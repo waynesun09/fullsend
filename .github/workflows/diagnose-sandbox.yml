@@ -57,12 +57,12 @@ jobs:
               ip netns list
             ' 2>&1
 
-      - name: Test supervisor v0.0.72 (working version)
+      - name: Test supervisor 0.0.72 (pre-PR-2001)
         run: |
-          echo "=== Pulling supervisor v0.0.72 ==="
-          podman pull ghcr.io/nvidia/openshell/supervisor:v0.0.72
+          echo "=== Pulling supervisor 0.0.72 ==="
+          podman pull ghcr.io/nvidia/openshell/supervisor:0.0.72
 
-          echo "=== Running supervisor v0.0.72 --version ==="
+          echo "=== Running supervisor 0.0.72 --version ==="
           podman run --rm \
             --cap-add SYS_ADMIN \
             --cap-add NET_ADMIN \
@@ -71,15 +71,15 @@ jobs:
             --cap-add DAC_READ_SEARCH \
             --mount type=tmpfs,dst=/run/netns \
             --security-opt seccomp=unconfined \
-            ghcr.io/nvidia/openshell/supervisor:v0.0.72 \
+            ghcr.io/nvidia/openshell/supervisor:0.0.72 \
             --version 2>&1 || echo "v0.0.72 failed: $?"
 
-      - name: Test supervisor v0.0.73 (broken version)
+      - name: Test supervisor 0.0.73 (contains PR 2001 cap changes)
         run: |
-          echo "=== Pulling supervisor v0.0.73 ==="
-          podman pull ghcr.io/nvidia/openshell/supervisor:v0.0.73
+          echo "=== Pulling supervisor 0.0.73 ==="
+          podman pull ghcr.io/nvidia/openshell/supervisor:0.0.73
 
-          echo "=== Running supervisor v0.0.73 --version ==="
+          echo "=== Running supervisor 0.0.73 --version ==="
           podman run --rm \
             --cap-add SYS_ADMIN \
             --cap-add NET_ADMIN \
@@ -89,10 +89,10 @@ jobs:
             --cap-add SETPCAP \
             --mount type=tmpfs,dst=/run/netns \
             --security-opt seccomp=unconfined \
-            ghcr.io/nvidia/openshell/supervisor:v0.0.73 \
+            ghcr.io/nvidia/openshell/supervisor:0.0.73 \
             --version 2>&1 || echo "v0.0.73 failed: $?"
 
-      - name: Test supervisor v0.0.73 with all OpenShell caps
+      - name: Test supervisor 0.0.73 with full OpenShell cap set
         run: |
           echo "=== v0.0.73 with all caps from OpenShell Podman driver ==="
           podman run --rm \
@@ -109,10 +109,48 @@ jobs:
             --mount type=tmpfs,dst=/run/netns \
             --security-opt seccomp=unconfined \
             --security-opt no-new-privileges \
-            ghcr.io/nvidia/openshell/supervisor:v0.0.73 \
+            ghcr.io/nvidia/openshell/supervisor:0.0.73 \
             --version 2>&1 || echo "v0.0.73 full caps failed: $?"
 
-      - name: Test DirtyClone mitigation detection
+      - name: Test supervisor latest (currently resolves to 0.0.73)
+        run: |
+          echo "=== Pulling supervisor :latest ==="
+          podman pull ghcr.io/nvidia/openshell/supervisor:latest
+
+          echo "=== Check what latest resolves to ==="
+          podman inspect ghcr.io/nvidia/openshell/supervisor:latest --format '{{.Digest}}' 2>&1
+
+          echo "=== Running supervisor :latest --version ==="
+          podman run --rm \
+            --cap-add SYS_ADMIN \
+            --cap-add NET_ADMIN \
+            --cap-add SYS_PTRACE \
+            --cap-add SYSLOG \
+            --cap-add DAC_READ_SEARCH \
+            --cap-add SETPCAP \
+            --mount type=tmpfs,dst=/run/netns \
+            --security-opt seccomp=unconfined \
+            ghcr.io/nvidia/openshell/supervisor:latest \
+            --version 2>&1 || echo "latest failed: $?"
+
+      - name: Test supervisor 0.0.63 (fullsend pinned version)
+        run: |
+          echo "=== Pulling supervisor 0.0.63 ==="
+          podman pull ghcr.io/nvidia/openshell/supervisor:0.0.63
+
+          echo "=== Running supervisor 0.0.63 --version ==="
+          podman run --rm \
+            --cap-add SYS_ADMIN \
+            --cap-add NET_ADMIN \
+            --cap-add SYS_PTRACE \
+            --cap-add SYSLOG \
+            --cap-add DAC_READ_SEARCH \
+            --mount type=tmpfs,dst=/run/netns \
+            --security-opt seccomp=unconfined \
+            ghcr.io/nvidia/openshell/supervisor:0.0.63 \
+            --version 2>&1 || echo "0.0.63 failed: $?"
+
+      - name: DirtyClone mitigation detection
         run: |
           echo "=== Checking if unshare is restricted at host level ==="
           unshare -Urn id 2>&1 || echo "unshare -Urn BLOCKED: $?"
