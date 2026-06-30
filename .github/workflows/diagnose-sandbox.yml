@@ -1,0 +1,127 @@
+name: Diagnose sandbox namespace restrictions
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Runner environment
+        run: |
+          echo "=== Runner image ==="
+          echo "ImageOS: ${ImageOS:-unknown}"
+          echo "ImageVersion: ${ImageVersion:-unknown}"
+
+          echo "=== Kernel ==="
+          uname -r
+
+          echo "=== Namespace sysctls ==="
+          for f in \
+            /proc/sys/kernel/unprivileged_userns_clone \
+            /proc/sys/kernel/apparmor_restrict_unprivileged_userns \
+            /proc/sys/user/max_user_namespaces \
+            /proc/sys/user/max_net_namespaces; do
+            printf "%-55s %s\n" "$f" "$(cat "$f" 2>/dev/null || echo 'not present')"
+          done
+
+          echo "=== AppArmor ==="
+          sudo aa-status 2>/dev/null | head -20 || echo "aa-status not available"
+
+          echo "=== Podman version ==="
+          podman version
+
+          echo "=== Host-level unshare test ==="
+          unshare --user --net echo "host unshare OK" 2>&1 || echo "host unshare FAILED: $?"
+
+      - name: Test ip netns add in rootless Podman (baseline)
+        run: |
+          echo "=== ip netns add inside rootless Podman container ==="
+          podman run --rm \
+            --cap-add SYS_ADMIN \
+            --cap-add NET_ADMIN \
+            --mount type=tmpfs,dst=/run/netns \
+            --security-opt seccomp=unconfined \
+            ubuntu:24.04 bash -c '
+              apt-get update -qq > /dev/null 2>&1
+              apt-get install -y -qq iproute2 strace > /dev/null 2>&1
+
+              echo "--- strace ip netns add ---"
+              strace -f -e trace=mount,unshare,clone 2>&1 ip netns add test-ns
+              echo "exit code: $?"
+
+              echo "--- ip netns list ---"
+              ip netns list
+            ' 2>&1
+
+      - name: Test supervisor v0.0.72 (working version)
+        run: |
+          echo "=== Pulling supervisor v0.0.72 ==="
+          podman pull ghcr.io/nvidia/openshell/supervisor:v0.0.72
+
+          echo "=== Running supervisor v0.0.72 --version ==="
+          podman run --rm \
+            --cap-add SYS_ADMIN \
+            --cap-add NET_ADMIN \
+            --cap-add SYS_PTRACE \
+            --cap-add SYSLOG \
+            --cap-add DAC_READ_SEARCH \
+            --mount type=tmpfs,dst=/run/netns \
+            --security-opt seccomp=unconfined \
+            ghcr.io/nvidia/openshell/supervisor:v0.0.72 \
+            --version 2>&1 || echo "v0.0.72 failed: $?"
+
+      - name: Test supervisor v0.0.73 (broken version)
+        run: |
+          echo "=== Pulling supervisor v0.0.73 ==="
+          podman pull ghcr.io/nvidia/openshell/supervisor:v0.0.73
+
+          echo "=== Running supervisor v0.0.73 --version ==="
+          podman run --rm \
+            --cap-add SYS_ADMIN \
+            --cap-add NET_ADMIN \
+            --cap-add SYS_PTRACE \
+            --cap-add SYSLOG \
+            --cap-add DAC_READ_SEARCH \
+            --cap-add SETPCAP \
+            --mount type=tmpfs,dst=/run/netns \
+            --security-opt seccomp=unconfined \
+            ghcr.io/nvidia/openshell/supervisor:v0.0.73 \
+            --version 2>&1 || echo "v0.0.73 failed: $?"
+
+      - name: Test supervisor v0.0.73 with all OpenShell caps
+        run: |
+          echo "=== v0.0.73 with all caps from OpenShell Podman driver ==="
+          podman run --rm \
+            --cap-add SYS_ADMIN \
+            --cap-add NET_ADMIN \
+            --cap-add SYS_PTRACE \
+            --cap-add SYSLOG \
+            --cap-add DAC_READ_SEARCH \
+            --cap-add SETPCAP \
+            --cap-add SETUID \
+            --cap-add SETGID \
+            --cap-add CHOWN \
+            --cap-add FOWNER \
+            --mount type=tmpfs,dst=/run/netns \
+            --security-opt seccomp=unconfined \
+            --security-opt no-new-privileges \
+            ghcr.io/nvidia/openshell/supervisor:v0.0.73 \
+            --version 2>&1 || echo "v0.0.73 full caps failed: $?"
+
+      - name: Test DirtyClone mitigation detection
+        run: |
+          echo "=== Checking if unshare is restricted at host level ==="
+          unshare -Urn id 2>&1 || echo "unshare -Urn BLOCKED: $?"
+
+          echo "=== Nested namespace test ==="
+          unshare --user bash -c '
+            echo "In user namespace, attempting net namespace..."
+            unshare --net echo "Nested user+net namespace OK" 2>&1 || echo "Nested net ns FAILED: $?"
+          ' 2>&1 || echo "Outer user ns FAILED: $?"
+
+          echo "=== Seccomp / audit denials ==="
+          sudo dmesg 2>/dev/null | grep -iE "audit|seccomp|denied|apparmor|userns" | tail -20 || echo "dmesg not available"
