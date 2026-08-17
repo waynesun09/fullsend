@@ -143,6 +143,15 @@ if [ ! -f "${TEMPLATE}" ]; then
   exit 1
 fi
 
+if ! [[ "${VM_USER}" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+  echo "ERROR: VM_USER must be a plain Unix user name (got: ${VM_USER})" >&2
+  exit 1
+fi
+if [[ "${RUNNER_ACCESS_LEVEL}" != "not_protected" && "${RUNNER_ACCESS_LEVEL}" != "ref_protected" ]]; then
+  echo "ERROR: RUNNER_ACCESS_LEVEL must be not_protected or ref_protected (got: ${RUNNER_ACCESS_LEVEL})" >&2
+  exit 1
+fi
+
 # Preflight — every tool and file this run depends on. Without this, a missing
 # executor script or an absent `timeout` is discovered only after the VM has
 # booted and a runner has been registered, so the failure costs a rollback.
@@ -234,8 +243,8 @@ fi
 python3 -c "
 import sys
 template = sys.stdin.read()
-print(template.replace('__VM_NAME__', sys.argv[1]).replace('__SSH_PUBLIC_KEY__', sys.argv[2]), end='')
-" "${vm_name}" "${SSH_PUBLIC_KEY}" < "${TEMPLATE}" \
+print(template.replace('__VM_NAME__', sys.argv[1]).replace('__SSH_PUBLIC_KEY__', sys.argv[2]).replace('__VM_USER__', sys.argv[3]), end='')
+" "${vm_name}" "${SSH_PUBLIC_KEY}" "${VM_USER}" < "${TEMPLATE}" \
   | oc create -n "${NAMESPACE}" -f -
 
 cleanup_vm() {
@@ -245,7 +254,8 @@ cleanup_vm() {
 trap cleanup_vm ERR
 # ERR does not fire on Ctrl-C; the boot and cloud-init waits below can take
 # up to 20 minutes, so print the cleanup hint on interrupt as well.
-trap 'cleanup_vm; exit 130' INT TERM
+trap 'cleanup_vm; exit 130' INT
+trap 'cleanup_vm; exit 143' TERM
 
 # ----------------------------------------------------------------------
 # 3. Wait for the VM to boot and accept SSH
@@ -324,7 +334,8 @@ trap cleanup_runner ERR
 # ERR does not fire on Ctrl-C, and the window below spans a ~20-minute setup
 # run — without this, an interrupt leaves the runner registered with nobody
 # tracking it.
-trap 'cleanup_runner; exit 130' INT TERM
+trap 'cleanup_runner; exit 130' INT
+trap 'cleanup_runner; exit 143' TERM
 
 REGISTRATION_TOKEN=$(echo "${runner_json}" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 runner_id=$(echo "${runner_json}" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
@@ -397,6 +408,14 @@ for val in "${REGISTRATION_TOKEN}" "${GITLAB_URL}" "${RUNNER_TAG}" "${RUNNER_IMA
     exit 1
   fi
 done
+# One remote session: install the .env removal trap first, receive the env
+# file on stdin, then run setup.sh. Doing this in one session means there is
+# no window where the token-bearing file exists without a trap covering it.
+# The signal handlers must terminate the shell (which then fires EXIT): a
+# handler that merely returns would swallow the SIGHUP from a dropped SSH
+# connection and let setup.sh keep running while the local side deregisters
+# the runner. Bounded at 20 minutes (image pulls and binary downloads are the
+# bottleneck).
 {
   printf "REGISTRATION_TOKEN='%s'\n" "${REGISTRATION_TOKEN}"
   printf "GITLAB_URL='%s'\n" "${GITLAB_URL}"
@@ -404,18 +423,13 @@ done
   printf "RUNNER_IMAGE='%s'\n" "${RUNNER_IMAGE}"
   printf "OPENSHELL_VERSION='%s'\n" "${OPENSHELL_VERSION}"
   printf "GITLAB_RUNNER_VERSION='%s'\n" "${GITLAB_RUNNER_VERSION}"
-} | virtctl -n "${NAMESPACE}" ssh "${VM_USER}"@vm/"${vm_name}" \
+} | timeout 1200 virtctl -n "${NAMESPACE}" ssh "${VM_USER}"@vm/"${vm_name}" \
   -t "-o StrictHostKeyChecking=no" -t "-o UserKnownHostsFile=/dev/null" \
-  -c "umask 077 && cat > ~/gitlab-runner-vm/.env"
+  -c "trap 'rm -f ~/gitlab-runner-vm/.env' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; umask 077 && cat > ~/gitlab-runner-vm/.env && set -a && . ~/gitlab-runner-vm/.env && set +a && bash ~/gitlab-runner-vm/setup.sh"
 
-# Run setup — the ERR trap handles runner deregistration on failure.
-# Bounded at 20 minutes (image pulls and binary downloads are the bottleneck).
-timeout 1200 virtctl -n "${NAMESPACE}" ssh "${VM_USER}"@vm/"${vm_name}" \
-  -t "-o StrictHostKeyChecking=no" -t "-o UserKnownHostsFile=/dev/null" \
-  -c "trap 'rm -f ~/gitlab-runner-vm/.env' EXIT INT TERM HUP; set -a && . ~/gitlab-runner-vm/.env && set +a && bash ~/gitlab-runner-vm/setup.sh"
-
-# Setup succeeded — clear the rollback trap.
-trap - ERR
+# Setup succeeded — clear every rollback trap so a stray signal during the
+# final output cannot deregister a healthy runner.
+trap - ERR INT TERM
 
 echo ""
 echo "Done. Runner ${vm_name} (ID ${runner_id}) is ready."

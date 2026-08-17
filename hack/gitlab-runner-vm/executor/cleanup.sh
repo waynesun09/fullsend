@@ -29,14 +29,15 @@ STATE_FILE="${STATE_DIR}/container-${JOB_ID}"
 
 if [ -f "${STATE_FILE}" ]; then
   CONTAINER_NAME=$(cat "${STATE_FILE}")
-  if ! [[ "${CONTAINER_NAME}" =~ ^runner-[0-9]+$ ]]; then
-    echo "WARN: state file holds an unexpected container name (${CONTAINER_NAME}) — skipping"
-    rm -f "${STATE_FILE}"
-    exit 0
+  if [[ "${CONTAINER_NAME}" =~ ^runner-[0-9]+$ ]]; then
+    echo "Cleaning up container: ${CONTAINER_NAME}"
+    podman stop --time 10 "${CONTAINER_NAME}" 2>/dev/null || true
+    podman rm -f "${CONTAINER_NAME}" 2>/dev/null || true
+  else
+    # Skip only the podman calls — the staging copy of the gateway mTLS
+    # material below must still be removed.
+    echo "WARN: state file holds an unexpected container name (${CONTAINER_NAME}) — not touching podman"
   fi
-  echo "Cleaning up container: ${CONTAINER_NAME}"
-  podman stop --time 10 "${CONTAINER_NAME}" 2>/dev/null || true
-  podman rm -f "${CONTAINER_NAME}" 2>/dev/null || true
   rm -f "${STATE_FILE}"
 fi
 

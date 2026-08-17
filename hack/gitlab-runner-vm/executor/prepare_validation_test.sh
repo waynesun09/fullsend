@@ -45,13 +45,14 @@ ln -s /etc "${FAKE_HOME}/builds/escape"
 failures=0
 
 # run_case <expected: accept|reject> <var> <value>
+# JOB_RESPONSE_OVERRIDE, when set, replaces the JOB_RESPONSE_FILE path.
 run_case() {
   local expected="$1" var="$2" value="$3" rc=0 output
   output=$(
     cd "${FAKE_HOME}" && \
     PATH="${SHIM_DIR}:${PATH}" \
     HOME="${FAKE_HOME}" \
-    JOB_RESPONSE_FILE="${JOB_RESPONSE}" \
+    JOB_RESPONSE_FILE="${JOB_RESPONSE_OVERRIDE-${JOB_RESPONSE}}" \
     CUSTOM_ENV_CI_JOB_IMAGE="registry.example.com/img:latest" \
     env "${var}=${value}" bash "${PREPARE}" 2>&1
   ) || rc=$?
@@ -62,8 +63,10 @@ run_case() {
   local got
   if [ "${rc}" -eq 0 ]; then
     got="accept"
-  elif printf '%s' "${output}" | grep -q "ERROR: ${short} must be under"; then
+  elif printf '%s' "${output}" | grep -Eq "ERROR: ${short} must (be under|not contain)"; then
     got="reject"
+  elif printf '%s' "${output}" | grep -q "ERROR: could not read job id from JOB_RESPONSE_FILE"; then
+    got="reject-identity"
   else
     got="error(rc=${rc}): $(printf '%s' "${output}" | tail -1)"
   fi
@@ -89,11 +92,28 @@ run_case reject CUSTOM_ENV_CI_BUILDS_DIR "${FAKE_HOME}/builds/escape/pki"
 run_case accept CUSTOM_ENV_CI_BUILDS_DIR "builds/relative"
 run_case reject CUSTOM_ENV_CI_BUILDS_DIR "builds/../etc"
 run_case reject CUSTOM_ENV_CI_BUILDS_DIR "${FAKE_HOME}/builds/a:b"
+run_case reject CUSTOM_ENV_CI_BUILDS_DIR "${FAKE_HOME}/builds/a"$'\n'"b"
 
 echo "== CACHE_DIR =="
 run_case accept CUSTOM_ENV_CI_CACHE_DIR "${FAKE_HOME}/cache"
 run_case reject CUSTOM_ENV_CI_CACHE_DIR "${FAKE_HOME}/cache-evil"
 run_case reject CUSTOM_ENV_CI_CACHE_DIR "${FAKE_HOME}/cache/../../etc"
+
+echo "== job identity =="
+# A spoofed CUSTOM_ENV_CI_JOB_ID must be ignored: identity comes from the
+# runner-written JOB_RESPONSE_FILE, so this still accepts under the real id.
+run_case accept CUSTOM_ENV_CI_JOB_ID "999999"
+# Missing, unreadable, or malformed response files must fail before podman.
+JOB_RESPONSE_OVERRIDE="${FAKE_HOME}/does-not-exist.json" \
+  run_case reject-identity CUSTOM_ENV_CI_BUILDS_DIR "${FAKE_HOME}/builds"
+printf '{"id": "not-an-int"}\n' > "${FAKE_HOME}/bad-id.json"
+JOB_RESPONSE_OVERRIDE="${FAKE_HOME}/bad-id.json" \
+  run_case reject-identity CUSTOM_ENV_CI_BUILDS_DIR "${FAKE_HOME}/builds"
+printf 'not json' > "${FAKE_HOME}/bad-json.json"
+JOB_RESPONSE_OVERRIDE="${FAKE_HOME}/bad-json.json" \
+  run_case reject-identity CUSTOM_ENV_CI_BUILDS_DIR "${FAKE_HOME}/builds"
+JOB_RESPONSE_OVERRIDE="" \
+  run_case reject-identity CUSTOM_ENV_CI_BUILDS_DIR "${FAKE_HOME}/builds"
 
 if [ "${failures}" -ne 0 ]; then
   echo "${failures} case(s) failed" >&2

@@ -169,7 +169,7 @@ for r in runners:
   # been deregistered above, leaving nothing to find it by.
   if delete_err=$(oc -n "${NAMESPACE}" delete vm --wait=false -- "${vm_name}" 2>&1); then
     echo "  OK: VM ${vm_name} deletion initiated"
-  elif printf '%s' "${delete_err}" | grep -q 'NotFound'; then
+  elif printf '%s' "${delete_err}" | grep -q '(NotFound)'; then
     echo "  WARN: VM ${vm_name} not found — nothing to delete"
   else
     echo "  ERROR: failed to delete VM ${vm_name}: ${delete_err}" >&2
@@ -180,7 +180,7 @@ for r in runners:
   # NotFound-vs-error split as the VM above.
   if delete_err=$(oc -n "${NAMESPACE}" delete dv --wait=false -- "${vm_name}" 2>&1); then
     echo "  OK: DataVolume ${vm_name} deletion initiated"
-  elif printf '%s' "${delete_err}" | grep -q 'NotFound'; then
+  elif printf '%s' "${delete_err}" | grep -q '(NotFound)'; then
     : # no DataVolume — nothing to delete
   else
     echo "  ERROR: failed to delete DataVolume ${vm_name}: ${delete_err}" >&2

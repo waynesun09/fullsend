@@ -85,7 +85,7 @@ spec:
         - cloudInitNoCloud:
             userData: |
               #cloud-config
-              user: fedora
+              user: __VM_USER__
               ssh_authorized_keys:
                 - __SSH_PUBLIC_KEY__
               packages:

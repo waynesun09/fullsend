@@ -62,8 +62,8 @@ require_under_root() {
   fi
   # ':' and ',' are field separators in podman's -v spec; a path containing
   # them would produce an opaque volume-parse error after the image pull.
-  if [[ "${resolved}" == *[:,]* ]]; then
-    echo "ERROR: ${name} must be under ${resolved_root} and must not contain ':' or ',' (got: ${resolved})" >&2
+  if [[ "${resolved}" == *[:,]* || "${resolved}" == *[[:cntrl:]]* ]]; then
+    echo "ERROR: ${name} must not contain ':' ',' or control characters (got: ${resolved})" >&2
     exit 1
   fi
   printf '%s' "${resolved}"
@@ -92,8 +92,12 @@ OPENSHELL_CONFIG="${HOME}/.config/openshell"
 # stopped leftover from an earlier failed stage. Use plain `podman rm` (no -f):
 # it refuses a running container atomically, with no inspect/rm window.
 if podman container exists "${CONTAINER_NAME}" 2>/dev/null; then
-  if ! podman rm "${CONTAINER_NAME}" >/dev/null 2>&1; then
-    echo "ERROR: container ${CONTAINER_NAME} exists and is running — refusing to reuse it" >&2
+  if ! rm_err=$(podman rm "${CONTAINER_NAME}" 2>&1); then
+    if podman inspect --format '{{.State.Running}}' "${CONTAINER_NAME}" 2>/dev/null | grep -q true; then
+      echo "ERROR: container ${CONTAINER_NAME} exists and is running — refusing to reuse it" >&2
+    else
+      echo "ERROR: could not remove stale container ${CONTAINER_NAME}: ${rm_err}" >&2
+    fi
     exit 1
   fi
 fi

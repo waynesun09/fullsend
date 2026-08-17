@@ -42,17 +42,54 @@ fi
 
 # Forward CI environment variables into the container.
 # GitLab Runner exposes job variables as CUSTOM_ENV_* — strip the prefix and
-# pass each one as a separate --env argument. A line-delimited --env-file
-# cannot carry these safely: file-type CI/CD variables (PEM material, keys)
-# contain newlines, which an `env`-parsing loop truncates to the first line,
-# and a continuation line beginning with CUSTOM_ENV_ would be re-parsed as an
-# attacker-chosen assignment. argv preserves values verbatim, and keeps
-# secrets out of a temp file on disk.
+# forward each one with `--env NAME` (no value). Podman then copies the value
+# from its own environment, so secrets never appear in argv or on disk. A
+# line-delimited --env-file cannot carry these safely: file-type CI/CD
+# variables (PEM material, keys) contain newlines, which an `env`-parsing loop
+# truncates to the first line, and a continuation line beginning with
+# CUSTOM_ENV_ would be re-parsed as an attacker-chosen assignment.
+# The exports happen in a subshell that execs podman, so a job variable
+# named PATH or HOME cannot alter this script's own environment. Names that
+# would change how the podman *process itself* behaves (locating conmon and
+# the OCI runtime, its storage/config, its home) are never secrets, so those
+# few are passed inline as NAME=VALUE instead of through podman's environ.
+PODMAN_BIN=$(command -v podman) || exit "${SYSTEM_FAILURE_EXIT_CODE}"
+is_process_critical() {
+  case "$1" in
+    PATH|HOME|TMPDIR|XDG_RUNTIME_DIR|XDG_CONFIG_HOME|XDG_DATA_HOME|\
+    LD_PRELOAD|LD_LIBRARY_PATH|CONTAINERS_CONF|CONTAINERS_CONF_OVERRIDE|\
+    CONTAINERS_STORAGE_CONF|CONTAINERS_REGISTRIES_CONF|CONTAINER_HOST|\
+    CONTAINER_CONNECTION|CONTAINER_SSHKEY|DOCKER_HOST) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 ENV_ARGS=()
 while IFS= read -r name; do
   [ -n "${name}" ] || continue
-  ENV_ARGS+=(--env "${name#CUSTOM_ENV_}=${!name}")
+  short="${name#CUSTOM_ENV_}"
+  if is_process_critical "${short}"; then
+    ENV_ARGS+=(--env "${short}=${!name}")
+  else
+    ENV_ARGS+=(--env "${short}")
+  fi
 done < <(compgen -v | grep '^CUSTOM_ENV_')
+
+# run_in_container <podman exec args...>: exec podman with the job's variables
+# exported under their short names.
+run_in_container() {
+  (
+    while IFS= read -r name; do
+      [ -n "${name}" ] || continue
+      short="${name#CUSTOM_ENV_}"
+      is_process_critical "${short}" && continue
+      # Readonly shell names (UID, EUID, SHELLOPTS, ...) cannot be exported;
+      # a CI variable colliding with one is dropped rather than aborting.
+      export "${short}=${!name}" 2>/dev/null \
+        || echo "WARN: cannot forward job variable ${short}" >&2
+    done < <(compgen -v | grep '^CUSTOM_ENV_')
+    exec "${PODMAN_BIN}" exec "$@"
+  )
+}
 
 # The script lives on the host — copy it into the container before executing.
 BUILD_SCRIPT_DIR=$(dirname "${SCRIPT_PATH}")
@@ -65,7 +102,7 @@ podman cp "${SCRIPT_PATH}" "${CONTAINER_NAME}:${SCRIPT_PATH}" || exit "${SYSTEM_
 # it cannot execute inside the job script, and podman propagates that verbatim,
 # so those stay build failures. 125 is ambiguous too (the script may exit
 # 125), so fall back to container liveness there.
-podman exec \
+run_in_container \
   "${ENV_ARGS[@]}" \
   "${CONTAINER_NAME}" \
   bash -- "${SCRIPT_PATH}"; rc=$?
