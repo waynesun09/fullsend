@@ -1,0 +1,94 @@
+# GitLab Runner VM
+
+Provisions GitLab Runner VMs on OpenShift Virtualization with a Podman custom
+executor and OpenShell gateway for fullsend agent jobs.
+
+> **Requires:** `oc`, `virtctl` (client >= 1.5 — ships with OpenShift Virtualization >= 4.19),
+> `python3`, and a local `ssh` binary (virtctl wraps it via ProxyCommand).
+
+## Architecture
+
+Each runner VM runs:
+- **gitlab-runner** (custom executor) — receives CI jobs from GitLab
+- **Podman** (rootless) — creates per-job containers
+- **OpenShell gateway** — provides sandbox compute for fullsend agents
+
+Job containers use `--network=host` to reach the gateway. An OCI
+`createRuntime` hook injects the host CA trust bundle into every container
+(Debian and RHEL-family layouts) so jobs can verify internal TLS endpoints.
+Gateway mTLS credentials are mounted read-only from the runner user's
+OpenShell config.
+
+This is a deployment variant of the container isolation model described in
+ADR-0036. It uses a Podman custom executor instead of Docker/Kubernetes
+executors but maintains equivalent container-level isolation for agent jobs.
+
+See also:
+- [ADR 0036: Agent Execution Sandbox](../../docs/ADRs/0036-agent-execution-sandbox.md)
+
+## Quick start
+
+```bash
+# 1. Create and provision a VM (auto-numbers):
+GL_TOKEN=glpat-xxx PROJECT_ID=12345 \
+  GITLAB_URL=https://gitlab.example.com \
+  NAMESPACE=my-namespace \
+  RUNNER_IMAGE=ghcr.io/org/runner:v1.2.3 \
+  ./create-vm.sh
+
+# 2. Delete a VM:
+GL_TOKEN=glpat-xxx \
+  GITLAB_URL=https://gitlab.example.com \
+  NAMESPACE=my-namespace \
+  ./delete-vm.sh fullsend-gitlab-runner-01
+
+# 3. List VMs:
+NAMESPACE=my-namespace ./delete-vm.sh --list
+```
+
+## Environment variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `GL_TOKEN` | yes | — | GitLab PAT (Owner role, scopes: `create_runner` + `manage_runner` + `api`) |
+| `PROJECT_ID` | yes (create) | — | GitLab project ID |
+| `GITLAB_URL` | yes | — | GitLab instance URL |
+| `NAMESPACE` | yes (create/delete) | — | OpenShift namespace |
+| `RUNNER_IMAGE` | yes | — | Image pre-pulled as a warm cache; jobs must still set `image:` in `.gitlab-ci.yml` |
+| `RUNNER_TAG` | no | `fullsend-gitlab-runner` | Runner tag for job matching |
+| `VM_USER` | no | `fedora` | Cloud-image login user (`cloud-user` on RHEL/CentOS Stream images) |
+| `RUNNER_ACCESS_LEVEL` | no | `not_protected` | `ref_protected` restricts the runner to protected branches and tags, so merge-request pipelines on unprotected source refs never match and sit `pending`. Note the trade-off: with `not_protected`, any job on any branch of the project runs on this VM and can read the mounted gateway credentials (see Security below) — set `ref_protected` if the runner only needs to serve protected refs |
+| `OPENSHELL_VERSION` | no | from `.github/scripts/openshell-version.sh` | OpenShell version (Renovate-tracked) |
+| `GITLAB_RUNNER_VERSION` | no | `19.2.1` | gitlab-runner version |
+| `SSH_PUBLIC_KEY` | no | contents of `~/.ssh/id_rsa.pub` or `id_ed25519.pub` | SSH public key contents (not a path) |
+| `REGISTRATION_TOKEN` | setup only | — | GitLab runner registration token |
+
+## Files
+
+- `create-vm.sh` — end-to-end VM creation + runner registration + setup
+- `delete-vm.sh` — VM teardown + runner deregistration
+- `setup.sh` — standalone VM configuration (called by create-vm.sh)
+- `gitlab-runner-version.sh` — central pin for the gitlab-runner version
+- `vm.yaml` — KubeVirt VirtualMachine template
+- `executor/prepare.sh` — custom executor prepare stage
+- `executor/run.sh` — custom executor run stage
+- `executor/cleanup.sh` — custom executor cleanup stage
+
+## Security notes
+
+- The CA trust bootstrap uses trust-on-first-use (TOFU). For higher assurance,
+  provide the CA bundle out-of-band before running setup.sh.
+- The OCI CA-injection hook fires for all containers on the host. It only
+  copies a CA bundle file and is scoped to the `createRuntime` stage.
+- Job containers share the host network namespace (`--network=host`) to reach
+  the OpenShell gateway. The gateway binds to `0.0.0.0` (required for the
+  Podman compute driver — sandbox containers register via
+  `host.containers.internal`). mTLS protects the endpoint.
+- Job containers receive read-only access to the runner's gateway mTLS
+  credentials (`~/.config/openshell`). This is required for the fullsend
+  agent inside job containers to authenticate to the gateway. The runner is
+  scoped to one project by `runner_type=project_type` and `locked=true`, so
+  only jobs from that project can access these credentials; `run_untagged=false`
+  narrows this further to tag-matched jobs. If job-scoped credential minting
+  is added to the gateway, this mount should be replaced with short-lived
+  per-job tokens.
