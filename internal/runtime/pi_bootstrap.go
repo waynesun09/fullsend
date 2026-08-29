@@ -226,17 +226,27 @@ const piNoSubagentNote = "\n## Runtime note\n\n" +
 	"sub-agent definition yourself, in the listed order, with the same context package, " +
 	"and treat each output as that sub-agent's result.\n"
 
+// piDefaultTools is the built-in tool set activated when the agent lists
+// no tools: pi 0.84.x itself starts with only read, bash, edit and write
+// (packages/coding-agent/src/core/sdk.ts defaultActiveToolNames — grep,
+// find and ls are registered but inactive), which left the search tools
+// unavailable to every agent without `tools:` frontmatter. The sandbox
+// image ships rg and fd for grep/find (images/sandbox/Containerfile).
+var piDefaultTools = []string{"read", "bash", "edit", "write", "grep", "find", "ls"}
+
 // piSettingsJSON is the locked-down global settings for the sandbox run.
 // defaultProjectTrust "never" means a repo-owned .pi/ (settings, extensions,
 // SYSTEM.md) is never loaded in non-interactive modes; skills as slash
 // commands are irrelevant headless; retry/compaction stay on so a transient
 // provider error or a long session does not end the run
-// (parsePiStream models both).
+// (parsePiStream models both); defaultTools activates every built-in
+// (see piDefaultTools) — --tools, when Run emits it, still replaces this.
 func piSettingsJSON() ([]byte, error) {
 	settings := map[string]any{
 		"defaultProjectTrust": "never",
 		"quietStartup":        true,
 		"enableSkillCommands": false,
+		"defaultTools":        piDefaultTools,
 		"retry":               map[string]any{"enabled": true},
 		"compaction":          map[string]any{"enabled": true},
 	}

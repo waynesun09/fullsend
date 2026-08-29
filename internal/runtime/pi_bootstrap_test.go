@@ -110,6 +110,7 @@ func TestPiRuntimeBootstrap_WritesConfigAndManifest(t *testing.T) {
 	require.NoError(t, json.Unmarshal(storedUpload(t, store, cfg+"/settings.json"), &settings))
 	assert.Equal(t, "never", settings["defaultProjectTrust"])
 	assert.Equal(t, false, settings["enableSkillCommands"])
+	assert.Equal(t, []any{"read", "bash", "edit", "write", "grep", "find", "ls"}, settings["defaultTools"])
 
 	ext := string(storedUpload(t, store, cfg+"/fullsend-hooks.js"))
 	assert.Contains(t, ext, "export default function")
