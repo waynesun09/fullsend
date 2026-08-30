@@ -16,7 +16,7 @@ import (
 func TestBuildProviderArgsLiteral_NoExpansion(t *testing.T) {
 	t.Setenv("LEAK", "expanded")
 	credentials := map[string]string{
-		"OPENAI_API_KEY": "tok-${LEAK}-$LEAK-literal",
+		"OPENAI_API_KEY": "tok-${LEAK}-$LEAK-literal", // notsecret
 		"ZERO":           "",
 	}
 
@@ -65,7 +65,7 @@ func TestEnsureProviderLiteral_CreatesWithValueInChildEnvOnly(t *testing.T) {
 	argsLog, envLog := recordingOpenshell(t, "", 0)
 	t.Setenv("LEAK", "expanded")
 
-	err := EnsureProviderLiteral(context.Background(), "openai-abc", "fullsend-openai", map[string]string{"OPENAI_API_KEY": "tok-$LEAK-9f8e7d"})
+	err := EnsureProviderLiteral(context.Background(), "openai-abc", "fullsend-openai", map[string]string{"OPENAI_API_KEY": "tok-$LEAK-9f8e7d"}) // notsecret
 	require.NoError(t, err)
 
 	args := readLines(t, argsLog)
@@ -141,7 +141,7 @@ func TestDeleteProvider(t *testing.T) {
 func TestUpdateProviderLiteral(t *testing.T) {
 	argsLog, envLog := recordingOpenshell(t, "", 0)
 	t.Setenv("LEAK", "expanded")
-	require.NoError(t, UpdateProviderLiteral(context.Background(), "openai-abc", map[string]string{"OPENAI_API_KEY": "tok-$LEAK-refreshed"}))
+	require.NoError(t, UpdateProviderLiteral(context.Background(), "openai-abc", map[string]string{"OPENAI_API_KEY": "tok-$LEAK-refreshed"})) // notsecret
 	assert.Equal(t, []string{"provider update openai-abc --credential OPENAI_API_KEY"}, readLines(t, argsLog))
 	assert.Equal(t, "tok-$LEAK-refreshed", readLines(t, envLog)[0], "unexpanded value in the child environment")
 
