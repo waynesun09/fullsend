@@ -12,6 +12,12 @@ on:
   push:
     branches: [bt-emulator-playback]
   workflow_dispatch:
+    inputs:
+      runner_kind:
+        description: upstream (the real actions/runner) or python (the emulator's own runner, whose step logs the emulator keeps)
+        type: choice
+        options: [upstream, python]
+        default: upstream
 
 permissions:
   contents: read
@@ -29,7 +35,7 @@ jobs:
     env:
       CI_STACK_DIR: /tmp/ci-stack
       CI_STACK_PYTHON: /tmp/emu-venv/bin/python
-      CI_STACK_RUNNER_KIND: upstream
+      CI_STACK_RUNNER_KIND: ${{ inputs.runner_kind || 'upstream' }}
       CI_STACK_RUNNERS: "2"
       CI_STACK_PORT: "443"
       CI_STACK_TLS: "1"
