@@ -71,6 +71,13 @@ jobs:
           # github.com actions without the anonymous rate limit.
           UPSTREAM_TOKEN: ${{ github.token }}
           BT_SUITE: playback
+          # The code stage opens its pull request and then labels it
+          # ready-for-review: two review dispatches. The review job's
+          # concurrency group (cancel-in-progress) keeps one, but only if the
+          # two overlap, as they do on GitHub-hosted runners. With two
+          # emulator runners the second waited for a runner, the first
+          # finished, and both reviews ran (the second served the fix entry).
+          EMULATOR_RUNNERS: "4"
           # The host-aware agents ops scripts, until they merge.
           AGENTS_PRS: ${{ inputs.agents_prs || '1871 1873' }}
         run: e2e/behaviour/emulator/run-job.sh
