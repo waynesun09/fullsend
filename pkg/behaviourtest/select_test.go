@@ -31,6 +31,10 @@ func TestInstallFactoryFor(t *testing.T) {
 		reflect.ValueOf(install.NewRepoPoolCFMintPreviews).Pointer(),
 		reflect.ValueOf(installFactoryFor("")).Pointer(),
 	)
+	assert.Equal(t,
+		reflect.ValueOf(install.NewRepoPoolEmulator).Pointer(),
+		reflect.ValueOf(installFactoryFor("emulator")).Pointer(),
+	)
 
 	// The STAGE factory refuses a DEV layout.
 	pool := poolConfigFor("dev", e2etest.EnvConfig{}, "", func(string, ...any) {})
