@@ -22,7 +22,7 @@ concurrency:
 env:
   # waynesun09/github-emulator branch bt-f5-e2e: ci-self-contained + the mint App seed.
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: 7e65143f954eff6154325faafbfa8e17c5c21ba1
+  EMULATOR_REF: 9234221229acd48a376f873e8385891323308a00
 
 jobs:
   behaviour-emulator:
