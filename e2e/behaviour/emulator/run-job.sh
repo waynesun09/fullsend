@@ -76,6 +76,11 @@ export SSL_CERT_FILE="$STATE/stack/tls/bundle.pem" GIT_SSL_CAINFO="$STATE/stack/
 export CURL_CA_BUNDLE="$STATE/stack/tls/ca.pem" NODE_EXTRA_CA_CERTS="$STATE/stack/tls/ca.pem"
 phase stack
 
+# OpenShell's egress proxy (in the sandbox supervisor) checks upstream TLS
+# against the supervisor image's CA bundle, so trust the stack CA there.
+"$ROOT/e2e/behaviour/emulator/supervisor-ca-image.sh" "$STATE/stack/tls/ca.pem"
+phase supervisor-ca
+
 # 2. One App per mint role plus the harness's e2e App, keys made by the emulator.
 mkdir -p "$STATE/pem"
 APP_SET=$APP_SET "$EMULATOR_PY" -I "$EMULATOR_DIR/scripts/ci-seed-mint-apps.py" "$EMU" "$ADMIN" "$ORG" "$STATE/pem" >"$STATE/role_app_ids.json"
