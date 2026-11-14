@@ -113,16 +113,21 @@ case "$CMD" in
       "$IMAGE" -f /etc/agw-config/config.yaml >/dev/null
     nat_rule -C 2>/dev/null || nat_rule -A
     # Ready when the TLS bind answers through the route with an HTTP status
-    # (an unauthenticated call gets 401 or 403, never 000).
+    # (an unauthenticated call gets 401 or 403, never 000). curl resolves
+    # *.localhost to loopback itself, without DNS, so pin GW_IP: the address
+    # DNS gives the sandbox supervisor, and the one the nat rule matches.
     code=000
     for _ in $(seq 1 30); do
       code=$(curl -sS -o /dev/null -w '%{http_code}' --cacert "$STACK_TLS/ca.pem" -m 3 \
-        "https://$GW_HOST/v1/chat/completions" -H 'Content-Type: application/json' -d '{"model":"echo"}' 2>/dev/null) || true
+        --resolve "$GW_HOST:443:$GW_IP" "https://$GW_HOST/v1/chat/completions" \
+        -H 'Content-Type: application/json' -d '{"model":"echo"}' 2>"$DIR/ready.err") || true
       [ "$code" != 000 ] && break
       sleep 1
     done
     if [ "$code" = 000 ]; then
-      echo "::error::gateway stub not reachable on https://$GW_HOST"
+      echo "::error::gateway stub not reachable on https://$GW_HOST ($GW_IP): $(tail -1 "$DIR/ready.err")"
+      echo "DNS: $(getent hosts "$GW_HOST" || echo none)"
+      sudo iptables -t nat -S OUTPUT
       podman logs "$CONTAINER" 2>&1 | tail -20
       exit 1
     fi
