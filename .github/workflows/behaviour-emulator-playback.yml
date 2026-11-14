@@ -1,0 +1,120 @@
+# The playback behaviour suite against a GitHub emulator, inside this job's
+# VM: emulator + real Actions runner, fullsend's own standalone mint, Apps
+# whose keys the emulator generates for this run. No repository secret, no
+# environment and no id-token, so it can run for fork pull requests.
+#
+# It sits next to behaviour-emulator as a separate job with its own stack,
+# because the playback suite is a separate test binary (-tags playback) and
+# its five-stage scenario is the longest; in parallel it adds no wall time.
+name: behaviour-emulator-playback
+
+on:
+  push:
+    branches: [bt-emulator-playback]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # waynesun09/github-emulator bt-f3-playback-stack: ci-self-contained plus
+  # bt-f3-oidc-claims and bt-f3-localhost-dns.
+  EMULATOR_REPO: waynesun09/github-emulator
+  EMULATOR_REF: 1c04b64f28c10b76063f3174471a1c0e38dd051a
+
+jobs:
+  playback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CI_STACK_DIR: /tmp/ci-stack
+      CI_STACK_PYTHON: /tmp/emu-venv/bin/python
+      CI_STACK_RUNNER_KIND: upstream
+      CI_STACK_RUNNERS: "2"
+      CI_STACK_PORT: "443"
+      CI_STACK_TLS: "1"
+      CI_STACK_SYSTEM_TRUST: "1"
+      CI_STACK_HOST: ghemu.localhost
+      CI_STACK_LOCALHOST_DNS: "1"
+      MINT_PORT: "8090"
+      POOL_SIZE: "2"
+      ARTIFACTS: /tmp/behaviour-artifacts
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.EMULATOR_REPO }}
+          ref: ${{ env.EMULATOR_REF }}
+          path: emulator
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Start the emulator and its runners
+        working-directory: emulator
+        run: |
+          python3 -m venv /tmp/emu-venv
+          /tmp/emu-venv/bin/pip install -q -r requirements.txt
+          sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80
+          GITHUB_EMULATOR_DEFAULT_ADMIN_TOKEN="ghp_$(openssl rand -hex 20)"
+          echo "::add-mask::$GITHUB_EMULATOR_DEFAULT_ADMIN_TOKEN"
+          echo "EMU_ADMIN=$GITHUB_EMULATOR_DEFAULT_ADMIN_TOKEN" >> "$GITHUB_ENV"
+          export GITHUB_EMULATOR_DEFAULT_ADMIN_TOKEN
+          scripts/ci-stack.sh start
+          issuer="$(curl -sf --cacert "$CI_STACK_DIR/tls/ca.pem" "https://$CI_STACK_HOST:$CI_STACK_PORT/.well-known/openid-configuration" | jq -r .issuer)"
+          echo "EMU=$issuer" >> "$GITHUB_ENV"
+          echo "emulator issuer: $issuer"
+
+      - name: Seed the Apps and start fullsend's mint
+        run: |
+          export SSL_CERT_FILE="$CI_STACK_DIR/tls/bundle.pem"
+          seed=emulator/scripts/ci-seed-mint-apps.py
+          /tmp/emu-venv/bin/python "$seed" "$EMU" "$EMU_ADMIN" halfsend /tmp/mint-pem > /tmp/role-app-ids.json
+          GH_TOKEN="$(/tmp/emu-venv/bin/python "$seed" token "$EMU" "$EMU_ADMIN" halfsend e2e)"
+          echo "::add-mask::$GH_TOKEN"
+          echo "BT_GH_TOKEN=$GH_TOKEN" >> "$GITHUB_ENV"
+          hosts=""
+          for i in $(seq -f '%02g' 1 "$POOL_SIZE"); do
+            hosts="$hosts${hosts:+,}halfsend/test-repo-$i,halfsend/test-repo-$i-mint-host"
+          done
+          go build -o /tmp/fullsend-mint ./cmd/mint
+          PORT="$MINT_PORT" MINT_OIDC_ISSUER_URL="$EMU" MINT_GITHUB_API_URL="$EMU/api/v3" \
+            PEM_DIR=/tmp/mint-pem ROLE_APP_IDS="$(cat /tmp/role-app-ids.json)" \
+            PER_REPO_WIF_REPOS='*' ALLOWED_WORKFLOW_FILES='*' WORKFLOW_HOST_REPOS="$hosts" \
+            nohup /tmp/fullsend-mint > "$CI_STACK_DIR/mint.log" 2>&1 &
+          for _ in $(seq 1 30); do curl -sf "http://127.0.0.1:$MINT_PORT/health" >/dev/null && break; sleep 0.5; done
+          curl -sf "http://127.0.0.1:$MINT_PORT/health"
+
+      - name: Run the playback suite
+        run: |
+          mkdir -p "$ARTIFACTS"
+          env -u GITHUB_TOKEN \
+            ENVIRONMENT=emulator \
+            BEHAVIOUR_GITHUB_URL="$EMU" \
+            GH_TOKEN="$BT_GH_TOKEN" \
+            FULLSEND_MINT_URL="http://127.0.0.1:$MINT_PORT" \
+            BEHAVIOUR_APP_SET=fullsend \
+            BEHAVIOUR_POOL_SIZE="$POOL_SIZE" \
+            BEHAVIOUR_CAPABILITIES= \
+            BEHAVIOUR_ARTIFACT_DIR="$ARTIFACTS" \
+            SSL_CERT_FILE="$CI_STACK_DIR/tls/bundle.pem" \
+            go test -tags playback -race -v -count=1 -timeout 45m ./e2e/behaviour/ 2>&1 | tee "$ARTIFACTS/playback.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Stop the stack
+        if: always()
+        working-directory: emulator
+        run: scripts/ci-stack.sh stop
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: behaviour-emulator-playback
+          path: |
+            /tmp/behaviour-artifacts
+            /tmp/ci-stack/*.log
+            /tmp/ci-stack/runner-*/_diag/*.log
