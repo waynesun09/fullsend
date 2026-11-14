@@ -96,12 +96,24 @@ for _ in $(seq 1 50); do curl -s -o /dev/null "$MINT/" && break; sleep 0.2; done
 phase mint
 
 # 4. This checkout as fullsend-ai/fullsend, so the shim pinned to HEAD resolves.
-api() { curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: token $ADMIN" -H 'Content-Type: application/json' "$@"; }
-api -X POST "$EMU/api/v3/admin/organizations" -d '{"login":"fullsend-ai","admin":"admin"}' >/dev/null
-api -X POST "$EMU/api/v3/orgs/fullsend-ai/repos" -d '{"name":"fullsend","private":false}' >/dev/null
-# Only a source to fetch from: its own CI (lint, test, semgrep) must not
-# start in the emulator and hold the runners.
-api -X PUT "$EMU/api/v3/repos/fullsend-ai/fullsend/actions/permissions" -d '{"enabled":false}' >/dev/null
+api() { curl -sS -o "$STATE/api-body" -w '%{http_code}' -H "Authorization: token $ADMIN" -H 'Content-Type: application/json' "$@"; }
+# ensure_source_repo NAME: create public fullsend-ai/NAME, a source to fetch
+# from only, so its own CI (lint, test, semgrep) is turned off and cannot
+# start in the emulator and hold the runners. Fails loudly.
+ensure_source_repo() {
+  local code
+  code=$(api -X POST "$EMU/api/v3/orgs/fullsend-ai/repos" -d "{\"name\":\"$1\",\"private\":false}")
+  case "$code" in 201|422) ;; *) echo "::error::creating fullsend-ai/$1: HTTP $code $(head -c 300 "$STATE/api-body")"; return 1 ;; esac
+  for _ in $(seq 1 20); do
+    [ "$(api "$EMU/api/v3/repos/fullsend-ai/$1")" = 200 ] && break
+    sleep 0.5
+  done
+  code=$(api -X PUT "$EMU/api/v3/repos/fullsend-ai/$1/actions/permissions" -d '{"enabled":false}')
+  [ "$code" = 204 ] || { echo "::error::turning Actions off for fullsend-ai/$1: HTTP $code $(head -c 300 "$STATE/api-body")"; return 1; }
+}
+code=$(api -X POST "$EMU/api/v3/admin/organizations" -d '{"login":"fullsend-ai","admin":"admin"}')
+case "$code" in 201|422) ;; *) echo "::error::creating org fullsend-ai: HTTP $code $(head -c 300 "$STATE/api-body")"; exit 1 ;; esac
+ensure_source_repo fullsend
 sha=$(git -C "$ROOT" rev-parse HEAD)
 git -C "$ROOT" -c credential.helper= -c http.extraheader= push -q --force \
   "https://admin:$ADMIN@$EMU_HOST/fullsend-ai/fullsend.git" "$sha:refs/heads/main"
@@ -119,8 +131,7 @@ if [ "$AGENTS_SEED" = 1 ]; then
     git -C "$agents" -c user.name=bt-emulator -c user.email=bt-emulator@localhost \
       merge -q --no-edit -m "bt-emulator: merge agents#$pr" FETCH_HEAD
   done
-  api -X POST "$EMU/api/v3/orgs/fullsend-ai/repos" -d '{"name":"agents","private":false}' >/dev/null
-  api -X PUT "$EMU/api/v3/repos/fullsend-ai/agents/actions/permissions" -d '{"enabled":false}' >/dev/null
+  ensure_source_repo agents
   git -C "$agents" -c credential.helper= -c http.extraheader= push -q --force \
     "https://admin:$ADMIN@$EMU_HOST/fullsend-ai/agents.git" "HEAD:refs/heads/main"
   echo "fullsend-ai/agents main on the emulator: $(git -C "$agents" rev-parse --short HEAD) (${AGENTS_REF:-main}${AGENTS_PRS:+ + PRs $AGENTS_PRS})"
