@@ -12,7 +12,8 @@ type RunnerConfig struct {
 	CI          string
 	InstallMode string
 	// Environment is the mint/infra target the suite is talking to
-	// (`dev` or `stage`), from ENVIRONMENT. Empty defaults to `dev`
+	// (`dev`, `stage`, or `emulator` for a GitHub emulator at
+	// BEHAVIOUR_GITHUB_URL), from ENVIRONMENT. Empty defaults to `dev`
 	// so local `make behaviour-test` works without setting it. CI
 	// sets this to match the GitHub Environment on the behaviour job.
 	Environment string
@@ -65,8 +66,8 @@ func (c RunnerConfig) Validate() error {
 	if c.CI != "githubactions" {
 		return fmt.Errorf("unsupported BEHAVIOUR_CI %q", c.CI)
 	}
-	if c.Environment != "dev" && c.Environment != "stage" {
-		return fmt.Errorf("unsupported ENVIRONMENT %q (want dev or stage)", c.Environment)
+	if c.Environment != "dev" && c.Environment != "stage" && c.Environment != "emulator" {
+		return fmt.Errorf("unsupported ENVIRONMENT %q (want dev, stage or emulator)", c.Environment)
 	}
 	return nil
 }
