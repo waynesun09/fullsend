@@ -20,9 +20,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # waynesun09/github-emulator branch bt-f5-e2e: ci-self-contained + the mint App seed.
+  # waynesun09/github-emulator ci-self-contained (integration head with the mint App seed).
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: 9234221229acd48a376f873e8385891323308a00
+  EMULATOR_REF: a0f43ea8ae72e03421ffddc3f4d84a71d668fd2b
 
 jobs:
   behaviour-emulator:
