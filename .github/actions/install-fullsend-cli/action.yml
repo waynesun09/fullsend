@@ -179,7 +179,9 @@ runs:
         fi
         echo "::add-mask::${GH_TOKEN}"
         SRC="${RUNNER_TEMP}/fullsend-src"
-        REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${WORKFLOW_REPOSITORY}.git"
+        # The configured GitHub server (github.com, or GHES / an emulator).
+        SERVER="${GITHUB_SERVER_URL:-https://github.com}"
+        REMOTE="${SERVER%%://*}://x-access-token:${GH_TOKEN}@${SERVER#*://}/${WORKFLOW_REPOSITORY}.git"
         echo "Cloning ${WORKFLOW_REPOSITORY} at ref: ${WORKFLOW_SHA}"
         git init "${SRC}"
         git -C "${SRC}" remote add origin "${REMOTE}"
