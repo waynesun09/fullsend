@@ -80,7 +80,8 @@ jobs:
           for i in $(seq -f '%02g' 1 "$POOL_SIZE"); do
             hosts="$hosts${hosts:+,}halfsend/test-repo-$i,halfsend/test-repo-$i-mint-host"
           done
-          go build -o /tmp/fullsend-mint ./cmd/mint
+          # cmd/mint is its own module.
+          (cd cmd/mint && go build -o /tmp/fullsend-mint .)
           PORT="$MINT_PORT" MINT_OIDC_ISSUER_URL="$EMU" MINT_GITHUB_API_URL="$EMU/api/v3" \
             PEM_DIR=/tmp/mint-pem ROLE_APP_IDS="$(cat /tmp/role-app-ids.json)" \
             PER_REPO_WIF_REPOS='*' ALLOWED_WORKFLOW_FILES='*' WORKFLOW_HOST_REPOS="$hosts" \
