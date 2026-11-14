@@ -11,6 +11,12 @@ on:
       features:
         description: Space-separated feature paths under e2e/behaviour
         default: features/triage/triage.feature
+      workers:
+        description: Scenarios in parallel (slot pool size and godog concurrency)
+        default: "1"
+      runners:
+        description: Real actions/runner processes on the emulator
+        default: "2"
 
 permissions:
   contents: read
@@ -20,6 +26,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # Staging the scale-up on the fork: the triage tier on pull_request.
+  DEFAULT_FEATURES: >-
+    features/triage/triage.feature features/dispatch/owners-auth.feature features/actors/actor-identities.feature features/dispatch/triage-prioritize-cel-route.feature features/platform/actor-authorization.feature features/dispatch/dispatch.feature
+  DEFAULT_WORKERS: "3"
+  DEFAULT_RUNNERS: "4"
   # waynesun09/github-emulator ci-self-contained (integration head with the mint App seed).
   EMULATOR_REPO: waynesun09/github-emulator
   EMULATOR_REF: 1999e9d2541419b3e9d7ef08757c5812aebfdb2a
@@ -28,7 +39,7 @@ jobs:
   behaviour-emulator:
     name: behaviour-emulator
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - name: Checkout fullsend
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -62,11 +73,15 @@ jobs:
           # Read-only job token, only so the emulator can fetch public
           # github.com actions without the anonymous rate limit.
           UPSTREAM_TOKEN: ${{ github.token }}
-          FEATURES: ${{ inputs.features || 'features/triage/triage.feature' }}
+          FEATURES: ${{ inputs.features || env.DEFAULT_FEATURES }}
+          WORKERS: ${{ inputs.workers || env.DEFAULT_WORKERS }}
+          EMULATOR_RUNNERS: ${{ inputs.runners || env.DEFAULT_RUNNERS }}
+          SUITE_TIMEOUT: 60m
           # The run falls back to fullsend-ai/agents@main on the configured forge.
           AGENTS_SEED: "1"
         run: |
           read -ra feats <<<"$FEATURES"
+          export BEHAVIOUR_POOL_SIZE="$WORKERS" GODOG_CONCURRENCY="$WORKERS"
           e2e/behaviour/emulator/run-job.sh "${feats[@]}"
 
       - name: Upload logs
