@@ -28,9 +28,9 @@ env:
   # waynesun09/github-emulator ci-self-contained, the integration ref: the CI
   # stack, the emulator fixes fullsend's suites need, the mint App seed, the
   # OIDC claims, the *.localhost resolver and GH_HOST on the real runner.
-  # The same ref behaviour-emulator pins.
+  # Also the runner job cancellation (cancel-in-progress reaches a busy runner).
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: 1999e9d2541419b3e9d7ef08757c5812aebfdb2a
+  EMULATOR_REF: d27a3b7af73599747684fbcf656c168ac38b4c7e
 
 jobs:
   behaviour-emulator-playback:
