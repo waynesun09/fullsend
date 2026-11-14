@@ -1,0 +1,72 @@
+name: Sandbox load (measurement)
+
+# Measurement only: how many OpenShell sandboxes fit on one hosted runner,
+# and how long one agent job's sandbox phases take with the image pre-pulled.
+on:
+  push:
+    branches: [bt-f4-sandbox-load]
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  load:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Machine
+        run: |
+          nproc
+          free -m
+          df -h / | tail -1
+
+      - name: Install Podman
+        run: time .github/scripts/install-podman.sh
+
+      - name: Configure rootless Podman
+        run: |
+          test -f /sys/fs/cgroup/cgroup.controllers
+          whoami_user="$(whoami)"
+          grep -q "^${whoami_user}:" /etc/subuid || sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "${whoami_user}"
+          podman system migrate
+          systemctl --user start podman.socket
+
+      - name: Configure OpenShell gateway
+        run: |
+          source .github/scripts/openshell-version.sh
+          mkdir -p "$HOME/.config/openshell/"
+          printf 'OPENSHELL_BIND_ADDRESS=0.0.0.0\n' >"$HOME/.config/openshell/gateway.env"
+          printf '[openshell]\nversion = 2\n\n[openshell.gateway]\ncompute_driver = "podman"\n\n[openshell.drivers.podman]\nsupervisor_image = "ghcr.io/nvidia/openshell/supervisor:%s"\nhealth_check_interval_secs = 10\n' \
+            "$OPENSHELL_VERSION" >"$HOME/.config/openshell/gateway.toml"
+
+      - name: Install OpenShell CLI
+        run: time .github/scripts/install-openshell.sh
+
+      - name: Pre-pull images
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          echo "$GH_TOKEN" | podman login ghcr.io -u "$ACTOR" --password-stdin
+          time podman pull -q ghcr.io/fullsend-ai/fullsend-sandbox:latest
+          time podman pull -q "ghcr.io/nvidia/openshell/supervisor:${OPENSHELL_VERSION}"
+          podman images
+
+      - name: One sandbox (pre-pulled)
+        run: bash hack/sandbox-load/load.sh 1 "$RUNNER_TEMP/n1"
+
+      - name: Six sandboxes
+        run: bash hack/sandbox-load/load.sh 6 "$RUNNER_TEMP/n6"
+
+      - name: Twelve sandboxes (headroom)
+        run: bash hack/sandbox-load/load.sh 12 "$RUNNER_TEMP/n12"
+
+      - name: Leftovers
+        if: always()
+        run: |
+          openshell sandbox list || true
+          podman ps -a --format '{{.Names}} {{.Status}}' || true
+          free -m
