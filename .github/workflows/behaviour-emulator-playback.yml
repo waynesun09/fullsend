@@ -23,10 +23,11 @@ permissions:
   contents: read
 
 env:
-  # waynesun09/github-emulator bt-f3-playback-stack: ci-self-contained plus
-  # bt-f3-oidc-claims and bt-f3-localhost-dns.
+  # waynesun09/github-emulator ci-self-contained, the integration ref: the
+  # CI stack, the emulator fixes fullsend's suites need, the mint App seed,
+  # the OIDC claims and the *.localhost resolver.
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: 1c04b64f28c10b76063f3174471a1c0e38dd051a
+  EMULATOR_REF: 42f740d3f4d4ef63d1a9f9860f691dbcc9802b03
 
 jobs:
   playback:
