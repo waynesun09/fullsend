@@ -1,128 +1,86 @@
-# The playback behaviour suite against a GitHub emulator, inside this job's
-# VM: emulator + real Actions runner, fullsend's own standalone mint, Apps
-# whose keys the emulator generates for this run. No repository secret, no
-# environment and no id-token, so it can run for fork pull requests.
-#
-# It sits next to behaviour-emulator as a separate job with its own stack,
-# because the playback suite is a separate test binary (-tags playback) and
-# its five-stage scenario is the longest; in parallel it adds no wall time.
 name: behaviour-emulator-playback
 
+# The playback behaviour suite against a GitHub emulator inside this one job,
+# next to behaviour-emulator: no repository secrets, no environment, no OIDC
+# to a real cloud. Every credential (emulator admin token, App keys, mint) is
+# made for the run. A separate job with its own stack, because the playback
+# suite is its own test binary (-tags playback) and its five-stage scenario
+# is the longest; in parallel it adds no wall time.
+
 on:
+  pull_request:
   push:
     branches: [bt-emulator-playback]
   workflow_dispatch:
     inputs:
-      runner_kind:
-        description: upstream (the real actions/runner) or python (the emulator's own runner, whose step logs the emulator keeps)
-        type: choice
-        options: [upstream, python]
-        default: upstream
+      agents_prs:
+        description: fullsend-ai/agents pull requests merged into the seeded agents (space-separated)
+        default: "1871 1873"
 
 permissions:
   contents: read
 
+concurrency:
+  group: behaviour-emulator-playback-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
-  # waynesun09/github-emulator ci-self-contained, the integration ref: the
-  # CI stack, the emulator fixes fullsend's suites need, the mint App seed,
-  # the OIDC claims and the *.localhost resolver.
+  # waynesun09/github-emulator ci-self-contained, the integration ref: the CI
+  # stack, the emulator fixes fullsend's suites need, the mint App seed, the
+  # OIDC claims, the *.localhost resolver and GH_HOST on the real runner.
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: 42f740d3f4d4ef63d1a9f9860f691dbcc9802b03
+  EMULATOR_REF: 2cab1f0041c7384b185e452ee5dfa3302242b663
 
 jobs:
-  playback:
-    runs-on: ubuntu-latest
+  behaviour-emulator-playback:
+    name: behaviour-emulator-playback
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
-    env:
-      CI_STACK_DIR: /tmp/ci-stack
-      CI_STACK_PYTHON: /tmp/emu-venv/bin/python
-      CI_STACK_RUNNER_KIND: ${{ inputs.runner_kind || 'upstream' }}
-      CI_STACK_RUNNERS: "2"
-      CI_STACK_PORT: "443"
-      CI_STACK_TLS: "1"
-      CI_STACK_SYSTEM_TRUST: "1"
-      CI_STACK_HOST: ghemu.localhost
-      CI_STACK_LOCALHOST_DNS: "1"
-      MINT_PORT: "8090"
-      POOL_SIZE: "2"
-      ARTIFACTS: /tmp/behaviour-artifacts
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Checkout fullsend
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout github-emulator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.EMULATOR_REPO }}
           ref: ${{ env.EMULATOR_REF }}
-          path: emulator
+          path: .emulator
           persist-credentials: false
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
 
-      - name: Start the emulator and its runners
-        working-directory: emulator
+      - name: Install emulator dependencies
         run: |
-          python3 -m venv /tmp/emu-venv
-          /tmp/emu-venv/bin/pip install -q -r requirements.txt
-          sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80
-          GITHUB_EMULATOR_DEFAULT_ADMIN_TOKEN="ghp_$(openssl rand -hex 20)"
-          echo "::add-mask::$GITHUB_EMULATOR_DEFAULT_ADMIN_TOKEN"
-          echo "EMU_ADMIN=$GITHUB_EMULATOR_DEFAULT_ADMIN_TOKEN" >> "$GITHUB_ENV"
-          export GITHUB_EMULATOR_DEFAULT_ADMIN_TOKEN
-          scripts/ci-stack.sh start
-          issuer="$(curl -sf --cacert "$CI_STACK_DIR/tls/ca.pem" "https://$CI_STACK_HOST:$CI_STACK_PORT/.well-known/openid-configuration" | jq -r .issuer)"
-          echo "EMU=$issuer" >> "$GITHUB_ENV"
-          echo "emulator issuer: $issuer"
-
-      - name: Seed the Apps and start fullsend's mint
-        run: |
-          export SSL_CERT_FILE="$CI_STACK_DIR/tls/bundle.pem"
-          seed=emulator/scripts/ci-seed-mint-apps.py
-          /tmp/emu-venv/bin/python "$seed" "$EMU" "$EMU_ADMIN" halfsend /tmp/mint-pem > /tmp/role-app-ids.json
-          GH_TOKEN="$(/tmp/emu-venv/bin/python "$seed" token "$EMU" "$EMU_ADMIN" halfsend e2e)"
-          echo "::add-mask::$GH_TOKEN"
-          echo "BT_GH_TOKEN=$GH_TOKEN" >> "$GITHUB_ENV"
-          hosts=""
-          for i in $(seq -f '%02g' 1 "$POOL_SIZE"); do
-            hosts="$hosts${hosts:+,}halfsend/test-repo-$i,halfsend/test-repo-$i-mint-host"
-          done
-          # cmd/mint is its own module.
-          (cd cmd/mint && go build -o /tmp/fullsend-mint .)
-          PORT="$MINT_PORT" MINT_OIDC_ISSUER_URL="$EMU" MINT_GITHUB_API_URL="$EMU/api/v3" \
-            PEM_DIR=/tmp/mint-pem ROLE_APP_IDS="$(cat /tmp/role-app-ids.json)" \
-            PER_REPO_WIF_REPOS='*' ALLOWED_WORKFLOW_FILES='*' WORKFLOW_HOST_REPOS="$hosts" \
-            nohup /tmp/fullsend-mint > "$CI_STACK_DIR/mint.log" 2>&1 &
-          for _ in $(seq 1 30); do curl -sf "http://127.0.0.1:$MINT_PORT/health" >/dev/null && break; sleep 0.5; done
-          curl -sf "http://127.0.0.1:$MINT_PORT/health"
+          python3 -m venv "$RUNNER_TEMP/emu-venv"
+          "$RUNNER_TEMP/emu-venv/bin/pip" install -q -r .emulator/requirements.txt
 
       - name: Run the playback suite
-        run: |
-          mkdir -p "$ARTIFACTS"
-          env -u GITHUB_TOKEN \
-            ENVIRONMENT=emulator \
-            BEHAVIOUR_GITHUB_URL="$EMU" \
-            GH_TOKEN="$BT_GH_TOKEN" \
-            FULLSEND_MINT_URL="http://127.0.0.1:$MINT_PORT" \
-            BEHAVIOUR_APP_SET=fullsend \
-            BEHAVIOUR_POOL_SIZE="$POOL_SIZE" \
-            BEHAVIOUR_CAPABILITIES= \
-            BEHAVIOUR_ARTIFACT_DIR="$ARTIFACTS" \
-            SSL_CERT_FILE="$CI_STACK_DIR/tls/bundle.pem" \
-            go test -tags playback -race -v -count=1 -timeout 45m ./e2e/behaviour/ 2>&1 | tee "$ARTIFACTS/playback.log"
-          exit "${PIPESTATUS[0]}"
+        env:
+          EMULATOR_DIR: ${{ github.workspace }}/.emulator
+          EMULATOR_PY: ${{ runner.temp }}/emu-venv/bin/python
+          STATE_DIR: ${{ runner.temp }}/bt-emulator
+          # Read-only job token, only so the emulator can fetch public
+          # github.com actions without the anonymous rate limit.
+          UPSTREAM_TOKEN: ${{ github.token }}
+          BT_SUITE: playback
+          # The host-aware agents ops scripts, until they merge.
+          AGENTS_PRS: ${{ inputs.agents_prs || '1871 1873' }}
+        run: e2e/behaviour/emulator/run-job.sh
 
-      - name: Stop the stack
-        if: always()
-        working-directory: emulator
-        run: scripts/ci-stack.sh stop
-
-      - name: Keep the logs
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: behaviour-emulator-playback
+          name: behaviour-emulator-playback-logs
           path: |
-            /tmp/behaviour-artifacts
-            /tmp/ci-stack/*.log
-            /tmp/ci-stack/runner-*/_diag/*.log
+            ${{ runner.temp }}/bt-emulator/**/*.log
+            ${{ runner.temp }}/bt-emulator/phases.tsv
+            ${{ runner.temp }}/bt-emulator/bt-artifacts/
+          if-no-files-found: warn
