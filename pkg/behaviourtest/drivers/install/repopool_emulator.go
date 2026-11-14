@@ -39,11 +39,8 @@ func NewRepoPoolEmulator(pool PoolConfig) (Driver, error) {
 		if err != nil {
 			return nil, fmt.Errorf("emulator factory: token for %s: %w", org, err)
 		}
-		owner, err := e2etest.EmulatorViewerLogin(ctx, token)
-		if err != nil {
-			return nil, fmt.Errorf("emulator factory: %w", err)
-		}
-		if err := e2etest.EnsureEmulatorOrg(ctx, token, org, owner); err != nil {
+		viewer := func(ctx context.Context) (string, error) { return e2etest.EmulatorViewerLogin(ctx, token) }
+		if err := e2etest.EnsureEmulatorOrg(ctx, token, org, viewer); err != nil {
 			return nil, fmt.Errorf("emulator factory: %w", err)
 		}
 	}
