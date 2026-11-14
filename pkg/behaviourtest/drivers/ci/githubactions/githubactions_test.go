@@ -162,6 +162,22 @@ func TestDispatchPollingBackoff(t *testing.T) {
 	assert.Equal(t, 30*time.Second, dispatchIntervals[4])
 }
 
+func TestSelectWorkflowRun_SameSecondAsTrigger(t *testing.T) {
+	// created_at has second precision; a run created in the trigger's
+	// own second (a fast forge or an emulator) still matches.
+	trigger := time.Date(2026, 11, 14, 21, 56, 29, 400_000_000, time.UTC)
+	runs := []forge.WorkflowRun{
+		{ID: 1, CreatedAt: "2026-11-14T21:56:28Z", Event: "issues"},
+		{ID: 2, CreatedAt: "2026-11-14T21:56:29Z", Event: "issues"},
+	}
+	got := selectWorkflowRun(runs, trigger, "issues")
+	require.NotNil(t, got)
+	assert.Equal(t, 2, got.ID)
+
+	assert.True(t, createdBefore(time.Date(2026, 11, 14, 21, 56, 28, 0, time.UTC), trigger))
+	assert.False(t, createdBefore(time.Date(2026, 11, 14, 21, 56, 29, 0, time.UTC), trigger))
+}
+
 func TestSelectWorkflowRun_ReturnsFailedRun(t *testing.T) {
 	t.Parallel()
 

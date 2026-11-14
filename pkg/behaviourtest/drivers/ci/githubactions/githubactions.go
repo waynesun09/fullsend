@@ -221,9 +221,18 @@ func selectSuccessfulWorkflowRun(runs []forge.WorkflowRun, triggerTime time.Time
 	return best
 }
 
+// createdBefore reports whether a run or artifact created at created is
+// earlier than the trigger time. GitHub reports created_at to the second,
+// so the trigger is truncated to whole seconds first: a run created in the
+// same second as the trigger (a fast forge, or a GitHub emulator) would
+// otherwise read as created before it and be missed.
+func createdBefore(created, trigger time.Time) bool {
+	return created.Before(trigger.Truncate(time.Second))
+}
+
 func workflowRunMatches(run forge.WorkflowRun, triggerTime time.Time, event string) bool {
 	runTime, parseErr := time.Parse(time.RFC3339, run.CreatedAt)
-	if parseErr != nil || runTime.Before(triggerTime) {
+	if parseErr != nil || createdBefore(runTime, triggerTime) {
 		return false
 	}
 	if event != "" && run.Event != event {
@@ -277,7 +286,7 @@ func selectCompletedSuccessRunByName(runs []forge.WorkflowRun, after time.Time, 
 			continue
 		}
 		runTime, parseErr := time.Parse(time.RFC3339, run.CreatedAt)
-		if parseErr != nil || runTime.Before(after) {
+		if parseErr != nil || createdBefore(runTime, after) {
 			continue
 		}
 		if run.Status != "completed" || run.Conclusion != "success" {
@@ -295,7 +304,7 @@ func selectCompletedSuccessRun(runs []forge.WorkflowRun, after time.Time) *forge
 	var best *forge.WorkflowRun
 	for _, run := range runs {
 		runTime, parseErr := time.Parse(time.RFC3339, run.CreatedAt)
-		if parseErr != nil || runTime.Before(after) {
+		if parseErr != nil || createdBefore(runTime, after) {
 			continue
 		}
 		if run.Status != "completed" || run.Conclusion != "success" {
@@ -327,7 +336,7 @@ func (d *Driver) AssertNoWorkflow(ctx context.Context, owner, repo, workflowFile
 			if parseErr != nil {
 				continue
 			}
-			if !runTime.Before(after) {
+			if !createdBefore(runTime, after) {
 				return fmt.Errorf("unexpected workflow run %d for %s", run.ID, workflowFile)
 			}
 		}
@@ -511,7 +520,7 @@ func selectRepositoryArtifactAfter(arts []forge.RepositoryArtifact, name string,
 			continue
 		}
 		artTime, parseErr := time.Parse(time.RFC3339, art.CreatedAt)
-		if parseErr != nil || artTime.Before(after) {
+		if parseErr != nil || createdBefore(artTime, after) {
 			continue
 		}
 		if best == nil || art.ID > best.ID {
@@ -529,7 +538,7 @@ func repositoryArtifactsAfter(arts []forge.RepositoryArtifact, after time.Time, 
 			continue
 		}
 		artTime, parseErr := time.Parse(time.RFC3339, art.CreatedAt)
-		if parseErr != nil || artTime.Before(after) {
+		if parseErr != nil || createdBefore(artTime, after) {
 			continue
 		}
 		matching = append(matching, art)
@@ -681,7 +690,7 @@ func (d *Driver) listHarnessRunsAfter(ctx context.Context, owner, repo string, a
 	var matched []forge.WorkflowRun
 	for _, run := range runs {
 		runTime, parseErr := time.Parse(time.RFC3339, run.CreatedAt)
-		if parseErr != nil || runTime.Before(after) {
+		if parseErr != nil || createdBefore(runTime, after) {
 			continue
 		}
 		matched = append(matched, run)
@@ -707,7 +716,7 @@ func (d *Driver) listHarnessRunsAfterPaginated(ctx context.Context, owner, repo 
 	var matched []forge.WorkflowRun
 	for _, run := range runs {
 		runTime, parseErr := time.Parse(time.RFC3339, run.CreatedAt)
-		if parseErr != nil || runTime.Before(after) {
+		if parseErr != nil || createdBefore(runTime, after) {
 			continue
 		}
 		matched = append(matched, run)
@@ -739,7 +748,7 @@ func formatArtifactDiagnostics(arts []forge.RepositoryArtifact, targetName strin
 		switch {
 		case err != nil:
 			b.WriteString("(rejected: unparseable created_at)")
-		case artTime.Before(after):
+		case createdBefore(artTime, after):
 			fmt.Fprintf(&b, "(rejected: created before trigger time %s)", after.UTC().Format(time.RFC3339))
 		default:
 			b.WriteString("(eligible by trigger time; not explained by the listing — run lookup failed, run not completed or cancelled/skipped, or artifact appeared after the last poll; see the run diagnostics)")
@@ -1513,7 +1522,7 @@ func (d *Driver) harnessArtifactRunSuccess(ctx context.Context, owner, repo stri
 			continue
 		}
 		artTime, parseErr := time.Parse(time.RFC3339, art.CreatedAt)
-		if parseErr != nil || artTime.Before(after) {
+		if parseErr != nil || createdBefore(artTime, after) {
 			continue
 		}
 		run, err := d.Client.GetWorkflowRun(ctx, owner, repo, art.WorkflowRunID)
