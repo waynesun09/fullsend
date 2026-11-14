@@ -34,6 +34,9 @@
 #   and routes /e2e-prefix back to 127.0.0.1:8080. It stays as rendered; one
 #   more bind adds TLS on 8443 with a certificate from the stack CA and
 #   forwards to 8080.
+# - The container runs under root's podman: the harness jobs run as the same
+#   user as this script, and their setup runs `podman system migrate`, which
+#   stops every container in that user's podman store.
 # - The gateway reads the emulator's JWKS from a file fetched once, so it
 #   needs no trust in the stack CA. The emulator's signing key lives as long
 #   as the run.
@@ -106,8 +109,8 @@ case "$CMD" in
   config) render ;;
   start)
     render
-    podman rm -f "$CONTAINER" >/dev/null 2>&1 || true
-    podman run -d --name "$CONTAINER" --network host \
+    sudo podman rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    sudo podman run -d --name "$CONTAINER" --network host --log-driver k8s-file \
       -v "$DIR/config.yaml:/etc/agw-config/config.yaml:ro" -v "$DIR/jwks.json:/etc/agw-config/jwks.json:ro" \
       -v "$DIR/key:/etc/agw-upstream:ro" -v "$DIR/tls:/etc/agw-tls:ro" \
       "$IMAGE" -f /etc/agw-config/config.yaml >/dev/null
@@ -128,7 +131,7 @@ case "$CMD" in
       echo "::error::gateway stub not reachable on https://$GW_HOST ($GW_IP): $(tail -1 "$DIR/ready.err")"
       echo "DNS: $(getent hosts "$GW_HOST" || echo none)"
       sudo iptables -t nat -S OUTPUT
-      podman logs "$CONTAINER" 2>&1 | tail -20
+      sudo podman logs "$CONTAINER" 2>&1 | tail -20
       exit 1
     fi
     echo "gateway stub on https://$GW_HOST ($GW_IP:443 -> :$TLS_PORT), unauthenticated call: HTTP $code"
@@ -138,8 +141,9 @@ case "$CMD" in
     } >"$DIR/gateway.env"
     ;;
   stop)
-    podman logs "$CONTAINER" >"$DIR/gateway.log" 2>&1 || true
-    podman rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    # shellcheck disable=SC2024 # the log belongs to this user, in DIR
+    sudo podman logs "$CONTAINER" >"$DIR/gateway.log" 2>&1 || true
+    sudo podman rm -f "$CONTAINER" >/dev/null 2>&1 || true
     if nat_rule -C 2>/dev/null; then nat_rule -D; fi
     ;;
   *) echo "usage: gateway-stub.sh config|start|stop DIR" >&2; exit 2 ;;
