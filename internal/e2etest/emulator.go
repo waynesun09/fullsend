@@ -69,9 +69,11 @@ func emulatorRoot(raw string) (string, error) {
 
 // EnsureEmulatorOrg creates org on the emulator through the GitHub
 // Enterprise site-admin route (POST /admin/organizations) when it does
-// not exist yet. adminLogin becomes the org's first owner. It is a no-op
-// for an org that already exists.
-func EnsureEmulatorOrg(ctx context.Context, token, org, adminLogin string) error {
+// not exist yet, owned by the login adminLogin returns. It is a no-op for
+// an org that already exists, and then never calls adminLogin: an App
+// installation token gets 403 on GET /user, and a seed that creates the
+// org first lets such a token drive the suite.
+func EnsureEmulatorOrg(ctx context.Context, token, org string, adminLogin func(context.Context) (string, error)) error {
 	base := githubAPIBaseURL()
 	status, body, err := emulatorRequest(ctx, http.MethodGet, base+"/orgs/"+url.PathEscape(org), token, nil)
 	if err != nil {
@@ -84,7 +86,11 @@ func EnsureEmulatorOrg(ctx context.Context, token, org, adminLogin string) error
 	default:
 		return fmt.Errorf("looking up org %s: unexpected status %d: %s", org, status, body)
 	}
-	payload, _ := json.Marshal(map[string]string{"login": org, "admin": adminLogin})
+	owner, err := adminLogin(ctx)
+	if err != nil {
+		return fmt.Errorf("creating org %s: %w", org, err)
+	}
+	payload, _ := json.Marshal(map[string]string{"login": org, "admin": owner})
 	status, body, err = emulatorRequest(ctx, http.MethodPost, base+"/admin/organizations", token, payload)
 	if err != nil {
 		return fmt.Errorf("creating org %s: %w", org, err)

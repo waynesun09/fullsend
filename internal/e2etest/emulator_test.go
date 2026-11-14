@@ -3,6 +3,7 @@ package e2etest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -72,14 +73,22 @@ func TestEnsureEmulatorOrg(t *testing.T) {
 	t.Setenv("GITHUB_API_URL", srv.URL+"/api/v3")
 	ctx := context.Background()
 
-	require.NoError(t, EnsureEmulatorOrg(ctx, "tok", "present", "admin"))
+	lookups := 0
+	admin := func(context.Context) (string, error) { lookups++; return "admin", nil }
+	noViewer := func(context.Context) (string, error) { return "", errors.New("GET /user: 403") }
+
+	require.NoError(t, EnsureEmulatorOrg(ctx, "tok", "present", noViewer), "an existing org needs no viewer login")
 	assert.Empty(t, created, "an existing org is left alone")
 
-	require.NoError(t, EnsureEmulatorOrg(ctx, "tok", "missing", "admin"))
-	require.NoError(t, EnsureEmulatorOrg(ctx, "tok", "missing", "admin"))
-	assert.Equal(t, []map[string]string{{"login": "missing", "admin": "admin"}}, created, "created once, owned by admin")
+	require.Error(t, EnsureEmulatorOrg(ctx, "tok", "missing", noViewer), "a missing org needs an owner")
+	assert.Empty(t, created)
 
-	require.Error(t, EnsureEmulatorOrg(ctx, "tok", "broken", "admin"))
+	require.NoError(t, EnsureEmulatorOrg(ctx, "tok", "missing", admin))
+	require.NoError(t, EnsureEmulatorOrg(ctx, "tok", "missing", admin))
+	assert.Equal(t, []map[string]string{{"login": "missing", "admin": "admin"}}, created, "created once, owned by admin")
+	assert.Equal(t, 1, lookups, "the owner is looked up only for the create")
+
+	require.Error(t, EnsureEmulatorOrg(ctx, "tok", "broken", admin))
 }
 
 func TestEmulatorViewerLogin(t *testing.T) {
