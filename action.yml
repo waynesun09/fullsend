@@ -194,7 +194,7 @@ runs:
           TAG="$(retry_curl -fsSL \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
-            "https://api.github.com/repos/fullsend-ai/fullsend/releases/latest" | jq -r '.tag_name')"
+            "${GITHUB_API_URL:-https://api.github.com}/repos/fullsend-ai/fullsend/releases/latest" | jq -r '.tag_name')"
           if [[ -z "${TAG}" || "${TAG}" == "null" ]]; then
             echo "::error::Could not resolve latest release tag"
             exit 1
@@ -209,7 +209,7 @@ runs:
           commit_sha=$(retry_curl -fsSL \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
-            "https://api.github.com/repos/fullsend-ai/fullsend/git/tags/${VERSION}" 2>/dev/null \
+            "${GITHUB_API_URL:-https://api.github.com}/repos/fullsend-ai/fullsend/git/tags/${VERSION}" 2>/dev/null \
             | jq -r '.object.sha // empty') || true
           if [[ -n "${commit_sha}" ]]; then
             echo "Dereferenced annotated tag object ${VERSION:0:12} to commit ${commit_sha:0:12}"
@@ -227,7 +227,7 @@ runs:
             resp=$(retry_curl -fsSL \
               -H "Accept: application/vnd.github+json" \
               -H "Authorization: Bearer ${GH_TOKEN}" \
-              "https://api.github.com/repos/fullsend-ai/fullsend/tags?per_page=100&page=${page}") \
+              "${GITHUB_API_URL:-https://api.github.com}/repos/fullsend-ai/fullsend/tags?per_page=100&page=${page}") \
               || { echo "::warning::Tag lookup failed on page ${page}; skipping SHA-to-tag resolution"; break; }
             match=$(echo "${resp}" | jq -r --arg sha "${VERSION}" \
               '.[] | select(.commit.sha == $sha) | .name' \
@@ -259,7 +259,7 @@ runs:
         HTTP_STATUS="$(retry_curl -sL -o /dev/null -w "%{http_code}" \
           -H "Accept: application/vnd.github+json" \
           -H "Authorization: Bearer ${GH_TOKEN}" \
-          "https://api.github.com/repos/fullsend-ai/fullsend/releases/tags/${VERSION_URL}")"
+          "${GITHUB_API_URL:-https://api.github.com}/repos/fullsend-ai/fullsend/releases/tags/${VERSION_URL}")"
 
         if [[ "${HTTP_STATUS}" == "200" ]]; then
           echo "Found release ${VERSION_URL}; downloading pre-built binary"
@@ -339,7 +339,7 @@ runs:
         esac
 
         ASSET_NAME="fullsend_${VERSION_ASSET}_${os}_${arch}.tar.gz"
-        URL="https://github.com/fullsend-ai/fullsend/releases/download/${VERSION_URL}/${ASSET_NAME}"
+        URL="${GITHUB_SERVER_URL:-https://github.com}/fullsend-ai/fullsend/releases/download/${VERSION_URL}/${ASSET_NAME}"
 
         echo "Downloading from: ${URL}"
         retry_curl -fsSL "${URL}" -o "/tmp/${ASSET_NAME}"
@@ -395,7 +395,9 @@ runs:
         fi
         echo "::add-mask::${GH_TOKEN}"
         SRC="${RUNNER_TEMP}/fullsend-src"
-        REMOTE="https://x-access-token:${GH_TOKEN}@github.com/fullsend-ai/fullsend.git"
+        # The configured GitHub server (github.com, or GHES / an emulator).
+        SERVER="${GITHUB_SERVER_URL:-https://github.com}"
+        REMOTE="${SERVER%%://*}://x-access-token:${GH_TOKEN}@${SERVER#*://}/fullsend-ai/fullsend.git"
         echo "Cloning fullsend at ref: ${SOURCE_REF}"
         git init "${SRC}"
         git -C "${SRC}" remote add origin "${REMOTE}"
