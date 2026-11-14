@@ -30,7 +30,7 @@ env:
   # OIDC claims, the *.localhost resolver and GH_HOST on the real runner.
   # The same ref behaviour-emulator pins.
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: a0f43ea8ae72e03421ffddc3f4d84a71d668fd2b
+  EMULATOR_REF: 806f3077b6c4207f5ae70898e332e66da593b1bf
 
 jobs:
   behaviour-emulator-playback:
