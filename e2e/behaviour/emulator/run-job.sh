@@ -11,6 +11,14 @@
 #   EMULATOR_PY    python with its requirements.txt installed       [required]
 #   STATE_DIR      logs and state (default $RUNNER_TEMP/bt-emulator)
 #   UPSTREAM_TOKEN optional token the emulator uses to fetch github.com actions
+#   BT_SUITE       behaviour (default; runs the features given) or playback
+#                  (the @playback suite, -tags playback)
+#   AGENTS_SEED    1 to mirror github.com/fullsend-ai/agents into the
+#                  emulator as fullsend-ai/agents; the shipped agents (which
+#                  playback runs) resolve from it. Default 1 for playback.
+#   AGENTS_REF     agents ref to mirror as main (default main)
+#   AGENTS_PRS     agents pull request numbers merged on top, space-separated
+#                  (e.g. "1871 1873", the host-aware ops scripts)
 # Phase timings go to $STATE_DIR/phases.tsv and the step summary.
 set -euo pipefail
 
@@ -18,6 +26,12 @@ ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 STATE="${STATE_DIR:-${RUNNER_TEMP:-/tmp}/bt-emulator}"
 mkdir -p "$STATE"
 FEATURES=("${@:-features/triage/triage.feature}")
+SUITE="${BT_SUITE:-behaviour}"
+case "$SUITE" in
+  behaviour) AGENTS_SEED="${AGENTS_SEED:-0}" ;;
+  playback) AGENTS_SEED="${AGENTS_SEED:-1}" ;;
+  *) echo "BT_SUITE must be behaviour or playback, got $SUITE" >&2; exit 2 ;;
+esac
 EMU_HOST=ghemu.localhost
 EMU="https://$EMU_HOST"
 ORG=halfsend
@@ -93,18 +107,43 @@ git -C "$ROOT" -c credential.helper= -c http.extraheader= push -q --force \
   "https://admin:$ADMIN@$EMU_HOST/fullsend-ai/fullsend.git" "$sha:refs/heads/main"
 phase upstream-push
 
-# 5. The behaviour suite, emulator mode.
+# 4b. The shipped agents as fullsend-ai/agents: a run without its own agent
+# config falls back to fullsend-ai/agents@main on the configured forge.
+if [ "$AGENTS_SEED" = 1 ]; then
+  agents="$STATE/agents.git"
+  rm -rf "$agents"
+  git clone -q --no-checkout "https://github.com/fullsend-ai/agents.git" "$agents"
+  git -C "$agents" checkout -q --detach "${AGENTS_REF:-main}"
+  for pr in ${AGENTS_PRS:-}; do
+    git -C "$agents" fetch -q origin "pull/$pr/head"
+    git -C "$agents" -c user.name=bt-emulator -c user.email=bt-emulator@localhost \
+      merge -q --no-edit -m "bt-emulator: merge agents#$pr" FETCH_HEAD
+  done
+  api -X POST "$EMU/api/v3/orgs/fullsend-ai/repos" -d '{"name":"agents","private":false}' >/dev/null
+  api -X PUT "$EMU/api/v3/repos/fullsend-ai/agents/actions/permissions" -d '{"enabled":false}' >/dev/null
+  git -C "$agents" -c credential.helper= -c http.extraheader= push -q --force \
+    "https://admin:$ADMIN@$EMU_HOST/fullsend-ai/agents.git" "HEAD:refs/heads/main"
+  echo "fullsend-ai/agents main on the emulator: $(git -C "$agents" rev-parse --short HEAD) (${AGENTS_REF:-main}${AGENTS_PRS:+ + PRs $AGENTS_PRS})"
+  phase agents-push
+fi
+
+# 5. The suite, emulator mode.
 status=0
 (
   cd "$ROOT"
   unset GITHUB_TOKEN GITHUB_ACTIONS
-  ENVIRONMENT=emulator BEHAVIOUR_GITHUB_URL="$EMU" GH_TOKEN="$E2E_TOKEN" \
-  FULLSEND_MINT_URL="$MINT" BEHAVIOUR_APP_SET="$APP_SET" BEHAVIOUR_CAPABILITIES='' \
-  BEHAVIOUR_FEATURES="${FEATURES[*]}" BEHAVIOUR_POOL_SIZE="${BEHAVIOUR_POOL_SIZE:-1}" \
-  GODOG_CONCURRENCY=1 BEHAVIOUR_ARTIFACT_DIR="$STATE/bt-artifacts" \
-  BEHAVIOUR_RUN_POLL_INTERVAL="${BEHAVIOUR_RUN_POLL_INTERVAL:-3s}" \
-  BEHAVIOUR_NEGATIVE_SETTLE="${BEHAVIOUR_NEGATIVE_SETTLE:-20s}" \
-    go test -tags behaviour -count=1 -timeout 40m -v ./e2e/behaviour/ -run TestBehaviourSuite
+  export ENVIRONMENT=emulator BEHAVIOUR_GITHUB_URL="$EMU" GH_TOKEN="$E2E_TOKEN" \
+    FULLSEND_MINT_URL="$MINT" BEHAVIOUR_APP_SET="$APP_SET" BEHAVIOUR_CAPABILITIES='' \
+    BEHAVIOUR_POOL_SIZE="${BEHAVIOUR_POOL_SIZE:-1}" \
+    GODOG_CONCURRENCY=1 BEHAVIOUR_ARTIFACT_DIR="$STATE/bt-artifacts" \
+    BEHAVIOUR_RUN_POLL_INTERVAL="${BEHAVIOUR_RUN_POLL_INTERVAL:-3s}" \
+    BEHAVIOUR_NEGATIVE_SETTLE="${BEHAVIOUR_NEGATIVE_SETTLE:-20s}"
+  if [ "$SUITE" = playback ]; then
+    go test -tags playback -count=1 -timeout 40m -v ./e2e/behaviour/ -run TestPlaybackSuite
+  else
+    BEHAVIOUR_FEATURES="${FEATURES[*]}" \
+      go test -tags behaviour -count=1 -timeout 40m -v ./e2e/behaviour/ -run TestBehaviourSuite
+  fi
 ) 2>&1 | tee "$STATE/bt-run.log" || status=$?
 phase suite
 exit "$status"
