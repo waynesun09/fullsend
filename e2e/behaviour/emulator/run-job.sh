@@ -70,6 +70,46 @@ stop_all() {
 }
 trap stop_all EXIT
 
+# 0. One sandbox host for the whole VM: rootless Podman and one OpenShell
+# gateway, set up here once. The agent jobs get OPENSHELL_GATEWAY_ENDPOINT
+# (fullsend's documented remote-gateway runner mode), so action.yml skips
+# its per-job Podman install, `podman system migrate` and gateway setup.
+# On GitHub every job has its own VM; here the jobs share one, and those
+# per-job steps race each other. Set SHARED_SANDBOX_HOST=0 to keep them.
+RUNNER_ENV=""
+if [ "${SHARED_SANDBOX_HOST:-1}" = 1 ]; then
+  "$ROOT/.github/scripts/install-podman.sh"
+  test -f /sys/fs/cgroup/cgroup.controllers
+  grep -q "^$(whoami):" /etc/subuid || sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$(whoami)"
+  podman system migrate
+  systemctl --user start podman.socket
+  # shellcheck source=/dev/null
+  source "$ROOT/.github/scripts/openshell-version.sh"
+  mkdir -p "$HOME/.config/openshell"
+  printf 'OPENSHELL_BIND_ADDRESS=0.0.0.0\n' >"$HOME/.config/openshell/gateway.env"
+  cat >"$HOME/.config/openshell/gateway.toml" <<TOML
+[openshell]
+version = 2
+
+[openshell.gateway]
+compute_driver = "podman"
+
+[openshell.drivers.podman]
+supervisor_image = "ghcr.io/nvidia/openshell/supervisor:${OPENSHELL_VERSION}"
+health_check_interval_secs = 10
+TOML
+  "$ROOT/.github/scripts/install-openshell.sh"
+  gw_cfg="$HOME/.config/openshell/gateways/$(cat "$HOME/.config/openshell/active_gateway" 2>/dev/null || echo openshell)"
+  gw_endpoint=$(jq -r '[.. | strings | select(startswith("https://"))][0] // empty' "$gw_cfg/metadata.json" 2>/dev/null || true)
+  if [ -z "$gw_endpoint" ]; then
+    echo "::error::no https endpoint in $gw_cfg/metadata.json: $(cat "$gw_cfg/metadata.json" 2>/dev/null)"
+    exit 1
+  fi
+  echo "shared OpenShell gateway: $gw_endpoint ($(command -v openshell))"
+  RUNNER_ENV="OPENSHELL_GATEWAY_ENDPOINT=$gw_endpoint"
+  phase sandbox-host
+fi
+
 # 1. Emulator + one real actions/runner over TLS on ghemu.localhost:443.
 sudo sysctl -qw net.ipv4.ip_unprivileged_port_start=80
 (
@@ -79,6 +119,7 @@ sudo sysctl -qw net.ipv4.ip_unprivileged_port_start=80
   CI_STACK_TLS=1 CI_STACK_HOST="$EMU_HOST" CI_STACK_PORT=443 CI_STACK_SYSTEM_TRUST=1 \
   CI_STACK_LOCALHOST_DNS=1 CI_STACK_BIND=0.0.0.0 \
   CI_STACK_DNS_EXTRA="$([ "$GATEWAY" = 1 ] && echo "$GW_HOST=$GW_IP")" \
+  CI_STACK_RUNNER_ENV="$RUNNER_ENV" \
   GITHUB_EMULATOR_DEFAULT_ADMIN_TOKEN="$ADMIN" \
   GITHUB_EMULATOR_ACTIONS_UPSTREAM_TOKEN="${UPSTREAM_TOKEN:-}" \
     scripts/ci-stack.sh start
