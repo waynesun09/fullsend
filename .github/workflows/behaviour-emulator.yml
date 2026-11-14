@@ -63,6 +63,8 @@ jobs:
           # github.com actions without the anonymous rate limit.
           UPSTREAM_TOKEN: ${{ github.token }}
           FEATURES: ${{ inputs.features || 'features/triage/triage.feature' }}
+          # The run falls back to fullsend-ai/agents@main on the configured forge.
+          AGENTS_SEED: "1"
         run: |
           read -ra feats <<<"$FEATURES"
           e2e/behaviour/emulator/run-job.sh "${feats[@]}"
