@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/fullsend-ai/fullsend/internal/e2etest"
-	"github.com/fullsend-ai/fullsend/pkg/behaviourtest/drivers/install/common"
 )
 
 // emulatorOrgSetupTimeout bounds creating the pool orgs on the emulator.
@@ -49,9 +48,10 @@ func NewRepoPoolEmulator(pool PoolConfig) (Driver, error) {
 		return &externalMintDriver{mintURL: mintURL}, func() {}, nil
 	}
 	// Setup names the App set the emulator was seeded with, as the
-	// preview mints do, so bot logins match AppSet().
-	opts := common.DefaultGitHubSetupOpts()
-	opts.ConfigPreset = envConfigPreset()
+	// preview mints do, so bot logins match AppSet(). playbackSetupOpts
+	// also selects the playback runtime when PLAYBACK_RUNTIME is set, so
+	// this factory backs the playback suite too (see NewPlaybackDriver).
+	opts := playbackSetupOpts()
 	opts.AppSet = envAppSet()
 	pool.PrivateOrgs = true
 	return buildPoolDriver(pool, nil, newMint, opts, traceStart{})
