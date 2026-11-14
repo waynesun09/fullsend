@@ -1,0 +1,79 @@
+name: behaviour-emulator
+
+# Behaviour scenarios against a GitHub emulator inside this one job: no
+# repository secrets, no environment, no OIDC to a real cloud. Every
+# credential (emulator admin token, App keys, mint) is made for the run.
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      features:
+        description: Space-separated feature paths under e2e/behaviour
+        default: features/triage/triage.feature
+
+permissions:
+  contents: read
+
+concurrency:
+  group: behaviour-emulator-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # waynesun09/github-emulator branch bt-f5-e2e: ci-self-contained + the mint App seed.
+  EMULATOR_REPO: waynesun09/github-emulator
+  EMULATOR_REF: 7e65143f954eff6154325faafbfa8e17c5c21ba1
+
+jobs:
+  behaviour-emulator:
+    name: behaviour-emulator
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout fullsend
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout github-emulator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.EMULATOR_REPO }}
+          ref: ${{ env.EMULATOR_REF }}
+          path: .emulator
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install emulator dependencies
+        run: |
+          python3 -m venv "$RUNNER_TEMP/emu-venv"
+          "$RUNNER_TEMP/emu-venv/bin/pip" install -q -r .emulator/requirements.txt
+
+      - name: Run behaviour features
+        env:
+          EMULATOR_DIR: ${{ github.workspace }}/.emulator
+          EMULATOR_PY: ${{ runner.temp }}/emu-venv/bin/python
+          STATE_DIR: ${{ runner.temp }}/bt-emulator
+          # Read-only job token, only so the emulator can fetch public
+          # github.com actions without the anonymous rate limit.
+          UPSTREAM_TOKEN: ${{ github.token }}
+          FEATURES: ${{ inputs.features || 'features/triage/triage.feature' }}
+        run: |
+          read -ra feats <<<"$FEATURES"
+          e2e/behaviour/emulator/run-job.sh "${feats[@]}"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: behaviour-emulator-logs
+          path: |
+            ${{ runner.temp }}/bt-emulator/**/*.log
+            ${{ runner.temp }}/bt-emulator/phases.tsv
+            ${{ runner.temp }}/bt-emulator/bt-artifacts/
+          if-no-files-found: warn
