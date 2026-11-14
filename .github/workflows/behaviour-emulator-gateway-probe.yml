@@ -16,7 +16,7 @@ concurrency:
 
 env:
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: 1999e9d2541419b3e9d7ef08757c5812aebfdb2a
+  EMULATOR_REF: d27a3b7af73599747684fbcf656c168ac38b4c7e
 
 jobs:
   gateway-probe:
