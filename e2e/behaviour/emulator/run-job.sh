@@ -96,7 +96,17 @@ for _ in $(seq 1 50); do curl -s -o /dev/null "$MINT/" && break; sleep 0.2; done
 phase mint
 
 # 4. This checkout as fullsend-ai/fullsend, so the shim pinned to HEAD resolves.
-api() { curl -sS -o "$STATE/api-body" -w '%{http_code}' -H "Authorization: token $ADMIN" -H 'Content-Type: application/json' "$@"; }
+# api ARGS: one emulator API call, printing the status code. A 503 (SQLite
+# busy while the emulator still indexes a large push) is retried for ~60 s.
+api() {
+  local code i
+  for i in $(seq 1 30); do
+    code=$(curl -sS -o "$STATE/api-body" -w '%{http_code}' -H "Authorization: token $ADMIN" -H 'Content-Type: application/json' "$@")
+    [ "$code" = 503 ] || break
+    sleep $(( i < 5 ? 1 : 2 ))
+  done
+  echo "$code"
+}
 # ensure_source_repo NAME: create public fullsend-ai/NAME, a source to fetch
 # from only, so its own CI (lint, test, semgrep) is turned off and cannot
 # start in the emulator and hold the runners. Fails loudly.
