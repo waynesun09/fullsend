@@ -19,6 +19,10 @@
 #   AGENTS_REF     agents ref to mirror as main (default main)
 #   AGENTS_PRS     agents pull request numbers merged on top, space-separated
 #                  (e.g. "1871 1873", the host-aware ops scripts)
+#   BEHAVIOUR_CAPABILITIES  passed to the suite (default none). With
+#                  inference-gateway in it, a test gateway runs on
+#                  https://gw.ghemu.localhost (gateway-stub.sh) and the suite
+#                  gets E2E_INFERENCE_GATEWAY_URL and _TEST_KEY.
 # Phase timings go to $STATE_DIR/phases.tsv and the step summary.
 set -euo pipefail
 
@@ -41,6 +45,11 @@ MINT="http://127.0.0.1:$MINT_PORT"
 ADMIN="ghp_run$(openssl rand -hex 16)"
 PHASES="$STATE/phases.tsv"
 : >"$PHASES"
+CAPABILITIES="${BEHAVIOUR_CAPABILITIES:-}"
+GATEWAY=0
+case ",$CAPABILITIES," in *,inference-gateway,*) GATEWAY=1 ;; esac
+GW_HOST="gw.$EMU_HOST"
+GW_IP=10.254.0.1
 
 phase_start=$(date +%s)
 phase() { # phase NAME: close the previous phase and record its wall time
@@ -53,6 +62,7 @@ phase() { # phase NAME: close the previous phase and record its wall time
 # shellcheck disable=SC2317,SC2329 # invoked by the EXIT trap
 stop_all() {
   if [ -f "$STATE/mint.pid" ]; then kill "$(cat "$STATE/mint.pid")" 2>/dev/null || true; fi
+  if [ "$GATEWAY" = 1 ]; then GW_HOST=$GW_HOST GW_IP=$GW_IP "$ROOT/e2e/behaviour/emulator/gateway-stub.sh" stop "$STATE/gateway" || true; fi
   (cd "$EMULATOR_DIR" && CI_STACK_DIR="$STATE/stack" scripts/ci-stack.sh stop) >/dev/null 2>&1 || true
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     { echo "| phase | seconds |"; echo "|---|---|"; awk -F'\t' '{print "| " $1 " | " $2 " |"}' "$PHASES"; } >>"$GITHUB_STEP_SUMMARY"
@@ -68,6 +78,7 @@ sudo sysctl -qw net.ipv4.ip_unprivileged_port_start=80
   CI_STACK_RUNNER_KIND=upstream CI_STACK_RUNNERS="${EMULATOR_RUNNERS:-2}" \
   CI_STACK_TLS=1 CI_STACK_HOST="$EMU_HOST" CI_STACK_PORT=443 CI_STACK_SYSTEM_TRUST=1 \
   CI_STACK_LOCALHOST_DNS=1 CI_STACK_BIND=0.0.0.0 \
+  CI_STACK_DNS_EXTRA="$([ "$GATEWAY" = 1 ] && echo "$GW_HOST=$GW_IP")" \
   GITHUB_EMULATOR_DEFAULT_ADMIN_TOKEN="$ADMIN" \
   GITHUB_EMULATOR_ACTIONS_UPSTREAM_TOKEN="${UPSTREAM_TOKEN:-}" \
     scripts/ci-stack.sh start
@@ -87,6 +98,22 @@ APP_SET=$APP_SET "$EMULATOR_PY" -I "$EMULATOR_DIR/scripts/ci-seed-mint-apps.py" 
 E2E_TOKEN="$(APP_SET=$APP_SET "$EMULATOR_PY" -I "$EMULATOR_DIR/scripts/ci-seed-mint-apps.py" token "$EMU" "$ADMIN" "$ORG" e2e)"
 echo "::add-mask::$E2E_TOKEN"
 phase seed
+
+# 2b. The test inference gateway, trusting the emulator's OIDC issuer and
+# authorising the pool repositories under this emulator's halfsend org id.
+if [ "$GATEWAY" = 1 ]; then
+  discovery=$(curl -fsS "$EMU/.well-known/openid-configuration")
+  GW_HOST=$GW_HOST GW_IP=$GW_IP STACK_TLS="$STATE/stack/tls" \
+  ISSUER="$(jq -r .issuer <<<"$discovery")" JWKS_URL="$(jq -r .jwks_uri <<<"$discovery")" \
+  POOL_ORG_ID="$(curl -sS -H "Authorization: token $ADMIN" "$EMU/api/v3/orgs/$ORG" | jq -r .id)" \
+    "$ROOT/e2e/behaviour/emulator/gateway-stub.sh" start "$STATE/gateway"
+  set -a
+  # shellcheck disable=SC1091 # written by gateway-stub.sh start
+  . "$STATE/gateway/gateway.env"
+  set +a
+  echo "::add-mask::$E2E_INFERENCE_GATEWAY_TEST_KEY"
+  phase gateway
+fi
 
 # 3. fullsend's standalone mint, trusting the emulator's OIDC issuer and API.
 (cd "$ROOT/cmd/mint" && go build -o "$STATE/mint" .)
@@ -162,7 +189,7 @@ status=0
   cd "$ROOT"
   unset GITHUB_TOKEN GITHUB_ACTIONS
   export ENVIRONMENT=emulator BEHAVIOUR_GITHUB_URL="$EMU" GH_TOKEN="$E2E_TOKEN" \
-    FULLSEND_MINT_URL="$MINT" BEHAVIOUR_APP_SET="$APP_SET" BEHAVIOUR_CAPABILITIES='' \
+    FULLSEND_MINT_URL="$MINT" BEHAVIOUR_APP_SET="$APP_SET" BEHAVIOUR_CAPABILITIES="$CAPABILITIES" \
     BEHAVIOUR_POOL_SIZE="${BEHAVIOUR_POOL_SIZE:-1}" \
     GODOG_CONCURRENCY=1 BEHAVIOUR_ARTIFACT_DIR="$STATE/bt-artifacts" \
     BEHAVIOUR_RUN_POLL_INTERVAL="${BEHAVIOUR_RUN_POLL_INTERVAL:-3s}" \

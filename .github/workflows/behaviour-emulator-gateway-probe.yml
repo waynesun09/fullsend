@@ -1,0 +1,71 @@
+name: behaviour-emulator-gateway-probe
+
+# Throwaway: one run of the inference gateway scenario against the in-VM
+# test gateway (e2e/behaviour/emulator/gateway-stub.sh). Not for merge.
+
+on:
+  push:
+    branches: [bt-f3-gateway-probe]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: behaviour-emulator-gateway-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  EMULATOR_REPO: waynesun09/github-emulator
+  EMULATOR_REF: 1999e9d2541419b3e9d7ef08757c5812aebfdb2a
+
+jobs:
+  gateway-probe:
+    name: gateway-probe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout fullsend
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout github-emulator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.EMULATOR_REPO }}
+          ref: ${{ env.EMULATOR_REF }}
+          path: .emulator
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install emulator dependencies
+        run: |
+          python3 -m venv "$RUNNER_TEMP/emu-venv"
+          "$RUNNER_TEMP/emu-venv/bin/pip" install -q -r .emulator/requirements.txt
+
+      - name: Run the inference gateway scenario
+        env:
+          EMULATOR_DIR: ${{ github.workspace }}/.emulator
+          EMULATOR_PY: ${{ runner.temp }}/emu-venv/bin/python
+          STATE_DIR: ${{ runner.temp }}/bt-emulator
+          UPSTREAM_TOKEN: ${{ github.token }}
+          BT_SUITE: behaviour
+          BEHAVIOUR_CAPABILITIES: inference-gateway
+        run: e2e/behaviour/emulator/run-job.sh features/runtime/inference-gateway.feature
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gateway-probe-logs
+          path: |
+            ${{ runner.temp }}/bt-emulator/**/*.log
+            ${{ runner.temp }}/bt-emulator/phases.tsv
+            ${{ runner.temp }}/bt-emulator/gateway/config.yaml
+            ${{ runner.temp }}/bt-emulator/bt-artifacts/
+          if-no-files-found: warn
