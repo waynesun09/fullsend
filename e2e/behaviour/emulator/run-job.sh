@@ -87,7 +87,10 @@ phase seed
 (cd "$ROOT/cmd/mint" && go build -o "$STATE/mint" .)
 hosts=""
 for i in $(seq -f %02g 1 "${BEHAVIOUR_POOL_SIZE:-1}"); do hosts="$hosts,$ORG/test-repo-$i,$ORG/test-repo-$i-mint-host"; done
-PORT=$MINT_PORT MINT_OIDC_ISSUER_URL="$EMU" MINT_GITHUB_API_URL="$EMU/api/v3" \
+# The issuer exactly as the emulator writes it into tokens (it keeps an
+# explicit :443), from its discovery document.
+ISSUER=$(curl -sS "$EMU/.well-known/openid-configuration" | jq -r .issuer)
+PORT=$MINT_PORT MINT_OIDC_ISSUER_URL="$ISSUER" MINT_GITHUB_API_URL="$EMU/api/v3" \
 PEM_DIR="$STATE/pem" ROLE_APP_IDS="$(cat "$STATE/role_app_ids.json")" \
 PER_REPO_WIF_REPOS='*' ALLOWED_WORKFLOW_FILES='*' WORKFLOW_HOST_REPOS="fullsend-ai/fullsend$hosts" \
   nohup "$STATE/mint" >"$STATE/mint.log" 2>&1 &
