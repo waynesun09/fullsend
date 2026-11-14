@@ -154,6 +154,49 @@ if [ "$AGENTS_SEED" = 1 ]; then
     "https://admin:$ADMIN@$EMU_HOST/fullsend-ai/agents.git" "HEAD:refs/heads/main"
   echo "fullsend-ai/agents main on the emulator: $(git -C "$agents" rev-parse --short HEAD) (${AGENTS_REF:-main}${AGENTS_PRS:+ + PRs $AGENTS_PRS})"
   phase agents-push
+  # Pre-pull the sandbox images the agents pin (by digest) into the
+  # runner user's rootless store once, in the background, so no agent job
+  # pays the pull. The suite waits for it below.
+  mapfile -t sandbox_images < <(git -C "$agents" grep -hoE 'image: *[^ ]+@sha256:[0-9a-f]+' HEAD -- harness | sed 's/image: *//' | sort -u)
+  if [ "${#sandbox_images[@]}" -gt 0 ]; then
+    ( for img in "${sandbox_images[@]}"; do podman pull -q "$img" >/dev/null; done ) >"$STATE/prepull.log" 2>&1 &
+    prepull_pid=$!
+  fi
+fi
+
+# 4c. The human-like test actors, as hack/setup-new-e2e-org.sh grants them
+# on a live pool org: write and triage actors are org members holding the
+# all-repository write / triage role (so access survives slot recreation);
+# the outsider has no access. Their PATs are made here and die with the run.
+seed_actor() { # seed_actor LOGIN [ROLE]: prints the actor's PAT
+  local login=$1 role=${2:-} code role_id
+  code=$(api -X POST "$EMU/api/v3/admin/users" -d "{\"login\":\"$login\",\"name\":\"$login\",\"email\":\"$login@localhost\",\"password\":\"$(openssl rand -hex 12)\"}")
+  case "$code" in 201|422) ;; *) echo "::error::creating user $login: HTTP $code $(head -c 300 "$STATE/api-body")" >&2; return 1 ;; esac
+  code=$(api -X POST "$EMU/api/v3/admin/tokens" -d "{\"login\":\"$login\",\"name\":\"behaviour\",\"scopes\":[\"repo\",\"read:org\",\"workflow\"]}")
+  [ "$code" = 201 ] || { echo "::error::token for $login: HTTP $code $(head -c 300 "$STATE/api-body")" >&2; return 1; }
+  local pat; pat=$(jq -r '.token // .raw // empty' "$STATE/api-body")
+  [ -n "$pat" ] || { echo "::error::token for $login: no token in response" >&2; return 1; }
+  if [ -n "$role" ]; then
+    code=$(api -X PUT "$EMU/api/v3/orgs/$ORG/memberships/$login" -d '{"role":"member"}')
+    case "$code" in 200|201) ;; *) echo "::error::membership for $login: HTTP $code $(head -c 300 "$STATE/api-body")" >&2; return 1 ;; esac
+    code=$(api "$EMU/api/v3/orgs/$ORG/organization-roles")
+    role_id=$(jq -r --arg n "all_repo_$role" '.roles[] | select(.name == $n) | .id' "$STATE/api-body")
+    [ -n "$role_id" ] || { echo "::error::no all_repo_$role role in $ORG" >&2; return 1; }
+    code=$(api -X PUT "$EMU/api/v3/orgs/$ORG/organization-roles/users/$login/$role_id")
+    [ "$code" = 204 ] || { echo "::error::all_repo_$role for $login: HTTP $code $(head -c 300 "$STATE/api-body")" >&2; return 1; }
+  fi
+  echo "$pat"
+}
+TEST_ACTOR_WRITE_PAT=$(seed_actor fstest-write write)
+TEST_ACTOR_TRIAGE_PAT=$(seed_actor fstest-triage triage)
+TEST_ACTOR_OUTSIDER_PAT=$(seed_actor fstest-outsider)
+for pat in "$TEST_ACTOR_WRITE_PAT" "$TEST_ACTOR_TRIAGE_PAT" "$TEST_ACTOR_OUTSIDER_PAT"; do echo "::add-mask::$pat"; done
+export TEST_ACTOR_WRITE_PAT TEST_ACTOR_TRIAGE_PAT TEST_ACTOR_OUTSIDER_PAT
+phase actors
+
+if [ -n "${prepull_pid:-}" ]; then
+  wait "$prepull_pid" || echo "::warning::sandbox image pre-pull failed; agent jobs pull on demand ($(tail -c 300 "$STATE/prepull.log"))"
+  phase prepull-wait
 fi
 
 # 5. The suite, emulator mode.
@@ -164,14 +207,14 @@ status=0
   export ENVIRONMENT=emulator BEHAVIOUR_GITHUB_URL="$EMU" GH_TOKEN="$E2E_TOKEN" \
     FULLSEND_MINT_URL="$MINT" BEHAVIOUR_APP_SET="$APP_SET" BEHAVIOUR_CAPABILITIES='' \
     BEHAVIOUR_POOL_SIZE="${BEHAVIOUR_POOL_SIZE:-1}" \
-    GODOG_CONCURRENCY=1 BEHAVIOUR_ARTIFACT_DIR="$STATE/bt-artifacts" \
+    GODOG_CONCURRENCY="${GODOG_CONCURRENCY:-1}" BEHAVIOUR_ARTIFACT_DIR="$STATE/bt-artifacts" \
     BEHAVIOUR_RUN_POLL_INTERVAL="${BEHAVIOUR_RUN_POLL_INTERVAL:-3s}" \
     BEHAVIOUR_NEGATIVE_SETTLE="${BEHAVIOUR_NEGATIVE_SETTLE:-20s}"
   if [ "$SUITE" = playback ]; then
-    go test -tags playback -count=1 -timeout 40m -v ./e2e/behaviour/ -run TestPlaybackSuite
+    go test -tags playback -count=1 -timeout "${SUITE_TIMEOUT:-40m}" -v ./e2e/behaviour/ -run TestPlaybackSuite
   else
     BEHAVIOUR_FEATURES="${FEATURES[*]}" \
-      go test -tags behaviour -count=1 -timeout 40m -v ./e2e/behaviour/ -run TestBehaviourSuite
+      go test -tags behaviour -count=1 -timeout "${SUITE_TIMEOUT:-40m}" -v ./e2e/behaviour/ -run TestBehaviourSuite
   fi
 ) 2>&1 | tee "$STATE/bt-run.log" || status=$?
 phase suite
