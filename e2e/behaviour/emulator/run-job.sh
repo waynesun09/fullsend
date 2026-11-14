@@ -52,6 +52,14 @@ phase() { # phase NAME: close the previous phase and record its wall time
 
 # shellcheck disable=SC2317,SC2329 # invoked by the EXIT trap
 stop_all() {
+  if [ -n "${sampler_pid:-}" ]; then
+    # The sampler finishes its current sample and the profile first; never
+    # let it hold the job open.
+    kill "$sampler_pid" 2>/dev/null
+    for _ in $(seq 45); do kill -0 "$sampler_pid" 2>/dev/null || break; sleep 1; done
+    kill -9 "$sampler_pid" 2>/dev/null || true
+    echo "VM peak: $(cat "$STATE/vm-peak.log" 2>/dev/null)"
+  fi
   if [ -f "$STATE/mint.pid" ]; then kill "$(cat "$STATE/mint.pid")" 2>/dev/null || true; fi
   (cd "$EMULATOR_DIR" && CI_STACK_DIR="$STATE/stack" scripts/ci-stack.sh stop) >/dev/null 2>&1 || true
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
@@ -198,6 +206,11 @@ if [ -n "${prepull_pid:-}" ]; then
   wait "$prepull_pid" || echo "::warning::sandbox image pre-pull failed; agent jobs pull on demand ($(tail -c 300 "$STATE/prepull.log"))"
   phase prepull-wait
 fi
+
+# CPU, memory and live sandboxes every few seconds for the suite's length
+# (vm-samples.log, vm-peak.log), to check the concurrency fits the VM.
+"$ROOT/e2e/behaviour/emulator/sample-vm.sh" "$STATE" "$STATE/stack/emulator.pid" &
+sampler_pid=$!
 
 # 5. The suite, emulator mode.
 status=0

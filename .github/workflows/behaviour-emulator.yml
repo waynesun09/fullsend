@@ -92,5 +92,6 @@ jobs:
           path: |
             ${{ runner.temp }}/bt-emulator/**/*.log
             ${{ runner.temp }}/bt-emulator/phases.tsv
+            ${{ runner.temp }}/bt-emulator/emulator-profile.json
             ${{ runner.temp }}/bt-emulator/bt-artifacts/
           if-no-files-found: warn
