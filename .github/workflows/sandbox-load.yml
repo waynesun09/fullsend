@@ -70,3 +70,4 @@ jobs:
           openshell sandbox list || true
           podman ps -a --format '{{.Names}} {{.Status}}' || true
           free -m
+          journalctl --user -u openshell-gateway --no-pager | tail -80 || true

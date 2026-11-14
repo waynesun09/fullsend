@@ -9,6 +9,7 @@ set -euo pipefail
 n="$1"
 out="$2"
 image="${SANDBOX_IMAGE:-ghcr.io/fullsend-ai/fullsend-sandbox:latest}"
+policy="${SANDBOX_POLICY:-$GITHUB_WORKSPACE/internal/agentnew/templates/policies/base.yaml}"
 mkdir -p "$out"
 
 ts() { date +%s.%N; }
@@ -17,9 +18,19 @@ one() {
   local i="$1" name="bt-load-${n}-$1" t0 t1 t2 t3 t4
   t0=$(ts)
   openshell sandbox create --name "$name" --keep --no-auto-providers --no-tty \
-    --from "$image" --detach -- sleep infinity >"$out/create-$i.log" 2>&1 || true
+    --from "$image" --policy "$policy" --detach -- sleep infinity >"$out/create-$i.log" 2>&1 || true
   until openshell sandbox get "$name" 2>/dev/null | grep -Eq 'Phase:.*Ready'; do
-    if [[ $(echo "$(ts) - $t0 > 180" | bc) == 1 ]]; then echo "$i timeout" >>"$out/errors.txt"; echo fail >"$out/ready-$i"; return 1; fi
+    if [[ $(echo "$(ts) - $t0 > 180" | bc) == 1 ]]; then
+      {
+        echo "== $i timeout; create output:"; cat "$out/create-$i.log"
+        echo "== sandbox get:"; openshell sandbox get "$name" 2>&1 | head -40
+        for c in $(podman ps -a --format '{{.Names}}' | grep -E "${name}|supervisor"); do
+          echo "== podman logs $c:"; podman logs --tail 30 "$c" 2>&1
+        done
+      } >>"$out/errors.txt"
+      openshell sandbox delete "$name" >/dev/null 2>&1 || true
+      echo fail >"$out/ready-$i"; return 1
+    fi
     sleep 0.5
   done
   t1=$(ts)
@@ -57,7 +68,7 @@ kill "$vm" || true
 free -m >"$out/free-after.txt"
 printf 'n=%s wall=%.1f\n' "$n" "$(echo "$end-$start" | bc)" >"$out/summary.txt"
 echo "== n=$n: id create-to-ready upload exec hold+delete (s)"
-sort -n "$out/phases.txt"
+sort -n "$out/phases.txt" 2>/dev/null || echo "(no sandbox finished)"
 cat "$out/summary.txt"
 echo "== free at peak"; cat "$out/free-peak.txt"
 echo "== podman stats at peak"; cat "$out/podman-stats.txt"
@@ -65,3 +76,4 @@ echo "== top RSS"; cat "$out/ps-top.txt"
 echo "== vmstat peak: min idle %, max run queue, min free MB"
 awk 'NR>2 {if (min_id=="" || $15<min_id) min_id=$15; if ($1>max_r) max_r=$1; if (min_free=="" || $4<min_free) min_free=$4} END {print min_id, max_r, int(min_free/1024)}' "$out/vmstat.txt"
 if [[ -f "$out/errors.txt" ]]; then echo "== errors"; cat "$out/errors.txt"; fi
+exit 0
