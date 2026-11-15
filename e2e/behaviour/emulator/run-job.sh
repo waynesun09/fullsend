@@ -104,6 +104,7 @@ sudo sysctl -qw net.ipv4.ip_unprivileged_port_start=80
   CI_STACK_RAW_HOST=1 \
   CI_STACK_DNS_EXTRA="$([ "$GATEWAY" = 1 ] && echo "$GW_HOST=$GW_IP")" \
   GITHUB_EMULATOR_DEFAULT_ADMIN_TOKEN="$ADMIN" \
+  GITHUB_EMULATOR_RATE_LIMIT=1000000 \
   GITHUB_EMULATOR_ACTIONS_UPSTREAM_TOKEN="${UPSTREAM_TOKEN:-}" \
     scripts/ci-stack.sh start
 )
