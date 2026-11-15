@@ -8,15 +8,13 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      # No defaults: an empty input falls back to the shards and DEFAULT_*.
       features:
-        description: Space-separated feature paths under e2e/behaviour
-        default: features/triage/triage.feature
+        description: Space-separated feature paths under e2e/behaviour (empty runs the shards and playback)
       workers:
-        description: Scenarios in parallel (slot pool size and godog concurrency)
-        default: "1"
+        description: Scenarios in parallel (slot pool size and godog concurrency; empty uses DEFAULT_WORKERS)
       runners:
-        description: Real actions/runner processes on the emulator
-        default: "2"
+        description: Real actions/runner processes on the emulator (empty uses DEFAULT_RUNNERS)
 
 permissions:
   contents: read
