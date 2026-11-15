@@ -36,17 +36,17 @@ env:
   # which the emulator answers on a private VM address, and fullsend's fetch
   # guard refuses private addresses by design.
   SHARD_A_FEATURES: >-
-    features/dispatch/owners-auth.feature features/platform/actor-authorization.feature features/dispatch/fork-bash-routing.feature features/triage/triage.feature
+    features/dispatch/owners-auth.feature features/platform/actor-authorization.feature
   SHARD_B_FEATURES: >-
-    features/dispatch/dispatch.feature features/dispatch/fix-authorization.feature features/dispatch/retro-cel-route.feature features/dispatch/hooks-loaded.feature features/dispatch/reaction-notifications.feature features/actors/actor-identities.feature features/dispatch/jira-poll-dispatch.feature features/dispatch/jira-transport-bounds.feature
+    features/triage/triage.feature features/dispatch/dispatch.feature features/dispatch/fix-authorization.feature features/dispatch/retro-cel-route.feature features/dispatch/hooks-loaded.feature features/dispatch/reaction-notifications.feature features/actors/actor-identities.feature features/dispatch/jira-poll-dispatch.feature features/dispatch/jira-transport-bounds.feature
   SHARD_C_FEATURES: >-
-    features/dispatch/fork-dispatch.feature features/dispatch/url-dispatch.feature:29 features/dispatch/url-dispatch.feature:64 features/dispatch/url-dispatch.feature:100 features/dispatch/triage-prioritize-cel-route.feature features/dispatch/runner-secret-overlay-guard.feature features/dispatch/review-cel-route.feature
+    features/dispatch/fork-bash-routing.feature features/dispatch/fork-dispatch.feature features/dispatch/url-dispatch.feature:29 features/dispatch/url-dispatch.feature:64 features/dispatch/url-dispatch.feature:100 features/dispatch/triage-prioritize-cel-route.feature features/dispatch/runner-secret-overlay-guard.feature features/dispatch/review-cel-route.feature
   DEFAULT_CAPABILITIES: runner-secret-overlay-guard
   DEFAULT_WORKERS: "6"
   DEFAULT_RUNNERS: "12"
   # waynesun09/github-emulator ci-self-contained (integration head with the mint App seed).
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: 27dfc57829898ea374efb7cea3b8972f9c36ceb8
+  EMULATOR_REF: 668ea20a239e2f1514ab13d0c6d54a6cf9262a3e
 
 jobs:
   behaviour-emulator:
