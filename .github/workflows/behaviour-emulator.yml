@@ -30,6 +30,8 @@ env:
   # minutes of suite per shard). A 4-vCPU VM averages 60-66% CPU at six
   # workers, so shards scale out, not up.
   #
+  # Shard e: mint-scope.feature (18 outline rows, about 10 minutes of suite).
+  #
   # Live only, not here: base-dispatch.feature (both scenarios) and
   # url-dispatch.feature:7. They fetch a harness from raw.githubusercontent.com,
   # which the emulator answers on a private VM address, and fullsend's fetch
@@ -42,6 +44,8 @@ env:
     features/dispatch/fork-bash-routing.feature features/dispatch/fix-authorization.feature features/dispatch/fork-dispatch.feature features/dispatch/url-dispatch.feature:29 features/dispatch/url-dispatch.feature:64 features/dispatch/url-dispatch.feature:100 features/dispatch/runner-secret-overlay-guard.feature
   SHARD_D_FEATURES: >-
     features/platform/bot-actor-authorization.feature features/dispatch/triage-prioritize-cel-route.feature features/dispatch/review-cel-route.feature features/dispatch/reaction-notifications.feature
+  SHARD_E_FEATURES: >-
+    features/platform/mint-scope.feature
   DEFAULT_CAPABILITIES: runner-secret-overlay-guard
   DEFAULT_WORKERS: "6"
   DEFAULT_RUNNERS: "12"
@@ -58,7 +62,7 @@ jobs:
       fail-fast: false
       matrix:
         # A dispatch with explicit features runs them as one "custom" shard.
-        shard: ${{ fromJSON(inputs.features && '["custom"]' || '["a","b","c","d"]') }}
+        shard: ${{ fromJSON(inputs.features && '["custom"]' || '["a","b","c","d","e"]') }}
     steps:
       - name: Checkout fullsend
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -92,7 +96,7 @@ jobs:
           # Read-only job token, only so the emulator can fetch public
           # github.com actions without the anonymous rate limit.
           UPSTREAM_TOKEN: ${{ github.token }}
-          FEATURES: ${{ inputs.features || (matrix.shard == 'a' && env.SHARD_A_FEATURES) || (matrix.shard == 'b' && env.SHARD_B_FEATURES) || (matrix.shard == 'c' && env.SHARD_C_FEATURES) || env.SHARD_D_FEATURES }}
+          FEATURES: ${{ inputs.features || (matrix.shard == 'a' && env.SHARD_A_FEATURES) || (matrix.shard == 'b' && env.SHARD_B_FEATURES) || (matrix.shard == 'c' && env.SHARD_C_FEATURES) || (matrix.shard == 'd' && env.SHARD_D_FEATURES) || env.SHARD_E_FEATURES }}
           WORKERS: ${{ inputs.workers || env.DEFAULT_WORKERS }}
           EMULATOR_RUNNERS: ${{ inputs.runners || env.DEFAULT_RUNNERS }}
           SUITE_TIMEOUT: 30m
