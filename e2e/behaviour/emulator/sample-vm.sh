@@ -46,9 +46,28 @@ cpu_busy() { # prints busy % since the previous call
   prev_total=$total prev_idle=$idle_all
 }
 
-peak_cpu=0 peak_mem=0 peak_load=0 peak_sandboxes=0 samples=0 busy_samples=0
+hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+emu_cpu() { # prints the emulator's CPU % of one core since the previous call
+  local stat ticks now
+  stat=""
+  [ -n "$emu_pid" ] && stat=$(cat "/proc/$emu_pid/stat" 2>/dev/null)
+  if [ -z "$stat" ]; then echo 0; return; fi
+  # Fields after the parenthesised command: utime is 14th, stime 15th overall.
+  read -r -a f <<<"${stat##*) }"
+  if [ "${#f[@]}" -lt 13 ]; then echo 0; return; fi
+  ticks=$((f[11] + f[12]))
+  now=$(date +%s%N)
+  if [ -n "${prev_ticks:-}" ] && [ "$now" -gt "$prev_now" ]; then
+    echo $((100 * (ticks - prev_ticks) * 1000000000 / hz / (now - prev_now)))
+  else
+    echo 0
+  fi
+  prev_ticks=$ticks prev_now=$now
+}
+
+peak_cpu=0 peak_mem=0 peak_load=0 peak_sandboxes=0 samples=0 busy_samples=0 peak_emu_cpu=0
 summary() {
-  echo "samples=$samples cpu_busy_peak=${peak_cpu}% cpu_busy_ge90_samples=$busy_samples mem_used_peak=${peak_mem}MB load1_peak=$peak_load sandboxes_peak=$peak_sandboxes" >"$out/vm-peak.log"
+  echo "samples=$samples cpu_busy_peak=${peak_cpu}% cpu_busy_ge90_samples=$busy_samples mem_used_peak=${peak_mem}MB load1_peak=$peak_load sandboxes_peak=$peak_sandboxes emu_cpu_peak=${peak_emu_cpu}%" >"$out/vm-peak.log"
   if [ -n "${spy:-}" ]; then
     # py-spy writes the profile on SIGINT; give it 30 s, then stop waiting.
     sudo pkill -INT -f "py-spy record --pid $emu_pid" 2>/dev/null
@@ -58,8 +77,9 @@ summary() {
 }
 trap summary TERM INT
 
-echo "time cpu_busy% load1 mem_used_MB mem_avail_MB swap_used_MB sandboxes emu_rss_MB" >"$log"
+echo "time cpu_busy% load1 mem_used_MB mem_avail_MB swap_used_MB sandboxes emu_rss_MB emu_cpu%" >"$log"
 cpu_busy >/dev/null
+emu_cpu >/dev/null
 while :; do
   sleep "$interval"
   busy=$(cpu_busy)
@@ -70,7 +90,9 @@ while :; do
   boxes=$(timeout 5 podman ps -q --filter name=openshell-default 2>/dev/null | wc -l)
   rss=0
   [ -n "$emu_pid" ] && rss=$(($(ps -o rss= -p "$emu_pid" 2>/dev/null || echo 0) / 1024))
-  echo "$(date -u +%H:%M:%S) $busy $load1 $used $avail $swap $boxes $rss" >>"$log"
+  ecpu=$(emu_cpu)
+  echo "$(date -u +%H:%M:%S) $busy $load1 $used $avail $swap $boxes $rss $ecpu" >>"$log"
+  [ "$ecpu" -gt "$peak_emu_cpu" ] && peak_emu_cpu=$ecpu
   samples=$((samples + 1))
   [ "$busy" -gt "$peak_cpu" ] && peak_cpu=$busy
   [ "$busy" -ge 90 ] && busy_samples=$((busy_samples + 1))
