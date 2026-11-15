@@ -23,8 +23,9 @@ emu_pid=""
 
 if [ "${EMULATOR_PROFILE:-0}" = 1 ] && [ -n "$emu_pid" ]; then
   py="${EMULATOR_PY:-python3}"
-  # The job points SSL_CERT_FILE at the emulator's CA; PyPI needs the system one.
-  if env -u SSL_CERT_FILE -u REQUESTS_CA_BUNDLE "$py" -m pip install -q py-spy >"$out/py-spy.log" 2>&1; then
+  # The job points the CA variables at the emulator's CA (requests, under
+  # pip, reads CURL_CA_BUNDLE too); PyPI needs the system trust store.
+  if env -u SSL_CERT_FILE -u REQUESTS_CA_BUNDLE -u CURL_CA_BUNDLE "$py" -m pip install -q py-spy >"$out/py-spy.log" 2>&1; then
     # shellcheck disable=SC2024 # the log is the runner user's, not root's
     sudo "$(dirname "$py")/py-spy" record --pid "$emu_pid" --subprocesses --nonblocking \
       --format speedscope --output "$out/emulator-profile.json" >>"$out/py-spy.log" 2>&1 &
