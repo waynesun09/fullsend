@@ -20,6 +20,21 @@ Date: 2026-04-07
 
 Accepted
 
+*Amended by [ADR 0055](0055-unified-env-var-delivery.md), which introduces a
+unified `env:` key with `runner`/`sandbox` sub-maps and deprecates `runner_env`
+and the manual `.env` file convention.*
+
+*Extended by [ADR 0070](0070-portable-provider-profile-resolution.md), which
+adds `openshell.profiles` and URL-based `providers` fields to the harness schema
+for portable provider and profile resolution. Superseded by
+[ADR 0075](0075-local-path-profiles-providers.md), which extends resolution to
+local filesystem paths.*
+
+*See also [ADR 0081](0081-reserve-workflow-env-for-infra-plumbing.md), which
+narrows the CI workflow `env:` injection path described in "Template
+instantiation" below to infrastructure plumbing and CI-runtime-only values;
+static agent behavior defaults go through harness composition instead.*
+
 ## Context
 
 Each agent invocation requires configuration that ties together several moving
@@ -73,12 +88,16 @@ parts:
 13. **Security scanning** — layered prompt injection defenses enforced by
     default and built into the `fullsend` CLI. Host-side scanners run before
     sandbox creation (context injection detection, SSRF validation, unicode
-    normalization, secret redaction, ML-based LLM Guard). Sandbox-side
-    pre/post-tool hooks are installed into the Claude configuration during
+    normalization, secret redaction, ML-based LLM Guard — as of #6522 the
+    ML scanner ships only in the runner image, not in release binaries).
+    Sandbox-side pre/post-tool hooks are installed into the Claude
+    configuration during
     bootstrap (Tirith terminal security, SSRF pre-tool checks, secret
     redaction post-tool). Omitting the `security` block enables all scanners
     with fail-closed semantics. Individual scanners can be toggled off
     per-harness, but there is no global kill switch.
+    The actor-attributed source-record admission and per-record authorization
+    boundary is defined by [ADR 0133](0133-actor-attributed-data-security-boundary.md).
 14. **Validation loop** — an optional deterministic script that checks agent
     output and re-runs the same agent with feedback on failure. The current
     implementation supports re-running the previous agent with validation
@@ -121,6 +140,10 @@ definition and executes a deterministic sequence:
 │     (push, PR creation, label transitions)                │
 └───────────────────────────────────────────────────────────┘
 ```
+
+> Step 9c no longer applies to an iteration the runner killed at
+> `timeout_minutes`: the loop stops and the run ends with a distinct timeout
+> error ([ADR 0105](0105-timed-out-iteration-ends-the-run.md)).
 
 The runner is deterministic code, not an LLM. The agent is the LLM session.
 Each harness invocation provisions one sandbox for one agent — consistent with
@@ -230,12 +253,12 @@ agents/             # Agent definitions (.md, following Claude standard)
   arch-reviewer.md
   docs-reviewer.md
 
-skills/             # Skill definitions (SKILL.md, following AgentSkills standard)
-  triage-coordination/SKILL.md
-  detect-duplicates/SKILL.md
-  assess-completeness/SKILL.md
-  code-implementation/SKILL.md
-  testing-conventions/SKILL.md
+skills/             # Skill directories (each contains SKILL.md + companion files)
+  triage-coordination/
+  detect-duplicates/
+  assess-completeness/
+  code-implementation/
+  testing-conventions/
 
 env/                # Environment files delivered into the sandbox
   gcp-vertex.env    # May contain ${VAR} references expanded at bootstrap
@@ -380,6 +403,7 @@ agent_input: <directory>
 # another agent, and where that agent runs, is an open question.
 validation_loop:
   script: scripts/<validate>.sh     # exit 0 = pass, non-zero = retry
+  schema: schemas/result.schema.json # output schema (resolved like script)
   max_iterations: 3                 # how many times the agent can retry
   feedback_mode: append             # append validation output to agent prompt
 
@@ -415,7 +439,7 @@ security:
     context_injection: true
     ssrf_validator: true
     secret_redactor: true
-    llm_guard:
+    llm_guard:                       # validated but never read; see #6522
       enabled: true
       threshold: 0.92
       match_type: sentence           # "sentence" or "full"
@@ -424,6 +448,22 @@ security:
       enabled: true
     ssrf_pretool: true
     secret_redact_posttool: true
+
+# Remote resource access (ADR-0038). URL-prefix allowlist for skills, agents,
+# plugins, and policies fetched from HTTPS endpoints with SHA256 integrity verification.
+allowed_remote_resources:
+  - https://example.com/skills/
+  - https://example.com/policies/
+
+# Opt-in to runtime skill fetching. When true, the runner starts a fetch
+# service that agents can call mid-run via `fullsend fetch-skill`. Requires
+# at least one entry in allowed_remote_resources. Default: false.
+allow_runtime_fetch: true
+
+# Maximum number of runtime fetch requests per agent run. Requires
+# allow_runtime_fetch to be true. When omitted, uses the default (10).
+# Must be between 1 and 1000.
+max_runtime_fetches: 10
 ```
 
 ### Example: triage harness (with container image)
@@ -522,6 +562,7 @@ post_script: scripts/code-post.sh
 
 validation_loop:
   script: scripts/validate-lint.sh
+  schema: schemas/code-result.schema.json
   max_iterations: 3
   feedback_mode: append
 
@@ -708,7 +749,8 @@ in [#234](https://github.com/fullsend-ai/fullsend/issues/234).
 - **Security scanning is per-harness, enforced by default, with no global kill
   switch.** Layered prompt injection defenses — host-side scanners (unicode
   normalization, context injection detection, SSRF validation, secret
-  redaction, ML-based LLM Guard) and sandbox-side hooks (Tirith terminal
+  redaction, ML-based LLM Guard — as of #6522 the ML scanner ships only in
+  the runner image, not in release binaries) and sandbox-side hooks (Tirith terminal
   security, SSRF pre-tool, secret redaction post-tool) — are built into the
   `fullsend` CLI and enabled with fail-closed semantics by default. Individual
   scanners can be toggled off per-harness for development, but there is no
@@ -736,7 +778,9 @@ intentionally deferred to keep scope manageable:
   files may need a `version` field for schema evolution (e.g. when fields are
   renamed or restructured). The team agreed this is important but not
   blocking — failed validation can surface schema drift without a version
-  field.
+  field. Decided in [ADR 0127](0127-harness-schema-versioning-and-field-types.md):
+  a planned `schema_version` field (absent = `1`) with field-level semantic
+  types. Type-violation checks in `Harness.Lint()` are not yet implemented.
 - **Protected vs. freely overridable fields
   ([#236](https://github.com/fullsend-ai/fullsend/issues/236)).** At each
   inheritance layer (fullsend defaults → org `.fullsend` → per-repo), which

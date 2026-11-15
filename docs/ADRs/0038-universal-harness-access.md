@@ -22,6 +22,12 @@ Date: 2026-05-07
 
 Accepted
 
+*Extended by [ADR 0070](0070-portable-provider-profile-resolution.md), which
+adds URL support to `providers` and introduces `openshell.profiles` — extending
+portable resolution to provider and profile definitions. Superseded by
+[ADR 0075](0075-local-path-profiles-providers.md), which extends resolution to
+local filesystem paths.*
+
 ## Context
 
 Currently, harnesses reference local files through relative paths resolved against the `.fullsend` directory structure (ADR-0024). A harness configuration might reference:
@@ -69,11 +75,13 @@ Extend every path field in the harness schema to support three forms:
 
 1. **Absolute file path:** `/opt/fullsend/agents/code.md`
 2. **Relative file path:** `agents/code.md` (resolved against `.fullsend` base)
-3. **HTTP(S) URL:** `https://raw.githubusercontent.com/fullsend-ai/library/8cd3799.../agents/code.md#sha256=abc123...`
+3. **HTTP(S) URL:** `https://raw.githubusercontent.com/fullsend-ai/library/8cd3799.../agents/code.md#sha256=abc123...` (single-file resources) or `https://github.com/fullsend-ai/library/tree/8cd3799.../skills/rust#sha256=<tree-hash>...` (directory resources like skills)
 
 When the runner encounters a URL, it fetches the resource, caches it locally (content-addressed by SHA256), and validates its integrity before use. All referenced resources (skills, policies, scripts, binaries) support the same three forms, creating a uniform resolution model.
 
-**Note on URL immutability:** Example URLs in this ADR use GitHub `raw.githubusercontent.com` URLs with commit SHAs (e.g., `8cd3799...`) to ensure immutability. Branch-based URLs like `https://github.com/fullsend-ai/library/blob/main/agents/code.md` point to mutable content—the branch advances as commits are added. For production use, always use commit-pinned URLs or rely on the mandatory `#sha256=...` integrity hash to detect changes.
+**Skill directory model:** Skills are directories containing `SKILL.md` plus optional companion files (`scripts/`, `sub-agents/`, `assets/`). The entire directory tree is uploaded to the sandbox. When referenced via URL, skill URLs point to the directory (not the `SKILL.md` file) and use `github.com/.../tree/...` format. The integrity hash covers the entire directory tree (tree hash). The resolver uses forge APIs (GitHub Contents API, GitLab equivalent) to list directory contents, fetch all files, and reconstruct the directory tree in the local cache. Skills from non-forge HTTPS URLs are rejected because HTTP has no standard directory listing mechanism. Agents and policies remain single-file resources and work with any HTTPS URL.
+
+**Note on URL immutability:** Example URLs in this ADR use GitHub commit-pinned URLs with commit SHAs (e.g., `8cd3799...`) to ensure immutability. For single-file resources (agents, policies), `raw.githubusercontent.com` URLs are used. For directory resources (skills), `github.com/.../tree/...` URLs are used. Branch-based URLs point to mutable content—the branch advances as commits are added. For production use, always use commit-pinned URLs or rely on the mandatory `#sha256=...` integrity hash to detect changes.
 
 **Transitive closure:** A URL-referenced skill that itself references other skills via `dependencies:` in its frontmatter triggers a recursive fetch. The runner builds a complete dependency graph before sandbox creation. Skill-level `policy:` is deferred — the harness-level policy governs sandboxing, and there is no clear runtime semantic for a skill overriding or composing with the harness policy.
 
@@ -87,9 +95,11 @@ Like Option A, but all URLs must include an integrity hash:
 
 ```yaml
 agent: https://raw.githubusercontent.com/fullsend-ai/library/8cd3799.../agents/code.md#sha256=abc123...
+skills:
+  - https://github.com/fullsend-ai/library/tree/8cd3799.../skills/rust#sha256=<tree-hash>...
 ```
 
-The runner verifies the fetched content matches the declared hash before using it. This prevents TOCTOU attacks at the cost of requiring hash management for every remote resource.
+The runner verifies the fetched content matches the declared hash before using it. For single-file resources (agents, policies), the hash covers the file content. For directory resources (skills), the hash covers the entire directory tree. This prevents TOCTOU attacks at the cost of requiring hash management for every remote resource.
 
 **Trade-offs:**
 - **Pros:** Eliminates silent substitution attacks. Makes dependency versions explicit.
@@ -127,8 +137,9 @@ All resources remain local paths. Sharing requires manual copy-paste.
 
 **Hybrid approach: Option A for declarative resources combined with Option C's restriction on executable resources:**
 
-- Support URLs, absolute paths, and relative paths uniformly for **declarative** harness resources (agents, skills, policies, schemas)
-- **Executable resources (scripts, binaries) must be local files** (Option C restriction) to preserve auditability and prevent direct code execution from untrusted sources
+- Support URLs, absolute paths, and relative paths uniformly for **declarative** harness resources (agents, skills, plugins, policies, schemas). See amendment below for plugin classification rationale
+- **Executable resources (scripts, binaries) must be local files** (Option C restriction) to preserve auditability and prevent direct code execution from untrusted sources. Standalone URL references in script fields (`pre_script: https://...`) are rejected at validation time
+- **Exception: `base:` composition (ADR-0045).** When a harness inherits from a URL-referenced base via the `base:` field, scripts declared in the base harness are fetched from the same source as the base itself. The trust model is transitive: the base harness content is SHA256-pinned, and scripts referenced within that pinned content are fetched from the same origin. Script integrity depends on the base URL pointing to an immutable ref (e.g., a commit SHA in the URL path, not a branch name). When the base URL uses a mutable ref such as `main`, scripts could change between fetches even though the base harness hash is pinned — operators should ensure base URLs contain commit SHAs for production use. After fetching, scripts are cached content-addressed and their paths are rewritten to local cache paths before validation, preserving the invariant that all script fields are local paths at validation time
 - Fetch and cache remote resources content-addressed by SHA256
 - Validate integrity, apply SSRF protection, and enforce per-resource policies (read-only vs executable)
 - Extend transitive closure to all referenced resources
@@ -142,7 +153,8 @@ With the hybrid approach (URL support for declarative resources, local files for
 
 ### What changes
 
-- **Harness schema:** Declarative resource path fields (`agent`, `policy`, `skills[]`) accept URLs. Executable resource fields (`pre_script`, `post_script`) and configuration files (`host_files[].src`) must be local paths (see "Security implications" section for rationale).
+- **Harness schema:** Declarative resource path fields (`agent`, `policy`, `skills[]`, `plugins[]`) accept URLs. Executable resource fields (`pre_script`, `post_script`, `validation_loop.script`, `agent_input`) and configuration files (`host_files[].src`) must be local paths when set directly in a harness. However, when inherited from a URL-referenced `base:` harness (ADR-0045), these fields are resolved by fetching the scripts from the base's source URL, caching them locally, and rewriting the paths. See "Security implications" section for rationale.
+- **Skill resolution model:** Skills referenced via URL point to directories, not individual `SKILL.md` files. The resolver uses forge APIs (GitHub Contents API, GitLab equivalent) to list directory contents, fetch all files, and reconstruct the directory tree in the local cache. Skills from non-forge HTTPS URLs are rejected because HTTP has no standard directory listing mechanism. Agents and policies remain single-file resources and work with any HTTPS URL.
 - **Resolution logic:** The runner resolves URLs by fetching, caching (content-addressed), and validating before use.
 - **Transitive closure (Phase 2 feature):** URL-referenced resources can themselves reference other resources via URL, creating a dependency tree. Phase 1 implementation limits URL references to single-level only (harness can reference URL-based resources, but those resources cannot reference additional URLs). Phase 2 adds full transitive resolution with:
   - **Visited node tracking:** The resolver maintains a set of already-visited URLs. If a URL is encountered twice in the same dependency chain, the resolver returns an error indicating a circular dependency.
@@ -168,10 +180,10 @@ With the hybrid approach (URL support for declarative resources, local files for
    - Lock files (future): Pin exact URLs and hashes for all transitive dependencies.
 
 4. **Prompt injection via skills:** A URL-fetched skill contains adversarial instructions designed to manipulate the agent. **Mitigations:**
-   - All skills (local or remote) pass through the same security scanners (unicode normalization, context injection detection, LLM Guard).
+   - All skills (local or remote) pass through the same security scanners (unicode normalization, context injection detection). Note: LLM Guard is **not** among them — skill scanning runs `scanRuntimeContent`, which uses the heuristic `InputPipeline` only and never calls the ML scanner, in any image (#6522).
    - Remote skills are subject to more restrictive policies than local skills (e.g., cannot reference executable scripts).
 
-5. **Executable code from URLs:** Pre/post scripts fetched from URLs run on the runner host with full privileges. **Mitigation:** Apply **Option C** restriction: scripts and binaries must be local files. Only declarative resources (agents, skills, policies, schemas) can be URLs. **Alternative (future):** URL-sourced scripts could run in a restricted sandbox with no access to secrets, no network, and no filesystem writes outside `/tmp`. This requires designing an in-sandbox pre/post command execution mechanism (something like `pre_commands`/`post_commands` that run inside the sandbox before/after the agent's main execution). Today, `pre_script` and `post_script` run outside the sandbox. Any relaxation of the "scripts must be local" restriction depends on this prerequisite capability being implemented first.
+5. **Executable code from URLs:** Pre/post scripts fetched from URLs run on the runner host with full privileges. **Mitigation:** Apply **Option C** restriction: standalone URL references in script fields are rejected at validation time (`pre_script: https://...` is invalid). Only declarative resources (agents, skills, plugins, policies, schemas) accept standalone URL values. **Exception for `base:` composition:** When a harness inherits scripts from a URL-referenced base (ADR-0045), those scripts are fetched through the same integrity-verified pipeline as all other resources. The security argument: the base harness is SHA256-pinned, and scripts declared within that pinned content are part of the same trusted artifact. The scripts are fetched from the same domain/commit as the base, verified against the `allowed_remote_resources` allowlist, cached content-addressed, and their paths are rewritten to local cache paths. A URL-to-hash index enables offline mode for previously-fetched scripts. This provides the same auditability as local scripts (the content is deterministic and cached) while enabling fully standalone agent repositories.
 
 6. **Runtime dependency discovery increases attack surface:** If agents can fetch resources at runtime based on dynamic input (e.g., "I need a Python linting skill for this repo"), an attacker can manipulate input to trigger fetch of a malicious resource. **Mitigations:**
    - Runtime resource loading is opt-in per harness (disabled by default).
@@ -194,14 +206,16 @@ The implementation must address **how access policies work when agents don't kno
 
 ### Changes required
 
-See `docs/plans/universal-harness-access.md` for detailed implementation plan. Key changes:
+Key changes:
 
 1. **Harness loader (`internal/harness/harness.go`):** Add URL resolution and caching logic.
 2. **Resource fetcher (new package `internal/fetch/`):** HTTP client with SSRF protection, caching, integrity checking.
 3. **Transitive resolver (new package `internal/resolve/`):** Build dependency graph for harnesses, recursively fetch and validate.
 4. **Access policy enforcement (`internal/security/`):** Validate fetched resources against org-level and harness-level policies.
 5. **Schema extension:** Add `allowed_remote_resources[]` to harness YAML.
-6. **CLI flag:** `fullsend run --offline` to disable all network fetches (fail if harness references a URL).
+6. **Forge interface extension (`internal/forge/`):** Add `ListDirectoryContents` and `GetFileContentAtRef` to support skill directory listing and file retrieval at specific refs.
+7. **Directory cache (`internal/fetch/cache.go`):** Add `CachePutDir`, `CacheGetDir`, and `ComputeTreeHash` for caching directory trees.
+8. **CLI flag:** `fullsend run --offline` to disable all network fetches (fail if harness references a URL).
 
 ### Differences from traditional package management
 
@@ -229,7 +243,7 @@ To support community sharing and provide a trusted source for harness components
 
 Instead, the model applies **uniform security to all remote resources:**
 
-- **All remote resources require hash pinning**, regardless of source. `https://raw.githubusercontent.com/fullsend-ai/library/8cd3799.../agents/code.md#sha256=abc123...` and `https://example.com/my-skill.md#sha256=def456...` have the same verification requirements.
+- **All remote resources require hash pinning**, regardless of source. `https://raw.githubusercontent.com/fullsend-ai/library/8cd3799.../agents/code.md#sha256=abc123...` (single-file) and `https://github.com/fullsend-ai/library/tree/8cd3799.../skills/rust#sha256=<tree-hash>...` (directory) have the same verification requirements. For directory resources, the hash covers the entire directory tree.
 
 - **User-controlled allowlist with sensible defaults.** Organizations configure allowed URL prefixes in `config.yaml`:
   ```yaml
@@ -281,7 +295,7 @@ The following design questions have been resolved as part of this ADR:
 
 **Rationale:** Explicit URLs make dependencies auditable and prevent dependency confusion attacks. Version resolution requires a central registry (complexity, availability, trust) or org-level alias files (indirection that obscures actual dependencies). Full URLs are verbose but clear.
 
-**Alternative for ergonomics:** Organizations can use shell aliases or wrapper scripts if they frequently reference the same base URLs. Example: `fullsend run $LIBRARY/harness/rust-linter.yaml#sha256=...` where `LIBRARY=https://raw.githubusercontent.com/fullsend-ai/library/8cd3799...`
+**Alternative for ergonomics:** Organizations can use shell aliases or wrapper scripts if they frequently reference the same base URLs. Example: `fullsend run $LIBRARY/harness/rust-linter.yaml#sha256=...` where `LIBRARY=https://github.com/fullsend-ai/library/tree/8cd3799...`
 
 #### 5. Offline mode
 
@@ -293,31 +307,45 @@ The following design questions have been resolved as part of this ADR:
 
 #### 6. Lock file format
 
-**Decision:** Phase 3 introduces harness lock files at `.fullsend/lock.yaml`. Lock files pin all transitive dependencies (resources referenced by resources) with full URLs and integrity hashes. See implementation plan (docs/plans/universal-harness-access.md) for detailed schema.
+**Decision:** Phase 3 introduces harness lock files at `.fullsend/lock.yaml`. Lock files pin all transitive dependencies (resources referenced by resources) with full URLs and integrity hashes.
 
 **Schema summary:**
 ```yaml
 # .fullsend/lock.yaml
 version: 1
+generated_at: "2026-05-12T10:00:00Z"
 harnesses:
   rust-linter:
+    source: harness/rust-linter.yaml
+    sha256: abc123...
     resolved_at: "2026-05-12T10:00:00Z"
     dependencies:
-      agent:
+      - field: agent
         url: https://raw.githubusercontent.com/fullsend-ai/library/8cd3799.../agents/rust.md
-        sha256: abc123...
+        sha256: def456...
+        type: file
         fetched_at: "2026-05-12T10:00:00Z"
-      skills:
-        - url: https://raw.githubusercontent.com/fullsend-ai/library/8cd3799.../skills/cargo-check/SKILL.md
-          sha256: def456...
-          transitive_deps:
-            - url: https://raw.githubusercontent.com/fullsend-ai/library/8cd3799.../policies/rust-sandbox.yaml
-              sha256: ghi789...
+      - field: skills[0]
+        url: https://github.com/fullsend-ai/library/tree/8cd3799.../skills/cargo-check
+        sha256: <tree-hash>...
+        type: directory
+        fetched_at: "2026-05-12T10:00:00Z"
+        files:
+          - path: SKILL.md
+            sha256: abc123...
+          - path: scripts/check.sh
+            sha256: def456...
+        transitive_deps:
+          - field: skills[dep0]
+            url: https://raw.githubusercontent.com/fullsend-ai/library/8cd3799.../policies/rust-sandbox.yaml
+            sha256: jkl012...
+            type: file
+            fetched_at: "2026-05-12T10:00:00Z"
 ```
 
 **Rationale:** Lock files provide dependency pinning (reproducible builds), transitive closure visibility (auditability), and automated updates (tools can rewrite lock files when dependencies change). Similar to `package-lock.json` in npm.
 
-**Lock file workflow:** `fullsend lock <harness>` resolves all dependencies, generates/updates the lock file. `fullsend run <harness>` prefers lock file entries if present, warns if lock file is stale (resource hash doesn't match).
+**Lock file workflow:** `fullsend lock <harness>` (or `fullsend lock --all`) resolves all dependencies, generates/updates the lock file. `fullsend run <harness>` prefers lock file entries if present, warns if lock file is stale (resource hash doesn't match).
 
 #### 7. URL scheme: bare https:// vs git+https://
 
@@ -327,9 +355,17 @@ harnesses:
 
 **VCS-specific schemes trade-off:** Structured references like `git+https://` enable automation (dependabot-style updates that understand git semantics), make VCS coupling explicit, and provide stable API via tags/commits. However, they increase complexity (multiple URL parsers, VCS-specific logic) and reduce portability (what if a resource moves from GitHub to GitLab?).
 
-**Future enhancement:** Phase 2/3 could add opt-in support for structured references as an alternative to bare URLs. The implementation plan would translate `github:org/repo/path@ref` to a raw.githubusercontent.com URL with commit SHA lookup, then apply the same fetch/cache/validate logic. Both URL forms would coexist.
+**Future enhancement:** Phase 2/3 could add opt-in support for structured references as an alternative to bare URLs. The implementation plan would translate `github:org/repo/path@ref` to the appropriate GitHub URL with commit SHA lookup, then apply the same fetch/cache/validate logic. Both URL forms would coexist.
 
-**Current recommendation:** Use commit-pinned raw.githubusercontent.com URLs (e.g., `https://raw.githubusercontent.com/fullsend-ai/library/8cd3799.../agents/code.md#sha256=...`) for GitHub-hosted resources. The commit SHA in the URL path provides immutability at the URL level, and the `#sha256=...` fragment provides content integrity. This achieves the same goals as `git+https://` without requiring VCS-specific logic.
+**Current recommendation:** Use commit-pinned URLs for GitHub-hosted resources. For single-file resources (agents, policies), use `raw.githubusercontent.com` URLs (e.g., `https://raw.githubusercontent.com/fullsend-ai/library/8cd3799.../agents/code.md#sha256=...`). For directory resources (skills), use `github.com/.../tree/...` URLs (e.g., `https://github.com/fullsend-ai/library/tree/8cd3799.../skills/rust#sha256=<tree-hash>...`). The commit SHA in the URL path provides immutability at the URL level, and the `#sha256=...` fragment provides content integrity.
+
+#### 8. Git subprocess vs Go git library for directory fetching
+
+**Decision:** Use the `git` CLI as a subprocess (`os/exec`) rather than a Go git library (e.g., go-git) for skill directory fetching.
+
+**Rationale:** The key optimization is `--filter=blob:none` partial clone combined with `--depth 1` shallow fetch and sparse checkout — this avoids downloading blobs outside the target path. go-git's sparse checkout and partial clone support is limited. Additionally, `git` is already required in the runtime environment (sandbox bootstrap uses it), so this adds zero new dependencies. Auth via `GIT_CONFIG_COUNT` env vars works identically across all forges without per-forge setup code.
+
+**Trade-off:** Subprocess execution requires temp-dir I/O and is slightly slower than an in-memory implementation. For the current use case (single-digit files per skill directory, <1s typical), this is acceptable. An in-memory library could be revisited if performance becomes a bottleneck.
 
 ## Related Work
 
@@ -343,4 +379,26 @@ The proposed model follows the GitHub Actions approach: URL-based references wit
 
 ## Implementation Plan
 
-See `docs/plans/universal-harness-access.md` for full implementation details, security analysis, and migration path. See `docs/plans/universal-harness-access-phase1.md` for the phased PR breakdown (Phase 1 MVP) and `docs/plans/universal-harness-access-phase2.md` for Phase 2 (transitive dependency resolution).
+Implementation was phased: Phase 1 (MVP), Phase 2 (transitive dependency resolution), Phase 3 (lock files), Phase 4 (runtime dependency loading).
+
+## Amendments
+
+### 2026-06-30: Git sparse checkout replaces forge APIs for skill directory fetching (#2735)
+
+Skill directory fetching now uses git sparse checkout (`internal/gitfetch/gitfetch.go`) instead of forge-specific REST APIs (`ListDirectoryContents` / `GetFileContentAtRef`). This change affects Decision sections that reference "forge APIs" for skill resolution — the implementation now uses `gitfetch.FetchTree` with `--filter=blob:none --depth 1` partial clone and sparse checkout, which is forge-agnostic (works identically across GitHub, GitLab, and Forgejo without per-forge implementation). See resolved design question 8 above for the git subprocess vs go-git rationale.
+
+**Stale cache fallback:** When a cached skill directory exists but re-fetch fails due to a transient network error (connection refused, DNS failure, timeout, context deadline exceeded), the runner falls back to the stale cached content and attaches a warning to the dependency record. Non-transient errors (authentication failures, integrity mismatches) still propagate as hard errors.
+
+**Token model change:** Token resolution failure is no longer a hard error. When no git token is available, the runner warns and proceeds — public repos fetch without authentication, private repos fail at the git layer with an actionable hint message. This eliminates the chicken-and-egg token problem described in issue #2722.
+
+### 2026-08-04: Plugins classified as declarative resources (#2113)
+
+Plugins bundle executable content (hooks, MCP servers, init scripts). Plugin content only reaches the sandbox filesystem; the agent process runs under openshell's landlock/network policy. The SHA-256 integrity pin plus `allowed_remote_resources` gate which content arrives. Two host-side touchpoints handle fetched plugin content without executing it: `buildPluginConfigs` reads and unmarshals `.lsp.json` into `marketplace.json`, and `chmodPluginDir` sets file permissions on cached trees. No new host-side privilege surface is introduced. Plugin URL references follow the same fetch/cache/validate pipeline as skills. Note: `plugin.json` and `.lsp.json` are scanned by the injection scanner; other plugin content (commands, hooks) is not currently scanned.
+
+### 2026-09-07: Org-level allowlist extended to all URL resolution (#6452)
+
+The org-level `allowed_remote_resources` from `config.yaml` now acts as a fallback for all URL resolution types (agents, policies, skills, plugins, profiles, providers), not just `base:` composition. A URL passes if it is in the org-level **or** harness-level list. The intersection constraint in the "Trust boundary for URL-fetched harnesses" section above still applies to the harness-level `allowed_remote_resources` entries themselves (they must be a subset of the org-level list), but the org-level entries are available for resolution even when the harness omits them.
+
+### 2026-09-28: Clarify URL-base input and preflight semantics
+
+When inherited from a URL-referenced `base:`, relative script paths are fetched and rewritten as described in [ADR 0045](0045-forge-portable-harness-schema.md), but `agent_input` is a directory and is **cleared**, not fetched; a child needing it must supply a local directory. The `preflight_check` value is a literal host `sh -c` command, not an executable resource path, and is never resource-resolved ([ADR 0128](0128-preflight-check-literal-command.md)). The current URL-base delivery rules, including other field types, are maintained in the [harness field reference](../contributing/harness-fields.md#semantic-types-adr-0127).

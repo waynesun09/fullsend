@@ -1,0 +1,286 @@
+---
+title: "54. Require authorization on all agent dispatch paths"
+status: Accepted
+relates_to:
+  - agent-architecture
+  - security-threat-model
+topics:
+  - authorization
+  - slash-commands
+  - dispatch
+---
+
+# 54. Require authorization on all agent dispatch paths
+
+Date: 2026-05-29
+
+## Status
+
+Accepted
+
+Builds on [ADR 0034](0034-centralized-shim-routing-via-dispatch.md)
+(centralized dispatch routing) and
+[ADR 0042](0042-fs-prefix-for-slash-commands.md) (`/fs-` prefix
+convention).
+
+Related: [#877](https://github.com/fullsend-ai/fullsend/issues/877)
+(agents must not model their own authority limitations — this ADR
+implements the platform-level enforcement that principle requires).
+
+Living contract:
+[Authorization Contract v1](../normative/authorization/v1/)
+consolidates the normative rules from this ADR and subsequent
+implementation changes into a single reference for dispatch
+implementations, forge adapters, and harness authors.
+
+Bot identity resolution and the boundary between registered bot dispatch and
+the preserved GitHub label handoff exception are decided in [ADR 0107](0107-bot-identity-resolution-for-dispatch-authorization.md).
+
+[ADR 0098](0098-entity-first-harness-evaluation.md) extends this decision for
+Fullsend-originated entity discovery without a prompting event. Event-backed
+dispatch remains subject to this ADR's actor authorization gate.
+
+[ADR 0151](0151-harness-human-role-minimums.md) partially supersedes the human
+permission threshold for target CEL-routed event admission. The platform keeps
+a non-waivable `triage`-level floor, satisfied by a verified role or the narrow
+verified label-transition grant, and enforces each selected harness's effective
+`human_min_role` before CEL. The workflow stage guards and Go role-derived
+default thresholds remain in effect until migration.
+
+## Context
+
+The dispatch routing logic (`dispatch.yml` / `reusable-dispatch.yml`)
+defines an `is_authorized` helper that checks whether the acting user
+has write-level permission on the repository. Today, only a subset of
+dispatch paths gate on this check:
+
+| Trigger | Gated? | Notes |
+|---------|--------|-------|
+| `/fs-triage` | No | Any commenter triggers triage |
+| `/fs-code` | No | Any commenter triggers code |
+| `/fs-review` | No | Any commenter triggers review |
+| `/fs-fix` | Yes | `is_authorized` + non-Bot check |
+| `/fs-retro` | Yes | `is_authorized` + non-Bot check |
+| `/fs-prioritize` | Yes | `is_authorized` + non-Bot check |
+| `issues.opened` | No | Any issue opener triggers triage |
+| `pull_request_target.opened` | No | Any PR author triggers review |
+
+The ungated paths allow any GitHub user to trigger agent inference runs
+— either by commenting a slash command on a public issue/PR, or by
+opening an issue or PR directly. This creates two risks:
+
+1. **Cost exposure.** Each agent run consumes inference compute. An
+   external user opening issues or posting `/fs-code` across a public
+   org could generate significant cost with no rate limit.
+2. **Abuse surface.** The security threat model
+   ([security-threat-model.md](../problems/security-threat-model.md))
+   ranks external prompt injection as the highest-priority threat. An
+   unauthorized user triggering agent runs is a prerequisite for many
+   injection attacks — the attacker needs the agent to run before they
+   can influence its behavior.
+
+The inconsistency also violates the principle of least surprise: a
+contributor who sees `/fs-fix` rejected would reasonably expect
+`/fs-code` and auto-triage to behave the same way.
+
+## Decision
+
+All agent dispatch paths require authorization before dispatching.
+The check applies universally — to slash commands and to automatic
+event triggers where the acting user may be external.
+
+Both `is_authorized` (slash commands) and `is_event_actor_authorized`
+(event triggers) delegate to a shared `has_write_permission` helper that
+calls the collaborator permission API. This ensures consistent behavior
+across all paths.
+
+### Slash commands
+
+The dispatch routing logic must call `is_authorized` for `/fs-triage`,
+`/fs-code`, and `/fs-review` with the same guard pattern already used by
+`/fs-fix`, `/fs-retro`, and `/fs-prioritize`:
+
+```bash
+if [[ "${COMMENT_USER_TYPE}" != "Bot" ]] && is_authorized; then
+  STAGE="<stage>"
+fi
+```
+
+### Authorization mechanism: collaborator permission API
+
+**Why not `author_association`?** The `author_association` field in
+webhook payloads does not correctly reflect private org membership — an
+org admin with private membership gets `CONTRIBUTOR` instead of `MEMBER`
+(see [github/gh-aw-mcpg#2862](https://github.com/github/gh-aw-mcpg/issues/2862)).
+
+Instead, all authorization checks (both slash commands and event
+triggers) use the collaborator permission API
+(`GET /repos/{owner}/{repo}/collaborators/{username}/permission`) which
+returns the user's **effective** role including inherited org grants
+regardless of membership visibility.
+
+The implementation uses a three-function layering:
+
+- `has_write_permission(username)` — calls the API, checks `.role_name`
+- `is_authorized()` — delegates to `has_write_permission` for the comment author
+- `is_event_actor_authorized(username)` — delegates for event actors
+
+See the workflow files (`reusable-dispatch.yml`, scaffold `dispatch.yml`)
+for the canonical implementation.
+
+Users with `admin`, `maintain`, or `write` role are authorized. Users
+with only `triage` or `read` role are denied. This maps to "users with
+push access to the repository."
+
+### Automatic event triggers
+
+| Event | Actor checked | Gated? |
+|-------|---------------|--------|
+| `issues.opened` | Issue opener | Yes |
+| `issues.edited` | Event sender (editor) | Yes |
+| `pull_request_target.opened` / `synchronize` | PR author | Yes |
+| `issues.labeled` | Label applier | Already implicit (requires write access) |
+| `pull_request_target.ready_for_review` | PR author | Yes (same branch as opened/synchronize) |
+| `pull_request_target.closed` | Closer | Already implicit (requires write access) |
+| `pull_request_review.submitted` | Reviewer | Already gated (requires review-bot authorship) |
+| `issue_comment` (needs-info re-triage) | Commenter | ~~Weaker gate: `author_association != NONE` or issue author (intentional — allows clarification from external reporters)~~ Removed in [#6740](https://github.com/fullsend-ai/fullsend/issues/6740) — automatic needs-info re-triage replaced by explicit `/fs-triage` command |
+
+For external contributors (issues opened or PRs submitted by
+non-members), the agent does not fire automatically. A maintainer can
+still trigger the agent explicitly by:
+
+- Applying a label (`ready-to-code`, `ready-for-review`) — label
+  application requires write access, which is an implicit auth gate.
+- Posting a slash command (`/fs-triage`, `/fs-code`, `/fs-review`).
+
+This does not prevent external contributions — it prevents spending
+inference compute on them automatically.
+
+### Bot-to-bot workflows are preserved
+
+Agent-to-agent handoffs use label-based triggers, not slash commands.
+When one agent completes a stage, its post-script applies a label
+(e.g., `ready-for-triage`, `ready-to-code`, `ready-for-review`) which
+triggers the next stage via the `issues.labeled` dispatch path. Label
+application requires write access — an implicit authorization gate — so
+no explicit `is_authorized` check is needed on that path.
+
+The `COMMENT_USER_TYPE != "Bot"` check in the slash command guard means
+bot accounts cannot invoke slash commands at all (the condition
+short-circuits to false). This is intentional: bots have no need to use
+slash commands because they orchestrate via labels.
+
+### Visible feedback for unauthorized users
+
+When a non-Bot user fails `is_authorized`, the dispatch script should
+provide visible feedback. The dispatch mechanism is open source and
+present in every enrolled repo's workflow files — silent failure
+provides no security benefit but does confuse legitimate contributors.
+
+The dispatch script should provide some form of visible response (e.g.,
+a reaction, a comment, or both) so the user knows their command was
+received but not executed. This is not yet implemented — commands
+currently fail silently. Tracked as future work.
+
+For automatic triggers (e.g., unauthorized user opens an issue), no
+feedback is needed — the user didn't explicitly request an agent run.
+
+### Interaction with per-repo configurability
+
+The `is_authorized` check is a platform-level security boundary, not a
+per-repo policy. Individual repos cannot disable it. Per-repo
+configurability (e.g., which stages are enabled, which labels trigger
+automation) operates within the authorization boundary — a repo can
+disable `/fs-code` entirely, but it cannot make `/fs-code` available to
+unauthorized users.
+
+If a future per-repo configuration system needs to customize
+authorization rules (e.g., allowing `triage` or `read` permission), it
+should do so by extending the `has_write_permission` function's allowed
+permission list, not by bypassing the check.
+
+> **Note (2026-07-17, [#5223](https://github.com/fullsend-ai/fullsend/issues/5223)):**
+> Observation stages (triage, review) now accept the GitHub `triage`
+> role via a parameterized `has_repo_permission` helper (`min=triage`).
+> Mutation stages (code, fix, and other write-gated slash commands)
+> remain at `min=write`. Label-triggered `ready-to-code` requires a
+> write+ labeler (or a bot, for agent handoff). Exception:
+> `pull_request_target.closed` → retro was intentionally ungated so any
+> closer could trigger what was then described as read-only lifecycle
+> accounting (superseded by [#8912](https://github.com/fullsend-ai/fullsend/issues/8912)).
+> This followed the extension path above rather than bypassing the check.
+
+> **Note (2026-08-10, [#6042](https://github.com/fullsend-ai/fullsend/issues/6042)):**
+> Prow-based repositories (e.g., OpenShift) use OWNERS files rather than
+> GitHub collaborator roles to define contributor authority.
+> `has_repo_permission` now supports an opt-in OWNERS-file authorization
+> path: when `owners_file` is listed in the `authorization` providers in
+> `.fullsend/config.yaml`, the function checks the repo-root `OWNERS`
+> (and `OWNERS_ALIASES`) before falling back to the collaborator API.
+> OWNERS approvers get write-equivalent access; reviewers get
+> triage-equivalent. The sparse-checkout pins to the base branch SHA for
+> PR-scoped events (`pull_request_target`, `pull_request_review`) and the
+> default-branch head otherwise, so PR authors cannot self-authorize by
+> modifying OWNERS in their PR.
+> This follows the extension path above (extending the allowed permission
+> sources in `has_repo_permission`) rather than bypassing the check.
+> OWNERS auth applies to both built-in stages (bash routing) and the
+> harness/custom-agent dispatch path (`internal/harnessdispatch`), where
+> `owners.Resolve` computes an effective role for the `IsAuthorized`
+> gate without mutating the original event.
+>
+> OWNERS reviewer access (triage-equivalent) applies to built-in
+> bash-routed stages only (e.g. `/fs-triage`, `/fs-review`). Custom
+> harness dispatch requires write-level access — OWNERS approver or
+> GitHub write+ collaborator — because `IsAuthorized` gates all
+> harness triggers at the write level.
+>
+> v1 limitation: only repo-root flat `approvers`/`reviewers` lists are
+> read. Prow `filters:` blocks and nested per-directory OWNERS files
+> are not supported.
+
+> **Note (2026-09-27, ADR 0107):** Non-label bot authorization is being
+> migrated from `[bot]` naming and transition-specific exceptions to
+> provider-backed exact bot-role resolution. The existing GitHub label-added
+> authorization remains a permanent exception: provider-positive bot
+> classification is required, but the forge's accepted label mutation remains
+> sufficient platform evidence and no bot-role lookup or label allowlist is
+> introduced.
+
+> **Update (2026-11-02, amended 2026-11-04, [#8912](https://github.com/fullsend-ai/fullsend/issues/8912)):**
+> GitHub close-event retro requires the event sender to have write access,
+> including merge-queue merges; a failed permission lookup denies dispatch.
+> The `/fs-retro` command has the same fixed write floor, regardless of the
+> selected harness role. If CEL routing fails for a close event, the workflow
+> skips retro instead of falling back to the Bash route. GitLab merged and
+> closed merge requests use the same write-equivalent threshold: the actor
+> must have Developer access, checked in routing and again in the agent job.
+> If GitLab omits the closer identity, polling skips retro without using the
+> merge request author as a substitute.
+
+## Consequences
+
+- All dispatch paths require write-level repository permission,
+  closing the cost-exposure and abuse-surface gaps for both slash
+  commands and automatic triggers.
+- External users can no longer trigger agent runs by opening issues, PRs,
+  or posting slash commands on public repos.
+- Maintainers retain full control: labels and slash commands let them
+  trigger agents on external contributions when appropriate.
+- Bot-to-bot orchestration (e.g., triage → code handoff) is unaffected
+  because it uses label-based triggers, which require write access and
+  do not pass through the slash command authorization gate.
+- The dispatch routing logic becomes consistent: every dispatch path
+  checks authorization of the acting user, reducing cognitive load.
+- Unauthorized slash command attempts currently fail silently (STAGE
+  remains empty). Visible feedback (reaction + comment) is desirable
+  future work to improve UX for legitimate contributors who don't yet
+  have the required permission.
+- External contributors who don't want to become members will depend on
+  maintainers to trigger agents on their behalf — an acceptable
+  trade-off to keep the abuse surface minimal.
+- Future work: rate-limited auto-triage for external issue reporters
+  ([#1687](https://github.com/fullsend-ai/fullsend/issues/1687),
+  [vouch](https://github.com/mitchellh/vouch), or per-org trust
+  policies) could relax this boundary for drive-by bug reports without
+  re-opening the abuse surface for slash commands.

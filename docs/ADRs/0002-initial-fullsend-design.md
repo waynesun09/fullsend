@@ -160,6 +160,11 @@ It **does not** read the **issue comment thread** for intake decisions—no scan
 2. **`ready-for-review`** label **added** to the issue (or linked PR—policy per repo). Available for manual dispatch.
 3. **`/review`** in a comment.
 
+> **Note (2026-06):** In per-repo mode, triggers 2 and 3 (`ready-for-review`
+> label, `/fs-review` slash command) dispatch only when the issue has an
+> associated pull request (`issue.pull_request` present). Per-org `dispatch.yml`
+> is unchanged pending follow-up.
+
 **When a review run starts** (initial review, **`/review`**, or **push-triggered re-review**): **remove** **`ready-for-review`** **and** **`ready-for-merge`**. A new round **supersedes** any prior merge verdict until the coordinator finishes this round—otherwise **`ready-for-merge`** could describe an **old** head after the author **pushed** new commits, which is **unsafe** for bots and humans. Reviewers evaluate the **current** PR head; the coordinator applies outcomes using the algorithm below. (**`requires-manual-review`** is **not** removed here by default—humans may still need to resolve an earlier split verdict unless **repo policy** clears it when enqueueing a new round.)
 
 **Review swarm:**
@@ -262,6 +267,21 @@ Trace IDs spanning issue → PR → checks → review for incident response and 
 | **GitHub Actions / hosted runner** | Checks | Org-controlled workflows; OIDC where possible |
 
 **Data flow:** Agents receive **minimal** tokens (fine-scoped GitHub App). **Secrets** never appear in issue **`body`**, PR **`body`**, or **comments**. **Prompt injection** from those surfaces is assumed — see [security threat model](../problems/security-threat-model.md): **triage agent** and **review agent** prompts should treat **`body`** text and **comments** as **untrusted**, with tool allowlists and output validation.
+
+> **Trust:** Subsequent decisions implement the defense-in-depth strategy
+> for ensuring agent comments and output can be trusted:
+> [ADR 0007](0007-per-role-github-apps.md) assigns per-role GitHub Apps
+> so every agent comment carries a verifiable bot identity;
+> [ADR 0017](0017-credential-isolation-for-sandboxed-agents.md) isolates
+> credentials outside the sandbox — post-scripts write comments and
+> apply labels on behalf of agents, so agents never hold forge write
+> credentials directly;
+> [ADR 0022](0022-harness-level-output-schema-enforcement.md) enforces
+> structural validation of all agent output at the harness level before
+> it reaches downstream consumers;
+> [ADR 0054](0054-require-authorization-on-all-agent-dispatch-paths.md)
+> requires authorization on every dispatch path, preventing unauthorized
+> users from triggering agent runs.
 
 ---
 
@@ -447,3 +467,7 @@ This ADR’s **normative** workflow ends when the PR is ready to merge and merge
 - [Code review](../problems/code-review.md)
 - [Governance](../problems/governance.md)
 - [ADR 0001 — Use ADRs for decision making](./0001-use-adrs-for-decision-making.md)
+- [ADR 0007 — Per-role GitHub Apps with manifest-based creation](./0007-per-role-github-apps.md)
+- [ADR 0017 — Credential isolation for sandboxed agents](./0017-credential-isolation-for-sandboxed-agents.md)
+- [ADR 0022 — Harness-level output schema enforcement](./0022-harness-level-output-schema-enforcement.md)
+- [ADR 0054 — Require authorization on all agent dispatch paths](./0054-require-authorization-on-all-agent-dispatch-paths.md)

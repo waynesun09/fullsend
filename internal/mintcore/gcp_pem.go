@@ -1,3 +1,5 @@
+//go:build !js
+
 package mintcore
 
 import (
@@ -7,33 +9,49 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 )
 
 // GCPSecretPEMAccessor reads agent PEMs from GCP Secret Manager via REST API,
 // authenticating with the GCE metadata server token.
-// Secret naming convention: projects/{num}/secrets/fullsend-{org}--{role}-app-pem/versions/latest
+// Secret naming convention: projects/{num}/secrets/fullsend-{role}-app-pem/versions/latest
 type GCPSecretPEMAccessor struct {
-	httpClient    HTTPDoer
 	gcpProjectNum string
 }
 
-// NewGCPSecretPEMAccessor creates a PEM accessor that reads from GCP Secret Manager.
-func NewGCPSecretPEMAccessor(httpClient HTTPDoer, gcpProjectNum string) *GCPSecretPEMAccessor {
+// NewGCPSecretPEMAccessor creates a PEM accessor that reads from GCP Secret
+// Manager. HTTP requests are made via the package-internal mintHTTP function.
+func NewGCPSecretPEMAccessor(gcpProjectNum string) *GCPSecretPEMAccessor {
 	return &GCPSecretPEMAccessor{
-		httpClient:    httpClient,
 		gcpProjectNum: gcpProjectNum,
 	}
 }
 
-func (s *GCPSecretPEMAccessor) AccessPEM(ctx context.Context, org, role string) ([]byte, error) {
-	if err := ValidateOrgName(org); err != nil {
+func (s *GCPSecretPEMAccessor) AccessPEM(ctx context.Context, role string) ([]byte, error) {
+	secretRole := PemSecretRole(role)
+	if err := ValidateRoleName(secretRole); err != nil {
 		return nil, err
 	}
-	if err := ValidateRoleName(role); err != nil {
-		return nil, err
+	return s.accessLatest(ctx, "fullsend-"+secretRole+"-app-pem")
+}
+
+// gcpSecretIDPattern matches Secret Manager secret IDs.
+var gcpSecretIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,255}$`)
+
+// AccessGCPSecret reads the latest version of the Secret Manager secret
+// secretID in the given project, authenticating with the GCE metadata
+// server token. The GCF load site uses it to read the OTLP collector
+// headers secret. Errors never include the secret payload.
+func AccessGCPSecret(ctx context.Context, gcpProjectNum, secretID string) ([]byte, error) {
+	if !gcpSecretIDPattern.MatchString(secretID) {
+		return nil, fmt.Errorf("invalid secret ID %q", secretID)
 	}
-	name := fmt.Sprintf("projects/%s/secrets/fullsend-%s--%s-app-pem/versions/latest",
-		s.gcpProjectNum, org, role)
+	return NewGCPSecretPEMAccessor(gcpProjectNum).accessLatest(ctx, secretID)
+}
+
+// accessLatest reads the latest version of secretID.
+func (s *GCPSecretPEMAccessor) accessLatest(ctx context.Context, secretID string) ([]byte, error) {
+	name := fmt.Sprintf("projects/%s/secrets/%s/versions/latest", s.gcpProjectNum, secretID)
 	token, err := s.metadataToken(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("getting metadata token: %w", err)
@@ -46,7 +64,7 @@ func (s *GCPSecretPEMAccessor) AccessPEM(ctx context.Context, org, role string) 
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := s.httpClient.Do(req)
+	resp, err := mintHTTP(req)
 	if err != nil {
 		return nil, fmt.Errorf("accessing secret: %w", err)
 	}
@@ -81,7 +99,7 @@ func (s *GCPSecretPEMAccessor) metadataToken(ctx context.Context) (string, error
 	}
 	req.Header.Set("Metadata-Flavor", "Google")
 
-	resp, err := s.httpClient.Do(req)
+	resp, err := mintHTTP(req)
 	if err != nil {
 		return "", err
 	}

@@ -5,8 +5,8 @@
 #   - lychee (markdown link checker for pre-commit hooks)
 #   - scan-secrets (gitleaks wrapper for code-implementation skill)
 #
-# The base image already provides Claude Code, rsync, gitleaks, tirith,
-# pre-commit, gitlint, and the ProtectAI DeBERTa-v3 ONNX model.
+# The base image already provides Claude Code, pi (pinned; stub runtime,
+# #6464), jq, gitleaks, tirith, pre-commit, and gitlint.
 # See images/sandbox/Containerfile in fullsend-ai/fullsend for the base definition.
 #
 # This image is built AUTOMATICALLY by .github/workflows/sandbox-image.yml
@@ -18,7 +18,7 @@
 # The harness references this image:
 #   image: ghcr.io/fullsend-ai/fullsend-code:latest
 
-# CI passes --build-arg BASE_IMAGE=... from the build-base job output.
+# CI passes --build-arg BASE_IMAGE=... from the merge-base job output.
 # The default lets local builds work when the sandbox image is already pulled.
 ARG BASE_IMAGE=ghcr.io/fullsend-ai/fullsend-sandbox:latest
 FROM ${BASE_IMAGE}
@@ -49,6 +49,13 @@ RUN if command -v apt-get >/dev/null 2>&1; then \
 # env file overrides this with the OpenShell bundle if present.
 RUN git config --system http.sslCAInfo /etc/ssl/certs/ca-certificates.crt 2>/dev/null || true
 
+# Configure Git to use gitsign for commit signing (keyless signing via Sigstore).
+# Signing is opt-in: enabled per-agent via GIT_CONFIG_* env vars in the agents
+# repo, not globally. This avoids blocking commits when Sigstore endpoints are
+# not accessible or when signing is not needed.
+RUN git config --system gpg.format x509 \
+    && git config --system gpg.x509.program gitsign
+
 # ---------------------------------------------------------------------------
 # Go toolchain — needed to compile and run tests in Go-based target repos.
 # Without this the agent falls back to manual code review (no `go build`,
@@ -56,9 +63,9 @@ RUN git config --system http.sslCAInfo /etc/ssl/certs/ca-certificates.crt 2>/dev
 #
 # Pinned version + SHA256 checksum for supply chain safety.
 # To update: get the latest linux-{amd64,arm64} archive + sha256 from https://go.dev/dl/?mode=json
-ARG GO_VERSION=1.24.13
-ARG GO_SHA256_AMD64=1fc94b57134d51669c72173ad5d49fd62afb0f1db9bf3f798fd98ee423f8d730
-ARG GO_SHA256_ARM64=74d97be1cc3a474129590c67ebf748a96e72d9f3a2b6fef3ed3275de591d49b3
+ARG GO_VERSION=1.26.0
+ARG GO_SHA256_AMD64=aac1b08a0fb0c4e0a7c1555beb7b59180b05dfc5a3d62e40e9de90cd42f88235
+ARG GO_SHA256_ARM64=bd03b743eb6eb4193ea3c3fd3956546bf0e3ca5b7076c8226334afe6b75704cd
 
 RUN case "$TARGETARCH" in \
       amd64) GO_SHA="$GO_SHA256_AMD64" ;; \
@@ -70,16 +77,6 @@ RUN case "$TARGETARCH" in \
     && echo "${GO_SHA}  /tmp/go.tar.gz" | sha256sum -c - \
     && tar -C /usr/local -xzf /tmp/go.tar.gz \
     && rm /tmp/go.tar.gz
-
-ENV PATH="/usr/local/go/bin:${PATH}" \
-    GOPATH="/sandbox/go" \
-    GOMODCACHE="/sandbox/go/pkg/mod"
-
-# ---------------------------------------------------------------------------
-# gopls — Go language server for Claude Code LSP code intelligence.
-ARG GOPLS_VERSION=0.18.1
-RUN GOBIN=/usr/local/go/bin go install "golang.org/x/tools/gopls@v${GOPLS_VERSION}" \
-    && gopls version
 
 # ---------------------------------------------------------------------------
 # lychee — markdown link checker used by pre-commit hooks (lint-md-links).
@@ -105,6 +102,26 @@ RUN case "$TARGETARCH" in \
     && rm -rf /tmp/lychee.tar.gz "/tmp/lychee-${LY_TRIPLE}"
 
 # ---------------------------------------------------------------------------
+# gitsign — keyless Git signing using Sigstore. Used to cryptographically
+# sign agent commits with verifiable provenance via OIDC.
+# To update: bump GITSIGN_VERSION and GITSIGN_SHA256_{AMD64,ARM64} from:
+#   https://github.com/sigstore/gitsign/releases
+ARG GITSIGN_VERSION=0.16.1
+ARG GITSIGN_SHA256_AMD64=4a29a1f4b9add1f0f6d9a3e9e6ba0cffa121b971be82d62bb1496d7d1d877b0a
+ARG GITSIGN_SHA256_ARM64=66eb0378608c8fbceb497eecb58a525345549f46e9588616daa0f157624f33b4
+RUN case "$TARGETARCH" in \
+      amd64) GS_SHA="$GITSIGN_SHA256_AMD64" ;; \
+      arm64) GS_SHA="$GITSIGN_SHA256_ARM64" ;; \
+      *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL \
+      "https://github.com/sigstore/gitsign/releases/download/v${GITSIGN_VERSION}/gitsign_${GITSIGN_VERSION}_linux_${TARGETARCH}" \
+      -o /tmp/gitsign \
+    && echo "${GS_SHA}  /tmp/gitsign" | sha256sum -c - \
+    && mv /tmp/gitsign /usr/local/bin/gitsign \
+    && chmod +x /usr/local/bin/gitsign
+
+# ---------------------------------------------------------------------------
 # gitleaks is already installed in the base sandbox image.
 # See images/sandbox/Containerfile for the pinned version and checksums.
 
@@ -122,3 +139,24 @@ COPY scan-secrets /usr/local/bin/scan-secrets
 RUN chmod +x /usr/local/bin/scan-secrets
 
 USER sandbox
+
+# ---------------------------------------------------------------------------
+# Go environment — explicit so the sandbox user's GOPATH/GOMODCACHE are
+# self-documenting and don't rely on HOME inference.
+# /sandbox/go/bin is placed AFTER system paths so sandbox-user binaries
+# cannot shadow trusted system tools (go, git, scan-secrets, etc.).
+ENV GOPATH="/sandbox/go" \
+    PATH="/usr/local/go/bin:${PATH}:/sandbox/go/bin"
+
+# ---------------------------------------------------------------------------
+# gopls — Go language server for Claude Code LSP code intelligence.
+# Installed as sandbox user so /sandbox/go is owned by sandbox at runtime,
+# allowing go build and go test to write the module cache.
+#
+# gopls version writes ~/.cache/gopls with mode 0700. OpenShell's
+# Kubernetes seed-workspace copies /sandbox as uid 10001 and cannot read
+# that directory, so the sandbox never reaches Ready. The cache is not
+# needed in the image; gopls recreates it at runtime.
+ARG GOPLS_VERSION=0.22.0
+RUN go install "golang.org/x/tools/gopls@v${GOPLS_VERSION}" && gopls version \
+    && rm -rf /sandbox/.cache/gopls

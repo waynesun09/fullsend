@@ -1,0 +1,293 @@
+package cli
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+
+	"github.com/spf13/cobra"
+
+	"github.com/fullsend-ai/fullsend/internal/binary"
+	"github.com/fullsend-ai/fullsend/internal/forge"
+	"github.com/fullsend-ai/fullsend/internal/layers"
+	"github.com/fullsend-ai/fullsend/internal/scaffold"
+	"github.com/fullsend-ai/fullsend/internal/ui"
+)
+
+const vendorArch = binary.DefaultArch
+
+// vendorPathPrefix is the in-repo directory that holds vendored assets in a
+// per-repo install.
+const vendorPathPrefix = ".fullsend/"
+
+// Vendor install flags replaced the removed --vendor-fullsend-binary flag (binary-only
+// upload). A hidden --vendor-fullsend-binary alias sets --vendor and prints a deprecation
+// warning for external automation still using the old flag.
+
+func applyDeprecatedVendorBinaryFlag(cmd *cobra.Command, vendor *bool) {
+	if f := cmd.Flags().Lookup("vendor-fullsend-binary"); f != nil && f.Changed {
+		legacy, err := cmd.Flags().GetBool("vendor-fullsend-binary")
+		if err == nil && legacy {
+			fmt.Fprintln(cmd.ErrOrStderr(), "warning: --vendor-fullsend-binary is deprecated; use --vendor")
+			*vendor = true
+		}
+	}
+}
+func validateVendorFlags(vendor bool, fullsendBinary, fullsendSource string) error {
+	if fullsendBinary != "" && !vendor {
+		return fmt.Errorf("--fullsend-binary requires --vendor")
+	}
+	if fullsendSource != "" && !vendor {
+		return fmt.Errorf("--fullsend-source requires --vendor")
+	}
+	return nil
+}
+
+func addVendorFlags(cmd *cobra.Command, vendor *bool, fullsendBinary, fullsendSource *string) {
+	cmd.Flags().BoolVar(vendor, "vendor", false, "vendor binary, reusable workflows, actions, and agent content for CI")
+	cmd.Flags().StringVar(fullsendBinary, "fullsend-binary", "", "path to a Linux fullsend binary to upload when vendoring (default: auto-resolve)")
+	cmd.Flags().StringVar(fullsendSource, "fullsend-source", "", "fullsend source checkout for content and cross-compile (default: auto-detect or GitHub fetch)")
+	var legacyVendorBinary bool
+	cmd.Flags().BoolVar(&legacyVendorBinary, "vendor-fullsend-binary", false, "deprecated: use --vendor")
+	_ = cmd.Flags().MarkHidden("vendor-fullsend-binary")
+}
+
+type vendorFileBundle struct {
+	files      []forge.TreeFile
+	assetCount int
+}
+
+func nopCleanup() {}
+
+func appendVendorTreeFiles(ctx context.Context, client forge.Client, printer *ui.Printer, owner, repo string, files []forge.TreeFile, vendor bool, fullsendBinary, fullsendSource string) ([]forge.TreeFile, int, func(), error) {
+	if !vendor {
+		return files, 0, nopCleanup, nil
+	}
+	bundle, cleanup, err := prepareVendorFiles(ctx, client, printer, owner, repo, fullsendBinary, fullsendSource)
+	if err != nil {
+		return nil, 0, cleanup, err
+	}
+	return append(files, bundle.files...), bundle.assetCount, cleanup, nil
+}
+
+func prepareVendorFiles(ctx context.Context, client forge.Client, printer *ui.Printer, owner, repo, fullsendBinary, fullsendSource string) (vendorFileBundle, func(), error) {
+	pathPrefix := vendorPathPrefix
+	destPath := layers.VendoredBinaryPathPerRepo
+
+	root, err := binary.ResolveVendorRoot(fullsendSource, version)
+	if err != nil {
+		printer.StepFail("Failed to resolve fullsend source")
+		return vendorFileBundle{}, func() {}, err
+	}
+	cleanupRoot := func() {}
+	if root.Cleanup != nil {
+		cleanupRoot = root.Cleanup
+	}
+
+	var (
+		binPath string
+		tmpDir  string
+	)
+
+	if fullsendBinary != "" {
+		printer.StepStart(fmt.Sprintf("Using provided binary: %s", fullsendBinary))
+		if err := binary.ResolveExplicit(fullsendBinary, vendorArch); err != nil {
+			printer.StepFail("Invalid --fullsend-binary")
+			cleanupRoot()
+			return vendorFileBundle{}, func() {}, fmt.Errorf("validating --fullsend-binary: %w", err)
+		}
+		binPath = fullsendBinary
+		printer.StepDone("Validated linux/amd64 ELF binary")
+	} else {
+		result, err := binary.ResolveForVendorFromRoot(root.Path, version, vendorArch)
+		if err != nil {
+			printer.StepFail("Failed to obtain binary for vendoring")
+			cleanupRoot()
+			return vendorFileBundle{}, func() {}, err
+		}
+		tmpDir = result.TmpDir
+		binPath = result.Path
+	}
+
+	cleanup := func() {
+		if tmpDir != "" {
+			os.RemoveAll(tmpDir)
+		}
+		cleanupRoot()
+	}
+
+	absPath, err := filepath.Abs(binPath)
+	if err != nil {
+		cleanup()
+		return vendorFileBundle{}, func() {}, fmt.Errorf("resolving binary path: %w", err)
+	}
+	binPath = absPath
+
+	info, err := os.Stat(binPath)
+	if err != nil {
+		cleanup()
+		return vendorFileBundle{}, func() {}, fmt.Errorf("stat binary: %w", err)
+	}
+	const maxVendoredBinarySize = 100 * 1024 * 1024
+	if info.Size() > maxVendoredBinarySize {
+		cleanup()
+		return vendorFileBundle{}, func() {}, fmt.Errorf("binary is %d bytes, exceeds %d byte limit", info.Size(), maxVendoredBinarySize)
+	}
+
+	assets, err := scaffold.CollectVendoredAssets(root.Path, pathPrefix)
+	if err != nil {
+		printer.StepFail("Failed to collect vendored content")
+		cleanup()
+		return vendorFileBundle{}, func() {}, fmt.Errorf("collecting vendored content: %w", err)
+	}
+
+	manifest := scaffold.NewVendorManifest(version, fullsendSource, destPath, scaffold.PathsFromInstallFiles(assets))
+	// Manifest is built locally from collected assets; ParseVendorManifest validates
+	// paths when reading a committed manifest from the repo.
+	manifestYAML, err := manifest.MarshalYAML()
+	if err != nil {
+		cleanup()
+		return vendorFileBundle{}, func() {}, fmt.Errorf("building vendor manifest: %w", err)
+	}
+
+	files := []forge.TreeFile{{
+		Path:      destPath,
+		LocalPath: binPath,
+		Mode:      "100755",
+	}}
+	for _, f := range assets {
+		files = append(files, forge.TreeFile{
+			Path:    f.Path,
+			Content: f.Content,
+			Mode:    f.Mode,
+		})
+	}
+	files = append(files, forge.TreeFile{
+		Path:    scaffold.VendorManifestPath(pathPrefix),
+		Content: manifestYAML,
+		Mode:    "100644",
+	})
+
+	// Prune here, at the single point every --vendor commit path collects its
+	// tree: appendVendorTreeFiles and every other prepareVendorFiles caller
+	// receive the delete entries, so files that
+	// left the vendored set are removed from consumer repos instead of
+	// becoming orphans the replaced manifest no longer tracks.
+	files, err = appendStaleVendoredDeletes(ctx, client, printer, owner, repo, files)
+	if err != nil {
+		cleanup()
+		return vendorFileBundle{}, func() {}, err
+	}
+
+	return vendorFileBundle{files: files, assetCount: len(assets)}, cleanup, nil
+}
+
+// appendStaleVendoredDeletes prunes files a previous vendor install
+// committed that are no longer part of the vendored set — otherwise the
+// new manifest stops tracking them and they persist in the consumer repo
+// as untracked orphans that even uninstall cannot remove.
+func appendStaleVendoredDeletes(ctx context.Context, client forge.Client, printer *ui.Printer, owner, repo string, files []forge.TreeFile) ([]forge.TreeFile, error) {
+	oldManifest, found, err := scaffold.ReadVendorManifest(ctx, client, owner, repo, vendorPathPrefix)
+	if err != nil {
+		// A missing manifest (first install) is fine; a present-but-invalid
+		// one is not — proceeding would silently orphan every de-listed path.
+		return nil, fmt.Errorf("reading vendor manifest for pruning: %w", err)
+	}
+	if !found {
+		return files, nil
+	}
+	newPaths := make([]string, 0, len(files))
+	for _, f := range files {
+		if f.Delete {
+			continue
+		}
+		newPaths = append(newPaths, f.Path)
+	}
+	stale := scaffold.StaleVendoredPaths(oldManifest, newPaths)
+	if len(stale) == 0 {
+		return files, nil
+	}
+	for _, p := range stale {
+		files = append(files, forge.TreeFile{Path: p, Delete: true})
+	}
+	printer.StepInfo(fmt.Sprintf("Pruning %d vendored file(s) no longer shipped: %s", len(stale), strings.Join(stale, ", ")))
+	return files, nil
+}
+
+func removeStaleVendoredAssets(ctx context.Context, client forge.Client, printer *ui.Printer, owner, repo string) error {
+	return layers.RemoveStaleVendoredAssets(ctx, client, printer, owner, repo, vendorPathPrefix, layers.VendoredBinaryPathPerRepo)
+}
+
+// newVendoredWorkflowReader returns a reader for the reusable workflows a
+// vendored install copies from the resolved vendor source (the same source
+// and collection prepareVendorFiles uses), plus a cleanup to call once the
+// run is over. The source is resolved lazily, once, on the first read, so
+// runs that never vendor do no work. A workflow the source lacks yields
+// forge.ErrNotFound.
+func newVendoredWorkflowReader(fullsendSource string) (read func(path string) ([]byte, error), cleanup func()) {
+	var (
+		once      sync.Once
+		files     map[string][]byte
+		loadErr   error
+		cleanupFn func()
+	)
+	load := func() {
+		root, err := binary.ResolveVendorRoot(fullsendSource, version)
+		if err != nil {
+			loadErr = err
+			return
+		}
+		cleanupFn = root.Cleanup
+		assets, err := scaffold.CollectVendoredAssets(root.Path, "")
+		if err != nil {
+			loadErr = fmt.Errorf("collecting vendored content: %w", err)
+			return
+		}
+		files = make(map[string][]byte, len(assets))
+		for _, f := range assets {
+			files[f.Path] = f.Content
+		}
+	}
+	read = func(path string) ([]byte, error) {
+		once.Do(load)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		content, ok := files[path]
+		if !ok {
+			return nil, fmt.Errorf("%s is not in the vendor source: %w", path, forge.ErrNotFound)
+		}
+		return content, nil
+	}
+	cleanup = func() {
+		// once.Do makes a concurrent first read finish loading first.
+		once.Do(func() {})
+		if cleanupFn != nil {
+			cleanupFn()
+		}
+	}
+	return read, cleanup
+}
+
+func vendorDryRunMessage(fullsendBinary, fullsendSource, destPath string) string {
+	if fullsendBinary != "" {
+		msg := fmt.Sprintf("Would upload provided binary from %s to %s", fullsendBinary, destPath)
+		if fullsendSource != "" {
+			msg += fmt.Sprintf("; content from %s", fullsendSource)
+		}
+		return msg
+	}
+	if fullsendSource != "" {
+		return fmt.Sprintf("Would cross-compile from %s and upload vendored binary and content", fullsendSource)
+	}
+	if _, err := binary.ModuleRoot(); err == nil {
+		return fmt.Sprintf("Would cross-compile and upload vendored binary and content to %s", destPath)
+	}
+	if binary.IsReleasedVersion(version) {
+		return fmt.Sprintf("Would download release %s source/binary and upload vendored assets to %s", version, destPath)
+	}
+	return fmt.Sprintf("Would fail: dev CLI outside checkout cannot vendor to %s", destPath)
+}

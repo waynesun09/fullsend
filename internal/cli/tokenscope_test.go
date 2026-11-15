@@ -12,7 +12,9 @@ import (
 )
 
 func TestFetchTokenScope_ReturnsRepoNames(t *testing.T) {
+	var requestCount int
 	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
 		assert.Equal(t, "/installation/repositories", r.URL.Path)
 		assert.Equal(t, "100", r.URL.Query().Get("per_page"))
 		assert.Equal(t, "Bearer ghs_test_token", r.Header.Get("Authorization"))
@@ -30,6 +32,7 @@ func TestFetchTokenScope_ReturnsRepoNames(t *testing.T) {
 	repos, err := fetchTokenScope(context.Background(), "ghs_test_token", github.URL)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"org-a/repo-one", "org-a/repo-two"}, repos)
+	assert.Equal(t, 1, requestCount, "fetchTokenScope should use a single API round trip")
 }
 
 func TestFetchTokenScope_Truncated(t *testing.T) {
@@ -94,7 +97,7 @@ func TestFetchTokenScope_UnexpectedStatus(t *testing.T) {
 
 	repos, err := fetchTokenScope(context.Background(), "ghs_token", github.URL)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "status 500")
+	assert.Contains(t, err.Error(), "500")
 	assert.Nil(t, repos)
 }
 
@@ -110,4 +113,25 @@ func TestFetchTokenScope_CancelledContext(t *testing.T) {
 	repos, err := fetchTokenScope(ctx, "ghs_token", github.URL)
 	assert.Error(t, err)
 	assert.Nil(t, repos)
+}
+
+// TestFetchTokenScope_HonoursGITHUBAPIURL covers the base URL that
+// fullsend run passes to fetchTokenScope: on a non-github.com host the
+// scope check must reach GITHUB_API_URL, not api.github.com (#9041).
+func TestFetchTokenScope_HonoursGITHUBAPIURL(t *testing.T) {
+	var gotPath string
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"total_count":  1,
+			"repositories": []map[string]string{{"full_name": "org-a/repo-one"}},
+		})
+	}))
+	defer github.Close()
+	t.Setenv("GITHUB_API_URL", github.URL+"/api/v3/")
+
+	repos, err := fetchTokenScope(context.Background(), "ghs_token", githubAPIBaseURLFromEnv())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"org-a/repo-one"}, repos)
+	assert.Equal(t, "/api/v3/installation/repositories", gotPath)
 }

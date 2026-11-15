@@ -4,16 +4,22 @@ import "fmt"
 
 // AppPermissions defines the permissions for a GitHub App.
 type AppPermissions struct {
-	Actions              string `json:"actions,omitempty"`
-	Issues               string `json:"issues,omitempty"`
-	PullRequests         string `json:"pull_requests,omitempty"`
-	Checks               string `json:"checks,omitempty"`
-	Contents             string `json:"contents,omitempty"`
-	Variables            string `json:"actions_variables,omitempty"`
-	Workflows            string `json:"workflows,omitempty"`
-	Administration       string `json:"administration,omitempty"`
-	Members              string `json:"members,omitempty"`
-	OrganizationProjects string `json:"organization_projects,omitempty"`
+	Actions                    string `json:"actions,omitempty"`
+	Issues                     string `json:"issues,omitempty"`
+	PullRequests               string `json:"pull_requests,omitempty"`
+	Checks                     string `json:"checks,omitempty"`
+	Contents                   string `json:"contents,omitempty"`
+	Variables                  string `json:"actions_variables,omitempty"`
+	Workflows                  string `json:"workflows,omitempty"`
+	Administration             string `json:"administration,omitempty"`
+	Members                    string `json:"members,omitempty"`
+	OrganizationProjects       string `json:"organization_projects,omitempty"`
+	OrganizationAdministration string `json:"organization_administration,omitempty"`
+	// OrganizationActionsVariables is org-level Actions variables (distinct from
+	// repository actions_variables). Required to read FULLSEND_FOREIGN_* via the org API.
+	OrganizationActionsVariables string `json:"organization_actions_variables,omitempty"`
+	Packages                     string `json:"packages,omitempty"`
+	Secrets                      string `json:"secrets,omitempty"`
 }
 
 // HookAttributes configures the webhook for a GitHub App.
@@ -61,7 +67,7 @@ func AgentAppConfig(org, role, appSet string) AppConfig {
 
 	base.Name = fmt.Sprintf("%s-%s", appSet, role)
 
-	switch role{
+	switch role {
 	case "fullsend":
 		base.Description = fmt.Sprintf("Fullsend orchestrator for %s", org)
 		base.Permissions = AppPermissions{
@@ -91,6 +97,7 @@ func AgentAppConfig(org, role, appSet string) AppConfig {
 		base.Permissions = AppPermissions{
 			Issues:       "write",
 			Contents:     "write",
+			Packages:     "read",
 			PullRequests: "write",
 			Checks:       "read",
 		}
@@ -110,6 +117,7 @@ func AgentAppConfig(org, role, appSet string) AppConfig {
 		base.Description = fmt.Sprintf("Fullsend fix agent for %s", org)
 		base.Permissions = AppPermissions{
 			Contents:     "write",
+			Packages:     "read",
 			PullRequests: "write",
 			Issues:       "write",
 		}
@@ -137,6 +145,33 @@ func AgentAppConfig(org, role, appSet string) AppConfig {
 			Issues:       "write",
 		}
 		// No webhook events — triggered via workflow_dispatch from other agents.
+		base.Events = []string{}
+
+	case "scribe":
+		base.Description = fmt.Sprintf("Fullsend scribe agent for %s", org)
+		base.Permissions = AppPermissions{
+			Contents: "read",
+			Issues:   "write",
+		}
+		// No webhook events — schedule / workflow_dispatch only (like prioritize/retro).
+		base.Events = []string{}
+
+	case "e2e":
+		base.Description = fmt.Sprintf("Fullsend e2e pool testing for %s", org)
+		base.Permissions = AppPermissions{
+			Actions:                      "write",
+			Variables:                    "write",
+			OrganizationActionsVariables: "write",
+			Administration:               "write",
+			Contents:                     "write",
+			Issues:                       "write",
+			Members:                      "write",
+			OrganizationAdministration:   "write",
+			PullRequests:                 "write",
+			Secrets:                      "write",
+			Workflows:                    "write",
+		}
+		// Pool tests are API/mint driven; no webhook events required.
 		base.Events = []string{}
 
 	default:

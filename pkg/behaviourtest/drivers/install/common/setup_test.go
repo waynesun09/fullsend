@@ -1,0 +1,695 @@
+package common
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/fullsend-ai/fullsend/internal/behaviourfail"
+)
+
+func TestDefaultGitHubSetupOpts_HasVendor(t *testing.T) {
+	opts := DefaultGitHubSetupOpts()
+	assert.True(t, opts.Vendor, "default should enable vendoring")
+	assert.Empty(t, opts.FullsendRef, "default should not set a fullsend ref")
+	assert.Empty(t, opts.ConfigPreset, "default should not set a config preset")
+}
+
+func TestRunGitHubSetupWithOpts_VendoredMode(t *testing.T) {
+	var capturedArgs []string
+	runner := func(_, _ string, args ...string) (string, error) {
+		capturedArgs = args
+		return "", nil
+	}
+
+	opts := GitHubSetupOpts{Vendor: true}
+	err := RunGitHubSetupWithOpts("/bin/fullsend", "tok", "org/repo", "https://mint.test", "", opts, runner, t.Logf)
+	require.NoError(t, err)
+
+	joined := strings.Join(capturedArgs, " ")
+	assert.Contains(t, joined, "--vendor")
+	assert.NotContains(t, joined, "--fullsend-ref")
+	assert.Contains(t, joined, "--mint-url")
+	assert.Contains(t, joined, "--direct")
+	assert.Contains(t, joined, "--runtime")
+	assert.Contains(t, joined, "--runtime dummy", "empty Runtime should default to dummy")
+}
+
+func TestRunGitHubSetupWithOpts_CustomRuntime(t *testing.T) {
+	var capturedArgs []string
+	runner := func(_, _ string, args ...string) (string, error) {
+		capturedArgs = args
+		return "", nil
+	}
+
+	opts := GitHubSetupOpts{Vendor: true, Runtime: "dummy-playback", AppSet: "fullsend-test"}
+	err := RunGitHubSetupWithOpts("/bin/fullsend", "tok", "org/repo", "https://mint.test", "", opts, runner, t.Logf)
+	require.NoError(t, err)
+
+	assert.Contains(t, capturedArgs, "--runtime")
+	assert.Contains(t, strings.Join(capturedArgs, " "), "--app-set fullsend-test")
+	assert.Contains(t, capturedArgs, "dummy-playback")
+	assert.NotContains(t, capturedArgs, "dummy")
+}
+
+func TestRunGitHubSetupWithOpts_NonVendoredMode(t *testing.T) {
+	var capturedArgs []string
+	runner := func(_, _ string, args ...string) (string, error) {
+		capturedArgs = args
+		return "", nil
+	}
+
+	opts := GitHubSetupOpts{Vendor: false, FullsendRef: "main"}
+	err := RunGitHubSetupWithOpts("/bin/fullsend", "tok", "org/repo", "https://mint.test", "", opts, runner, t.Logf)
+	require.NoError(t, err)
+
+	joined := strings.Join(capturedArgs, " ")
+	assert.NotContains(t, joined, "--vendor")
+	assert.Contains(t, joined, "--fullsend-ref")
+	assert.Contains(t, joined, "main")
+}
+
+func TestRunGitHubSetupWithOpts_WithGCPProject(t *testing.T) {
+	var capturedCalls [][]string
+	runner := func(_, _ string, args ...string) (string, error) {
+		capturedCalls = append(capturedCalls, args)
+		if len(args) >= 2 && args[0] == "inference" && args[1] == "status" {
+			return `{"status":"healthy","FULLSEND_GCP_WIF_PROVIDER":"projects/1/locations/global/providers/wif"}`, nil
+		}
+		return "", nil
+	}
+
+	opts := GitHubSetupOpts{Vendor: false, FullsendRef: "main"}
+	err := RunGitHubSetupWithOpts("/bin/fullsend", "tok", "org/repo", "https://mint.test", "test-project", opts, runner, t.Logf)
+	require.NoError(t, err)
+
+	// A healthy provider skips provision: inference status, github setup.
+	require.Len(t, capturedCalls, 2)
+	assert.Equal(t, "inference", capturedCalls[0][0])
+	assert.Equal(t, "status", capturedCalls[0][1])
+	assert.Equal(t, "github", capturedCalls[1][0])
+	assert.Equal(t, "setup", capturedCalls[1][1])
+
+	setupArgs := strings.Join(capturedCalls[1], " ")
+	assert.Contains(t, setupArgs, "--inference-project")
+	assert.Contains(t, setupArgs, "--fullsend-ref")
+	assert.NotContains(t, setupArgs, "--vendor")
+}
+
+func TestRunGitHubSetupWithOpts_NonVendoredNoRef_ReturnsError(t *testing.T) {
+	runner := func(_, _ string, _ ...string) (string, error) {
+		t.Fatal("CLI should not be called when validation fails")
+		return "", nil
+	}
+
+	opts := GitHubSetupOpts{Vendor: false, FullsendRef: ""}
+	err := RunGitHubSetupWithOpts("/bin/fullsend", "tok", "org/repo", "https://mint.test", "", opts, runner, t.Logf)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "non-vendored mode requires FullsendRef")
+}
+
+func TestRunGitHubSetupWithOpts_VendoredWithRef_ReturnsError(t *testing.T) {
+	runner := func(_, _ string, _ ...string) (string, error) {
+		t.Fatal("CLI should not be called when validation fails")
+		return "", nil
+	}
+
+	opts := GitHubSetupOpts{Vendor: true, FullsendRef: "main"}
+	err := RunGitHubSetupWithOpts("/bin/fullsend", "tok", "org/repo", "https://mint.test", "", opts, runner, t.Logf)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "vendored mode conflicts with FullsendRef")
+}
+
+func TestRunGitHubSetupWithOpts_ConfigPreset(t *testing.T) {
+	var capturedArgs []string
+	runner := func(_, _ string, args ...string) (string, error) {
+		capturedArgs = args
+		return "", nil
+	}
+
+	opts := GitHubSetupOpts{Vendor: true, ConfigPreset: "https://example.com/preset.yaml"}
+	err := RunGitHubSetupWithOpts("/bin/fullsend", "tok", "org/repo", "https://mint.test", "", opts, runner, t.Logf)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{
+		"github", "setup", "org/repo",
+		"--direct",
+		"--mint-url", "https://mint.test",
+		"--config", "https://example.com/preset.yaml",
+		"--vendor",
+	}, capturedArgs)
+}
+
+func TestRunGitHubSetupWithOpts_ConfigPresetOmitsRuntime(t *testing.T) {
+	var capturedArgs []string
+	runner := func(_, _ string, args ...string) (string, error) {
+		capturedArgs = args
+		return "", nil
+	}
+
+	opts := GitHubSetupOpts{Vendor: true, ConfigPreset: "./presets/bt.yaml"}
+	err := RunGitHubSetupWithOpts("/bin/fullsend", "tok", "org/repo", "https://mint.test", "", opts, runner, t.Logf)
+	require.NoError(t, err)
+
+	joined := strings.Join(capturedArgs, " ")
+	assert.Contains(t, joined, "--config")
+	assert.NotContains(t, joined, "--runtime")
+}
+
+func TestRunGitHubSetupWithOpts_ConfigPresetWithExplicitRuntime(t *testing.T) {
+	var capturedArgs []string
+	runner := func(_, _ string, args ...string) (string, error) {
+		capturedArgs = args
+		return "", nil
+	}
+
+	opts := GitHubSetupOpts{Vendor: true, ConfigPreset: "./presets/bt.yaml", Runtime: "dummy-playback"}
+	err := RunGitHubSetupWithOpts("/bin/fullsend", "tok", "org/repo", "https://mint.test", "", opts, runner, t.Logf)
+	require.NoError(t, err)
+
+	joined := strings.Join(capturedArgs, " ")
+	assert.Contains(t, joined, "--config ./presets/bt.yaml")
+	assert.Contains(t, joined, "--runtime dummy-playback",
+		"an explicit Runtime must be forwarded even with a preset, so post-install validation (which checks opts.Runtime) matches what was actually installed")
+}
+
+func TestRunGitHubSetupWithOpts_ConfigPresetWithFullsendRef(t *testing.T) {
+	var capturedArgs []string
+	runner := func(_, _ string, args ...string) (string, error) {
+		capturedArgs = args
+		return "", nil
+	}
+
+	opts := GitHubSetupOpts{Vendor: false, FullsendRef: "main", ConfigPreset: "https://example.com/preset.yaml"}
+	err := RunGitHubSetupWithOpts("/bin/fullsend", "tok", "org/repo", "https://mint.test", "", opts, runner, t.Logf)
+	require.NoError(t, err)
+
+	joined := strings.Join(capturedArgs, " ")
+	assert.Contains(t, joined, "--config")
+	assert.Contains(t, joined, "https://example.com/preset.yaml")
+	assert.Contains(t, joined, "--fullsend-ref")
+	assert.Contains(t, joined, "main")
+	assert.NotContains(t, joined, "--vendor")
+	assert.NotContains(t, joined, "--runtime")
+}
+
+func TestRunGitHubSetupWithOpts_WhitespaceConfigPreset_KeepsRuntime(t *testing.T) {
+	var capturedArgs []string
+	runner := func(_, _ string, args ...string) (string, error) {
+		capturedArgs = args
+		return "", nil
+	}
+
+	opts := GitHubSetupOpts{Vendor: true, ConfigPreset: "   "}
+	err := RunGitHubSetupWithOpts("/bin/fullsend", "tok", "org/repo", "https://mint.test", "", opts, runner, t.Logf)
+	require.NoError(t, err)
+
+	joined := strings.Join(capturedArgs, " ")
+	assert.NotContains(t, joined, "--config")
+	assert.Contains(t, joined, "--runtime")
+}
+
+func TestRunGitHubSetup_DelegatesToWithOpts(t *testing.T) {
+	var capturedArgs []string
+	runner := func(_, _ string, args ...string) (string, error) {
+		capturedArgs = args
+		return "", nil
+	}
+
+	err := RunGitHubSetup("/bin/fullsend", "tok", "org/repo", "https://mint.test", "", runner, t.Logf)
+	require.NoError(t, err)
+
+	// RunGitHubSetup should use default opts (vendored).
+	joined := strings.Join(capturedArgs, " ")
+	assert.Contains(t, joined, "--vendor")
+	assert.NotContains(t, joined, "--fullsend-ref")
+}
+
+const healthyStatusJSON = `{"status":"healthy","FULLSEND_GCP_WIF_PROVIDER":"projects/1/locations/global/providers/wif"}`
+
+func isInference(args []string, sub string) bool {
+	return len(args) >= 2 && args[0] == "inference" && args[1] == sub
+}
+
+func TestRunGitHubSetupWithOpts_NotHealthy_Provisions(t *testing.T) {
+	// "inference status" exits 0 with a non-healthy status when the
+	// provider is missing; the fallback provisions and re-checks.
+	for name, first := range map[string]struct {
+		out string
+		err error
+	}{
+		"not_provisioned": {out: `{"status":"not_provisioned"}`},
+		"unhealthy":       {out: `{"status":"unhealthy","FULLSEND_GCP_WIF_PROVIDER":"projects/1/locations/global/providers/wif"}`},
+		"cli error":       {err: errors.New("status exploded")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var calls [][]string
+			statusCalls := 0
+			runner := func(_, _ string, args ...string) (string, error) {
+				calls = append(calls, args)
+				if isInference(args, "status") {
+					statusCalls++
+					if statusCalls == 1 {
+						return first.out, first.err
+					}
+					return healthyStatusJSON, nil
+				}
+				return "", nil
+			}
+
+			err := RunGitHubSetupWithOpts("/bin/fullsend", "tok", "org/repo", "https://mint.test", "proj", DefaultGitHubSetupOpts(), runner, t.Logf)
+			require.NoError(t, err)
+
+			require.Len(t, calls, 4, "expected status, provision, status, setup")
+			assert.True(t, isInference(calls[0], "status"))
+			assert.True(t, isInference(calls[1], "provision"))
+			assert.True(t, isInference(calls[2], "status"))
+			assert.Equal(t, []string{"github", "setup"}, calls[3][:2])
+			assert.Contains(t, calls[3], "projects/1/locations/global/providers/wif")
+		})
+	}
+}
+
+func TestRunGitHubSetupWithOpts_ProvisionError_IsHardFailure(t *testing.T) {
+	var calls [][]string
+	runner := func(_, _ string, args ...string) (string, error) {
+		calls = append(calls, args)
+		switch {
+		case isInference(args, "status"):
+			return `{"status":"not_provisioned"}`, nil
+		case isInference(args, "provision"):
+			return "", errors.New("provision boom")
+		}
+		return "", nil
+	}
+
+	err := RunGitHubSetupWithOpts("/bin/fullsend", "tok", "org/repo", "https://mint.test", "proj", DefaultGitHubSetupOpts(), runner, t.Logf)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "inference provision org/repo")
+	assert.Contains(t, err.Error(), "provision boom")
+	require.Len(t, calls, 2, "no status re-check or setup after a failed provision")
+}
+
+// stubPostProvisionSleep replaces PostProvisionSleep with a recorder so
+// tests skip the real backoff, and returns the recorded delays.
+func stubPostProvisionSleep(t *testing.T) *[]time.Duration {
+	t.Helper()
+	var slept []time.Duration
+	orig := PostProvisionSleep
+	PostProvisionSleep = func(_ context.Context, d time.Duration) error {
+		slept = append(slept, d)
+		return nil
+	}
+	t.Cleanup(func() { PostProvisionSleep = orig })
+	return &slept
+}
+
+func TestRunGitHubSetupWithOpts_StillNotHealthyAfterProvision(t *testing.T) {
+	slept := stubPostProvisionSleep(t)
+	var calls [][]string
+	runner := func(_, _ string, args ...string) (string, error) {
+		calls = append(calls, args)
+		if isInference(args, "status") {
+			return `{"status":"unhealthy","FULLSEND_GCP_WIF_PROVIDER":"projects/1/locations/global/providers/wif"}`, nil
+		}
+		return "", nil
+	}
+
+	err := RunGitHubSetupWithOpts("/bin/fullsend", "tok", "org/repo", "https://mint.test", "proj", DefaultGitHubSetupOpts(), runner, t.Logf)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `expected healthy status, got "unhealthy"`)
+	require.Len(t, calls, 2+len(postProvisionStatusDelays)+1, "status, provision, every post-provision status read; no setup")
+	assert.Equal(t, postProvisionStatusDelays, *slept)
+}
+
+func TestProvisionInference_HealthyOnNthRead(t *testing.T) {
+	slept := stubPostProvisionSleep(t)
+	const healthyOn = 3
+	var calls [][]string
+	statusCalls := 0
+	runner := func(_, _ string, args ...string) (string, error) {
+		calls = append(calls, args)
+		if isInference(args, "status") {
+			statusCalls++
+			if statusCalls < healthyOn {
+				return `{"status":"not_provisioned"}`, nil
+			}
+			return healthyStatusJSON, nil
+		}
+		return "", nil
+	}
+
+	got, err := ProvisionInference("/bin/fullsend", "tok", "org/repo", "proj", runner, t.Logf)
+	require.NoError(t, err)
+	assert.Equal(t, "projects/1/locations/global/providers/wif", got)
+	require.Len(t, calls, 1+healthyOn, "provision, then status until healthy")
+	assert.True(t, isInference(calls[0], "provision"))
+	assert.Equal(t, healthyOn, statusCalls)
+	assert.Equal(t, postProvisionStatusDelays[:healthyOn-1], *slept)
+}
+
+func TestProvisionInference_NeverHealthy_FailsAfterBudget(t *testing.T) {
+	slept := stubPostProvisionSleep(t)
+	statusCalls := 0
+	runner := func(_, _ string, args ...string) (string, error) {
+		if isInference(args, "status") {
+			statusCalls++
+			return `{"status":"not_provisioned"}`, nil
+		}
+		return "", nil
+	}
+
+	_, err := ProvisionInference("/bin/fullsend", "tok", "org/repo", "proj", runner, t.Logf)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not healthy after provision")
+	assert.Contains(t, err.Error(), `status="not_provisioned"`, "error names the last status")
+	assert.Equal(t, len(postProvisionStatusDelays)+1, statusCalls)
+
+	var total time.Duration
+	for _, d := range *slept {
+		total += d
+	}
+	assert.Equal(t, 60*time.Second, total, "the backoff budget is ~60s")
+}
+
+func TestProvisionInference_ProvisionFails_NoPolling(t *testing.T) {
+	slept := stubPostProvisionSleep(t)
+	statusCalls := 0
+	runner := func(_, _ string, args ...string) (string, error) {
+		switch {
+		case isInference(args, "provision"):
+			return "", errors.New("provision boom")
+		case isInference(args, "status"):
+			statusCalls++
+		}
+		return healthyStatusJSON, nil
+	}
+
+	_, err := ProvisionInference("/bin/fullsend", "tok", "org/repo", "proj", runner, t.Logf)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "provision boom")
+	assert.Zero(t, statusCalls, "no status reads after a failed provision")
+	assert.Empty(t, *slept)
+}
+
+func TestResolveInferenceWIFProvider_AlreadyProvisioned_SingleRead(t *testing.T) {
+	slept := stubPostProvisionSleep(t)
+	var calls [][]string
+	runner := func(_, _ string, args ...string) (string, error) {
+		calls = append(calls, args)
+		return healthyStatusJSON, nil
+	}
+
+	got, err := ResolveInferenceWIFProvider("/bin/fullsend", "tok", "org/repo", "proj", runner, t.Logf)
+	require.NoError(t, err)
+	assert.Equal(t, "projects/1/locations/global/providers/wif", got)
+	require.Len(t, calls, 1, "exactly one status read, no provision")
+	assert.True(t, isInference(calls[0], "status"))
+	assert.Empty(t, *slept)
+}
+
+func TestRunGitHubSetupWithOpts_UsesResolver(t *testing.T) {
+	var calls [][]string
+	runner := func(_, _ string, args ...string) (string, error) {
+		calls = append(calls, args)
+		return "", nil
+	}
+	var resolved []string
+	opts := DefaultGitHubSetupOpts()
+	opts.ResolveWIFProvider = func(target, project string) (string, error) {
+		resolved = append(resolved, target, project)
+		return "projects/9/locations/global/providers/cached", nil
+	}
+
+	err := RunGitHubSetupWithOpts("/bin/fullsend", "tok", "org/repo", "https://mint.test", " proj ", opts, runner, t.Logf)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"org/repo", "proj"}, resolved)
+	require.Len(t, calls, 1, "the resolver replaces the inference CLI calls")
+	assert.Contains(t, calls[0], "projects/9/locations/global/providers/cached")
+}
+
+func TestRunGitHubSetupWithOpts_ResolverError(t *testing.T) {
+	runner := func(_, _ string, _ ...string) (string, error) {
+		t.Fatal("github setup must not run when the resolver fails")
+		return "", nil
+	}
+	opts := DefaultGitHubSetupOpts()
+	opts.ResolveWIFProvider = func(string, string) (string, error) {
+		return "", errors.New("resolve boom")
+	}
+
+	err := RunGitHubSetupWithOpts("/bin/fullsend", "tok", "org/repo", "https://mint.test", "proj", opts, runner, t.Logf)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "resolve boom")
+}
+
+func TestInferenceStatusWIFProvider(t *testing.T) {
+	for name, tc := range map[string]struct {
+		out     string
+		err     error
+		want    string
+		wantErr string
+	}{
+		"healthy":         {out: healthyStatusJSON, want: "projects/1/locations/global/providers/wif"},
+		"not provisioned": {out: `{"status":"not_provisioned"}`, wantErr: "missing FULLSEND_GCP_WIF_PROVIDER"},
+		"unhealthy":       {out: `{"status":"unhealthy","FULLSEND_GCP_WIF_PROVIDER":"p"}`, wantErr: "expected healthy status"},
+		"cli error":       {err: errors.New("boom"), wantErr: "boom"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var calls [][]string
+			runner := func(_, _ string, args ...string) (string, error) {
+				calls = append(calls, args)
+				return tc.out, tc.err
+			}
+			got, err := InferenceStatusWIFProvider("/bin/fullsend", "tok", "org/repo", "proj", runner, t.Logf)
+			assert.Equal(t, [][]string{{"inference", "status", "org/repo", "--project", "proj", "--format", "json"}}, calls)
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "inference status org/repo")
+				assert.Contains(t, err.Error(), tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestWaitInferenceHealthy_ContextCancelledDuringBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	statusCalls := 0
+	runner := func(_, _ string, args ...string) (string, error) {
+		statusCalls++
+		cancel()
+		return `{"status":"not_provisioned"}`, nil
+	}
+
+	start := time.Now()
+	_, err := WaitInferenceHealthy(ctx, "/bin/fullsend", "tok", "org/repo", "proj", runner, t.Logf)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Contains(t, err.Error(), `status="not_provisioned"`, "error keeps the last status")
+	assert.Equal(t, 1, statusCalls, "no status read after cancellation")
+	assert.Less(t, time.Since(start), postProvisionStatusDelays[0], "the real backoff is cut short")
+}
+
+// TestIsGCPWIFQuotaError pins the bounded signature list behind the GCP WIF
+// quota mark (task 2.2 / design D3 of the behaviour-infra-retry change):
+// every known quota/rate-limit text from the inference CLI calls matches,
+// and the errors those call sites can also produce — parse failures and
+// unrelated CLI failures — must not. The realistic messages below mimic the
+// CLI runner's error shape (e2etest.tryRunCLIFromDir embeds the command's
+// combined output, where cobra prints "Error: <message>", in the error
+// string); classification through failclass.Classify is covered in
+// setup_infraclass_ext_test.go because failclass cannot be imported here.
+func TestIsGCPWIFQuotaError(t *testing.T) {
+	for name, tc := range map[string]struct {
+		err  error
+		want bool
+	}{
+		"iam write retry exhaustion": {
+			err:  fmt.Errorf("inference provision org/repo: [cli] fullsend inference provision org/repo --project proj failed: exit status 1\nError: rate limited (HTTP 429) after 7 attempts"),
+			want: true,
+		},
+		"gcp quota body": {
+			err:  fmt.Errorf("inference provision org/repo: [cli] fullsend inference provision org/repo --project proj failed: exit status 1\nError: Quota exceeded for quota project '123456789' and limit 'CreateWorkloadIdentityPool' of service 'iam.googleapis.com'"),
+			want: true,
+		},
+		"iam read returns 429": {
+			err:  fmt.Errorf("inference status org/repo: [cli] fullsend inference status org/repo --project proj --format json failed: exit status 1\nError: getting WIF provider returned 429: too many requests"),
+			want: true,
+		},
+		"unwrapped 429 status": {
+			err:  fmt.Errorf("unexpected status 429 deleting WIF pool: backend error"),
+			want: true,
+		},
+		"gcp rate limit body": {
+			err:  fmt.Errorf("inference provision org/repo: [cli] fullsend inference provision org/repo --project proj failed: exit status 1\nError: Rate limit exceeded for consumer"),
+			want: true,
+		},
+		"nil error": {
+			err: nil,
+		},
+		"unhealthy status is not quota": {
+			err: fmt.Errorf(`expected healthy status, got "unhealthy"`),
+		},
+		"missing provider is not quota": {
+			err: fmt.Errorf(`missing FULLSEND_GCP_WIF_PROVIDER (status="not_provisioned")`),
+		},
+		"unrelated cli failure": {
+			err: fmt.Errorf("inference provision org/repo: [cli] fullsend inference provision org/repo --project proj failed: exit status 1\nError: creating WIF pool returned 403: Permission 'iam.workloadIdentityPools.create' denied"),
+		},
+		"other status code is not quota": {
+			err: fmt.Errorf("getting WIF provider returned 404: provider not found"),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tc.want, isGCPWIFQuotaError(tc.err))
+		})
+	}
+}
+
+// TestMarkGCPWIFQuota covers the wrap rule the two inference call sites
+// share: quota-signature errors gain the "setup: gcp wif quota" mark, and
+// everything else — nil, unrelated errors, and already-marked errors —
+// passes through unchanged.
+func TestMarkGCPWIFQuota(t *testing.T) {
+	quotaErr := errors.New("rate limited (HTTP 429) after 7 attempts")
+
+	t.Run("quota error is marked with the setup reason", func(t *testing.T) {
+		marked := markGCPWIFQuota(quotaErr)
+		require.Error(t, marked)
+		assert.True(t, behaviourfail.Is(marked))
+		var infra *behaviourfail.InfraError
+		require.ErrorAs(t, marked, &infra)
+		assert.Equal(t, "setup: gcp wif quota", infra.Reason)
+		assert.ErrorIs(t, marked, quotaErr, "the CLI failure stays reachable through the mark")
+	})
+
+	t.Run("nil passes through", func(t *testing.T) {
+		assert.NoError(t, markGCPWIFQuota(nil))
+	})
+
+	t.Run("unrelated error passes through unchanged", func(t *testing.T) {
+		plain := fmt.Errorf(`expected healthy status, got "unhealthy"`)
+		got := markGCPWIFQuota(plain)
+		assert.Same(t, plain, got)
+		assert.False(t, behaviourfail.Is(got))
+	})
+
+	t.Run("already-marked error is not wrapped again", func(t *testing.T) {
+		marked := behaviourfail.Mark(quotaErr, "setup: gcp wif quota")
+		got := markGCPWIFQuota(marked)
+		assert.Same(t, marked, got, "WaitInferenceHealthy's marked error flows through ResolveInferenceWIFProvider unwrapped")
+	})
+}
+
+// setupCLIErr builds a failed `fullsend github setup` error the way
+// e2etest.tryRunCLIFromDir does: the command line, then the combined
+// output, which ends with the "Error: " line cmd/fullsend's main prints.
+func setupCLIErr(output string) error {
+	return fmt.Errorf("github setup org/repo: [cli] fullsend github setup org/repo --direct --mint-url https://mint.test --runtime dummy --vendor failed: exit status 1\n%s", output)
+}
+
+// TestMarkGitHubSetupTransient pins the anchored signatures behind the
+// GitHub 5xx and stream-reset marks on `github setup` failures (#9497):
+// the observed CLI texts are marked with their reason, and every other
+// setup failure — a 4xx, a validation error, a non-GitHub error, an
+// unobserved transport error, a panic — passes through unmarked.
+func TestMarkGitHubSetupTransient(t *testing.T) {
+	for name, tc := range map[string]struct {
+		err        error
+		wantReason string // empty: unchanged and unmarked
+	}{
+		"stream reset on create blob": {
+			err:        setupCLIErr("[setup] committing scaffold files\nError: committing scaffold files: create blob for .fullsend/bin/fullsend: decode blob: stream error: stream ID 23; CANCEL; received from peer"),
+			wantReason: "setup: github stream reset",
+		},
+		"500 on update ref after retries": {
+			err:        setupCLIErr("Error: committing scaffold files: update ref: github api: 500 retryable error after 5 attempts on PATCH /repos/halfsend-07/test-repo-05/git/refs/heads/main (last delay: 16s)"),
+			wantReason: "setup: github server error",
+		},
+		"502 not resent because it may have been applied": {
+			err:        setupCLIErr("Error: committing scaffold files: update ref: github api: 502 server error on PATCH /repos/org/repo/git/refs/heads/main (not retried: the request may have been applied)"),
+			wantReason: "setup: github server error",
+		},
+		"crlf line endings": {
+			err:        setupCLIErr("Error: committing scaffold files: update ref: github api: 503 retryable error after 5 attempts on PATCH /repos/org/repo/git/refs/heads/main (last delay: 16s)\r\n"),
+			wantReason: "setup: github server error",
+		},
+		"final error wins over an earlier 5xx line": {
+			err: setupCLIErr("Error: github api: 500 retryable error after 5 attempts on GET /repos/org/repo\n" +
+				"Error: committing scaffold files: update ref: github api: 422 Validation Failed (Reference update failed)"),
+		},
+		"404": {
+			err: setupCLIErr("Error: committing scaffold files: create tree: github api: 404 Not Found"),
+		},
+		"422 validation": {
+			err: setupCLIErr("Error: committing scaffold files: update ref: github api: 422 Validation Failed (Reference update failed)"),
+		},
+		"non-github error": {
+			err: setupCLIErr("Error: loading config preset: open /tmp/preset.yaml: no such file or directory"),
+		},
+		"5xx text without the client's give-up wording": {
+			err: setupCLIErr("Error: writing workflow file: upstream said github api: 500 Internal Server Error"),
+		},
+		"stream reset with an unobserved code": {
+			err: setupCLIErr("Error: committing scaffold files: create blob for x: decode blob: stream error: stream ID 7; PROTOCOL_ERROR; received from peer"),
+		},
+		"locally cancelled stream": {
+			err: setupCLIErr("Error: committing scaffold files: create blob for x: decode blob: stream error: stream ID 7; CANCEL"),
+		},
+		"panic after an earlier error line": {
+			err: setupCLIErr("Error: github api: 500 retryable error after 5 attempts on GET /repos/org/repo\n" +
+				"panic: runtime error: invalid memory address or nil pointer dereference\n\ngoroutine 1 [running]:"),
+		},
+		"no error line": {
+			err: setupCLIErr("signal: killed"),
+		},
+		"signature outside the error line": {
+			err: setupCLIErr("[setup] retried: stream error: stream ID 3; CANCEL; received from peer\nError: committing scaffold files: create tree: github api: 404 Not Found"),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := markGitHubSetupTransient(tc.err)
+			if tc.wantReason == "" {
+				assert.Same(t, tc.err, got, "unmatched setup failures pass through unchanged")
+				assert.False(t, behaviourfail.Is(got))
+				return
+			}
+			var infra *behaviourfail.InfraError
+			require.ErrorAs(t, got, &infra)
+			assert.Equal(t, tc.wantReason, infra.Reason)
+			assert.ErrorIs(t, got, tc.err, "the CLI failure stays reachable through the mark")
+		})
+	}
+
+	t.Run("nil passes through", func(t *testing.T) {
+		assert.NoError(t, markGitHubSetupTransient(nil))
+	})
+
+	t.Run("already-marked error is not wrapped again", func(t *testing.T) {
+		marked := behaviourfail.Mark(setupCLIErr("Error: decode blob: stream error: stream ID 23; CANCEL; received from peer"), "setup: other")
+		assert.Same(t, marked, markGitHubSetupTransient(marked))
+	})
+}
+
+func TestRunGitHubSetupWithOpts_MarksTransientSetupFailure(t *testing.T) {
+	runner := func(_, _ string, _ ...string) (string, error) {
+		return "", fmt.Errorf("[cli] fullsend github setup org/repo failed: exit status 1\nError: committing scaffold files: create blob for .fullsend/bin/fullsend: decode blob: stream error: stream ID 23; CANCEL; received from peer")
+	}
+
+	err := RunGitHubSetupWithOpts("/bin/fullsend", "tok", "org/repo", "https://mint.test", "", DefaultGitHubSetupOpts(), runner, t.Logf)
+	require.Error(t, err)
+	var infra *behaviourfail.InfraError
+	require.ErrorAs(t, err, &infra)
+	assert.Equal(t, "setup: github stream reset", infra.Reason)
+	assert.Contains(t, err.Error(), "github setup org/repo: ", "the setup target stays in the message")
+}

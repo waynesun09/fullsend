@@ -1,121 +1,196 @@
 # Roadmap
 
-Where fullsend is, and where it is going. Organized as **Now / Next / Later** — what we are actively building, what follows immediately after, and what we see on the horizon.
+Where fullsend is going, as **Now / Next / Later**. Those are confidence
+horizons, not deadlines: **Now** is what this planning cycle is advancing,
+**Next** is likely once Now has room, **Later** is on the horizon.
 
-## Foundation (done)
+This edition is the **September 2026** planning snapshot. Themes are how to
+find work; **Now / Next / Later** horizons are how to read commitment. Issue tracking spans
+[fullsend-ai/fullsend](https://github.com/fullsend-ai/fullsend) and
+[fullsend-ai/agents](https://github.com/fullsend-ai/agents).
+[User support](#user-support) is standing work on every edition until we say
+otherwise: investigating reports, fixing bugs, and keeping docs accurate. It
+is real capacity, not the headline of this page.
 
-Fullsend reached MVP in April 2026. The platform can be installed at the org level, enroll repositories, and run a full autonomous SDLC loop: triage issues, produce code and tests, review PRs, apply fixes from review feedback, and file retrospective improvement proposals. The core agent suite — triage, code, review, fix, retro, and scribe — ships as **OOTB (out-of-the-box) agents** and is designed to be general, extensible, and replaceable.
+Earlier published editions live in [archived-roadmaps](archived-roadmaps/).
 
-What this phase established:
+## At a glance
 
-- **Binary autonomy model** — per-repo opt-in, CODEOWNERS enforcing human approval on protected paths
-- **The repo is the coordinator** — branch protection, CODEOWNERS, and status checks replace a coordinator agent
-- **Trust derives from repository permissions, not agent identity**
-- **Fullsend is using fullsend** — the platform dogfoods its own agent workflows
-- **10+ Konflux repositories** running fullsend for bug triage, code production, and review
-- **Active engagement** with additional upstream organizations exploring adoption
+| Theme | Now |
+| ----- | --- |
+| [Auto-merge](#auto-merge) | A dedicated opt-in auto-merge agent; multi-runtime lets the multi-model review squad ([fullsend#6322](https://github.com/fullsend-ai/fullsend/issues/6322)) run, which raises trust in that path |
+| [Review quality and cost](#review-quality-and-cost) | Compare review approaches using quality and cost together |
+| [GitLab](#gitlab) | A usable GitLab path, including traces from real runs |
+| [Jira](#jira) | Jira can drive the default agent loop for teams that already live there |
+| [Community](#community) | Contributor review keeps moving; identify maintainer candidates through the documented process |
+| [Platform](#platform) | Host APIs, public mint, leftover cleanup from deprecated per-org install ([ADR 0044](ADRs/0044-deprecate-per-org-installation-mode.md)), artifacts, behaviour tests |
+| [Partners](#partners) | Tekton and Lightwell stay in motion; not a ship promise |
+| [User support](#user-support) | Standing: user reports, bugs, and docs — always on, not the feature headline |
 
 ## Now
 
-What we are actively building and shipping.
+What we are actively advancing. Themes are listed in planning-discussion
+order, not priority rank. Issue links are the work that best matches the
+September planning discussion, not the full backlog under each theme.
 
-### Secretless deployment (WIF)
+### Auto-merge
 
-Replace long-lived credentials with Workload Identity Federation. This is a prerequisite for per-repo deployment and a security improvement for existing org-level installs.
+The deliverable is a **fullsend auto-merge agent**: dedicated, opt-in, disabled
+by default, for a narrow class of low-risk work. Repository rules and CI stay
+the enforcement boundary. CI-aware fixing raises the success rate; it is not a
+gate on the first foothold.
 
-- See [#912](https://github.com/fullsend-ai/fullsend/issues/912), [#913](https://github.com/fullsend-ai/fullsend/issues/913), [#914](https://github.com/fullsend-ai/fullsend/issues/914), [#915](https://github.com/fullsend-ai/fullsend/issues/915)
+That agent depends on a trust path the team laid out in planning:
+**multi-runtime** so the **multi-model review squad** ([fullsend#6322](https://github.com/fullsend-ai/fullsend/issues/6322)) can run as the review agent,
+which should improve trust in auto-merge. Debounce/restart and a tighter
+triage → code → review → fix loop are the other enablers. Eval measurements
+and the revert/defect view (next theme) are how we know the path is actually
+safer. The auto-merge agent will not be recommended for opt-in until
+revert and defect visibility ([fullsend#6892](https://github.com/fullsend-ai/fullsend/issues/6892)) is operational.
 
-### Per-repo deployment
+**Auto-merge agent**
 
-Org-level installation is appropriate for some organizations but inappropriate for others. Per-repo deployment lets individual repositories adopt fullsend without requiring org-wide configuration — lowering the barrier for new organizations and enabling adoption in orgs where org-level access is impractical.
+- [agents#1132 — Add a dedicated auto-merge agent](https://github.com/fullsend-ai/agents/issues/1132)
+- [fullsend#3016 — Consider auto-merge for low-risk Renovate patch/minor devDependency updates where CI passes](https://github.com/fullsend-ai/fullsend/issues/3016)
 
-### MVP feedback iteration
+**Depends on: multi-runtime → review squad**
 
-Incorporating feedback from early adopters. The issue backlog reflects this ongoing work across all agents:
+- [fullsend#587 — Investigate ACP proxy chains for multi-runtime support with consistent security hooks](https://github.com/fullsend-ai/fullsend/issues/587)
+- [fullsend#6322 — Enhance Fullsend review agent with multi-model collaborative review strategy](https://github.com/fullsend-ai/fullsend/issues/6322)
 
-- Review agent stability and accuracy ([#947](https://github.com/fullsend-ai/fullsend/issues/947), [#898](https://github.com/fullsend-ai/fullsend/issues/898), [#925](https://github.com/fullsend-ai/fullsend/issues/925), [#887](https://github.com/fullsend-ai/fullsend/issues/887))
-- Review-fix feedback loop improvements ([#902](https://github.com/fullsend-ai/fullsend/issues/902), [#870](https://github.com/fullsend-ai/fullsend/issues/870), [#924](https://github.com/fullsend-ai/fullsend/issues/924))
-- Code agent reliability ([#934](https://github.com/fullsend-ai/fullsend/issues/934), [#935](https://github.com/fullsend-ai/fullsend/issues/935), [#871](https://github.com/fullsend-ai/fullsend/issues/871))
-- Operational improvements ([#896](https://github.com/fullsend-ai/fullsend/issues/896), [#909](https://github.com/fullsend-ai/fullsend/issues/909), [#893](https://github.com/fullsend-ai/fullsend/issues/893))
+**Depends on: loop hygiene (debounce, review/fix)**
 
-### OpenShell improvements
+- [fullsend#1014 — Debounce review dispatch on rapid synchronize events](https://github.com/fullsend-ai/fullsend/issues/1014)
+- [fullsend#5666 — Route fix-agent synchronize events to review stage for automated re-review](https://github.com/fullsend-ai/fullsend/issues/5666)
+- [agents#343 — Scope re-review to finding verification when push only addresses prior findings](https://github.com/fullsend-ai/agents/issues/343)
+- [agents#447 — Review agent should incorporate outstanding human reviews when re-reviewing after PR update](https://github.com/fullsend-ai/agents/issues/447)
+- [agents#478 — Post-fix script should reply to review inline threads it addressed](https://github.com/fullsend-ai/agents/issues/478)
 
-Pulling in new OpenShell features as they become available, including package-based installation ([#878](https://github.com/fullsend-ai/fullsend/issues/878)) and host-side API server capabilities ([#879](https://github.com/fullsend-ai/fullsend/issues/879), [#880](https://github.com/fullsend-ai/fullsend/issues/880), [#881](https://github.com/fullsend-ai/fullsend/issues/881)).
+### Review quality and cost
+
+Measure the review path that auto-merge will rely on. Run the collaborative
+review approach beside the current agent (not a day-one replacement). Compare
+cost over time. Group traces across triage → code → review → fix. Make revert
+and defect rates visible.
+
+- [fullsend#6433 — telemetry: hierarchical work-graph correlation IDs for cost rollup (leaf / parent / feature)](https://github.com/fullsend-ai/fullsend/issues/6433)
+- [fullsend#5361 — telemetry: MLflow trace columns (Name/Session/User/Source) blank; token & cost omit cache tokens](https://github.com/fullsend-ai/fullsend/issues/5361)
+- [fullsend#6458 — Portable OTLP export for eval measurement scores](https://github.com/fullsend-ai/fullsend/issues/6458)
+- [fullsend#6892 — Revert and defect rates are not visible for review and auto-merge outcomes](https://github.com/fullsend-ai/fullsend/issues/6892)
+- [agents#209 — Review eval suite has zero coverage — reintroduce review eval cases after post-review 422 fix lands](https://github.com/fullsend-ai/agents/issues/209)
+
+### GitLab
+
+Move from the current foundation through a usable release path. Prove default
+stages and MLflow export on the same GitLab run, not as separate pieces.
+
+- [fullsend#6684 — feat(cli): add `--gitlab-url` flag to `repos install` for GitLab bootstrapping](https://github.com/fullsend-ai/fullsend/issues/6684)
+- [fullsend#6893 — GitLab default agent stages and MLflow trace export are not validated together](https://github.com/fullsend-ai/fullsend/issues/6893)
+
+### Jira
+
+Finish the path from Jira events into default triage and code so teams (for
+example Konflux) do not copy bugs into GitHub first.
+
+August Jira-poller work that is still open, and how it maps:
+
+- [fullsend#4885 — Define Jira authentication strategy: interim service account credentials](https://github.com/fullsend-ai/fullsend/issues/4885) (issue)
+- [fullsend#2269 — JIRA identity and credential management](https://github.com/fullsend-ai/fullsend/issues/2269) (issue; still open, not a September Now item)
+- [fullsend#3812 — docs(adr): ADR 0079 — Jira project setup via fullsend CLI](https://github.com/fullsend-ai/fullsend/pull/3812) (open ADR pull request, not a poller tracking issue)
+- [fullsend#3428 — docs(adr): add ADR 0068 for privacy allowlist on poll input drivers](https://github.com/fullsend-ai/fullsend/pull/3428) (open ADR pull request, not a poller tracking issue)
+
+The work below is what this edition focuses on.
+
+- [fullsend#6672 — jira-poll: built-in harness files lack CEL triggers, causing 0 dispatches](https://github.com/fullsend-ai/fullsend/issues/6672)
+- [fullsend#2264 — Add JIRA support to the triage agent](https://github.com/fullsend-ai/fullsend/issues/2264)
+- [fullsend#2265 — Add JIRA support to the code agent](https://github.com/fullsend-ai/fullsend/issues/2265)
+
+### Community
+
+Gain additional contributors through the [maintainer process](https://github.com/fullsend-ai/fullsend/blob/main/MAINTAINERS.md).
+Do not promise specific number of new maintainers. Keep contributor pull
+requests moving. Progress is tracked through PR review velocity and the
+maintainer process rather than dedicated issues.
+
+### Platform
+
+Host-side APIs for sandboxed subagents, finish public mint, complete leftover
+cleanup from deprecated per-org installation mode
+([ADR 0044](ADRs/0044-deprecate-per-org-installation-mode.md); this is not
+new org-mode work), let teams choose artifact storage, and shift tests toward
+behaviour coverage in the agents repo.
+
+- [fullsend#879 — Host-side API servers for sandboxed agents](https://github.com/fullsend-ai/fullsend/issues/879)
+- [fullsend#881 — fullsend run: implement host-side API server lifecycle](https://github.com/fullsend-ai/fullsend/issues/881)
+- [fullsend#5116 — Deploy PROD public CF mint at mint.fullsend.sh](https://github.com/fullsend-ai/fullsend/issues/5116)
+- [fullsend#2887 — Remove install_mode input from per-repo shim template](https://github.com/fullsend-ai/fullsend/issues/2887)
+- [fullsend#6734 — Configurable artifact storage backend (replace forge-native artifacts)](https://github.com/fullsend-ai/fullsend/issues/6734)
+- [fullsend#3786 — feat(behaviour): integrate behaviour test runner in fullsend-ai/agents](https://github.com/fullsend-ai/fullsend/issues/3786)
+- [fullsend#3236 — Evaluate overlap between functional tests and behaviour tests + prompt evals](https://github.com/fullsend-ai/fullsend/issues/3236)
+
+### Partners
+
+Keep the Tekton compatibility conversation going. Explore a Lightwell
+custom-agent workflow after their GA, as a mock/PoC — not a September
+delivery promise. No public tracking issue yet for either thread.
+
+### User support
+
+Standing theme for this edition and later ones until we drop it on purpose.
+We spend significant time investigating user concerns, fixing bugs, and
+updating docs. That is real capacity, not a dated deliverable, so it does not
+get a numbered backlog dump. It still sits last on this page so Auto-merge,
+GitLab, and the other feature themes remain the planning focus.
+
+Concrete September docs item from planning feedback: land the scheduled /
+nightly agent example so users are not left guessing how to run a recurring
+agent.
+
+- [fullsend#6601 — docs(#6599): add scheduled agent example guide](https://github.com/fullsend-ai/fullsend/pull/6601)
 
 ## Next
 
-What follows once the current work stabilizes.
+Parked or dependency-bound in this planning session. Not dated.
 
-### Bring Your Own Agent (BYOA)
-
-The OOTB agents are designed to be good defaults, but many teams will want super-custom, super-bespoke agentic workflows that we could never anticipate. BYOA enables teams to use fullsend as a framework — plugging in their own agents, skills, and orchestration while inheriting the platform's security model, sandbox isolation, and coordination layer.
-
-This is a foundational capability. It transforms fullsend from a fixed agent suite into an extensible platform.
-
-- Harness definition architecture ([#173](https://github.com/fullsend-ai/fullsend/issues/173), [#101](https://github.com/fullsend-ai/fullsend/issues/101))
-- Skills loading policy and org/repo inheritance ([#237](https://github.com/fullsend-ai/fullsend/issues/237), [#236](https://github.com/fullsend-ai/fullsend/issues/236))
-- Per-repo workflow definitions ([#69](https://github.com/fullsend-ai/fullsend/issues/69))
-- Config schema and versioning ([#179](https://github.com/fullsend-ai/fullsend/issues/179), [#235](https://github.com/fullsend-ai/fullsend/issues/235))
-
-### Feature refinement
-
-Extending the SDLC footprint beyond bug triage and code production into feature work: refining feature requests, breaking them into implementable units, prioritizing them, and linking that process to upstream agentic development.
-
-- Related: [downstream-upstream](problems/downstream-upstream.md), [intent-representation](problems/intent-representation.md)
-
-### Auto-merge trustworthiness
-
-Monitoring rework rates and review outcomes to build confidence in auto-merge for specific codepaths and repositories. The question is not whether to auto-merge but where and when the evidence supports it.
-
-- Related: [autonomy-spectrum](problems/autonomy-spectrum.md), [code-review](problems/code-review.md)
+- Isolated sandboxes per subagent (host APIs come first): [fullsend#3978 — harness: subagents share the parent sandbox instead of running in isolated sandboxes](https://github.com/fullsend-ai/fullsend/issues/3978)
+- Red Hat AI inference routing — waiting on an inference proxy from another team (no public tracking issue yet)
+- Growing eval-measurements past the first review/cost slice: more stages, model experiments, and outcome evals — [fullsend#3413 — Design large-scale evaluation experiment for new inference models](https://github.com/fullsend-ai/fullsend/issues/3413) · [fullsend#6384 — Track agents@v0 release cut for eval measurement manifests](https://github.com/fullsend-ai/fullsend/issues/6384)
+- Tool proxies after host APIs land: [fullsend#5242 — Tool proxies: transparent CLI interception for sandboxed agents](https://github.com/fullsend-ai/fullsend/issues/5242)
 
 ## Later
 
-Problems we are actively thinking about but not yet building. These are informed by the [problem documents](problems/) and will move into **Next** as the platform matures.
+Direction, not a plan. No dates.
 
-### GitLab support
+- Kubernetes and OpenShift execution — forge-decoupled agent runtime
+- Security hardening, human factors, and production feedback loops — [human-factors](problems/human-factors.md) · [governance](problems/governance.md) · [production-feedback](problems/production-feedback.md) · tracking: [fullsend#172](https://github.com/fullsend-ai/fullsend/issues/172) · [fullsend#174](https://github.com/fullsend-ai/fullsend/issues/174) · [fullsend#84](https://github.com/fullsend-ai/fullsend/issues/84) · [fullsend#159](https://github.com/fullsend-ai/fullsend/issues/159) · [fullsend#877](https://github.com/fullsend-ai/fullsend/issues/877) · [fullsend#2826](https://github.com/fullsend-ai/fullsend/issues/2826) · [fullsend#2828](https://github.com/fullsend-ai/fullsend/issues/2828)
+- Agent attestations — cryptographic provenance for agent output: [fullsend#267](https://github.com/fullsend-ai/fullsend/issues/267)
+- Cross-forge orchestration — GitHub + GitLab / multi-org
+- Alternative sandbox providers — considered; not worth the refactor now
 
-GitHub is the starting point, not the boundary. GitLab support requires solving webhook-to-pipeline translation, MR-event security models, and forge interface abstraction. The architectural groundwork is laid in [ADR-0028](ADRs/0028-gitlab-support.md).
+## August 2026 (shipped since last edition)
 
-- Related: [gitlab-implementation](problems/gitlab-implementation.md)
+August planning lived as a flat Now / Next / Later table. The published
+edition is in [archived-roadmaps/2026-08.md](archived-roadmaps/2026-08.md).
+Work that closed in that window includes GitLab polling/dispatch foundations
+([fullsend#1964](https://github.com/fullsend-ai/fullsend/issues/1964),
+[fullsend#5556](https://github.com/fullsend-ai/fullsend/issues/5556)),
+removing per-org install mode
+([fullsend#2302](https://github.com/fullsend-ai/fullsend/issues/2302)),
+versioned docs
+([fullsend#5717](https://github.com/fullsend-ai/fullsend/issues/5717),
+[fullsend#5718](https://github.com/fullsend-ai/fullsend/issues/5718)),
+public-mint `--public` support
+([fullsend#5634](https://github.com/fullsend-ai/fullsend/issues/5634)),
+GitLab default-stage environment variables
+([fullsend#6865](https://github.com/fullsend-ai/fullsend/issues/6865)),
+configurable agent status comments
+([fullsend#3697](https://github.com/fullsend-ai/fullsend/issues/3697)),
+multi-endpoint telemetry export
+([fullsend#5545](https://github.com/fullsend-ai/fullsend/issues/5545)),
+and doc-practices guidance
+([fullsend#5372](https://github.com/fullsend-ai/fullsend/issues/5372)).
 
-### Kubernetes and OpenShift execution
-
-When OpenShell matures to run practically in Kubernetes and OpenShift, fullsend should support that as an execution environment. This also opens the door to triggering agent workflows from sources beyond GitHub and GitLab — decoupling the agent runtime from the forge.
-
-### JIRA-driven agent workflows
-
-Agents that work directly off JIRA issues — picking up stories, refining acceptance criteria, and linking implementation back to tracking. This extends fullsend's trigger model beyond forge events into project management systems.
-
-### Cross-run memory
-
-Agents are stateless by design, but they rediscover the same lessons on every run. The hard problem is preserving useful operational knowledge without creating a second, less-reviewed instruction channel.
-
-- Related: [cross-run-memory](problems/cross-run-memory.md)
-
-### Production feedback loops
-
-Closing the loop between production signals and what agents work on next. Platform organizations generate structured execution data that can drive triage and prioritization without waiting for humans to notice failures.
-
-- Related: [production-feedback](problems/production-feedback.md)
-
-### Operational observability
-
-How do the humans operating an autonomous software factory understand what it is doing, debug it when it goes wrong, and improve it over time?
-
-- Related: [operational-observability](problems/operational-observability.md)
-
-### Security hardening
-
-Ongoing work informed by the [security threat model](problems/security-threat-model.md):
-
-- Prompt injection detection and andon cord ([#172](https://github.com/fullsend-ai/fullsend/issues/172), [#174](https://github.com/fullsend-ai/fullsend/issues/174))
-- Org guardrail protection ([#84](https://github.com/fullsend-ai/fullsend/issues/84))
-- Workflow security scanning ([#159](https://github.com/fullsend-ai/fullsend/issues/159))
-- Agent authority modeling ([#877](https://github.com/fullsend-ai/fullsend/issues/877))
-
-### Human factors and governance
-
-As autonomous contribution scales, the organizational questions become unavoidable: domain ownership shifts, review fatigue, contributor motivation, and who has authority to make binding decisions about agent behavior.
-
-- Related: [human-factors](problems/human-factors.md), [governance](problems/governance.md), [contribution-volume](problems/contribution-volume.md)
+Items from the August edition not listed above were folded into September
+themes, moved to Next / Later, or deferred — see the
+[archived August edition](archived-roadmaps/2026-08.md) for the
+complete table.

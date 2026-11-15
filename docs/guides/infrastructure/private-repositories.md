@@ -4,38 +4,51 @@ This guide covers what administrators need to configure when enabling fullsend o
 
 ## Supported scenarios
 
-The two install modes have different requirements when the target repo is private.
-
-### Per-repo install (recommended for private repos)
-
-Per-repo install is self-contained: the fullsend workflow shim lives inside the target repo under `.fullsend/`, and it calls the public action workflows in the upstream `fullsend-ai/fullsend` repository directly. Because the caller and the called workflow are in the same repo (or the called repo is public), there are no cross-repo visibility constraints. Per-repo install works for any private repo on any GitHub plan.
-
-**This is the recommended install mode when adding fullsend to private repositories.**
-
-### Per-org install (`.fullsend` config repo)
-
-Per-org install uses a shared `.fullsend` config repo in your organization, with enrolled repos calling into it via cross-repo `workflow_call`. GitHub's Actions access controls create a visibility constraint:
-
-| `.fullsend` visibility | Enrolled repo visibility | Result |
-|------------------------|--------------------------|--------|
-| Public | Any (public, private, internal) | Works |
-| Private | Private | Works |
-| Private | Public | **Fails** (silent — 0 jobs, no error) |
-| Private | Internal (Enterprise Cloud only) | **Fails** (silent) |
-
-The installer creates `.fullsend` as **public by default**, which avoids all visibility edge cases. If your org overrides this to private — for example, to keep orchestration workflows proprietary — then **every enrolled repo must also be private**. Enrolling a public repo into a private `.fullsend` causes silent `workflow_call` failures with no diagnostics.
-
-> **Enterprise Cloud note:** On Enterprise Cloud orgs, GitHub distinguishes between _internal_ and _private_ repo visibility. A private `.fullsend` config repo accepts `workflow_call` only from other _private_ repos — internal repos are excluded. If your org has internal repos you want to enroll, the `.fullsend` config repo must be public or internal (not private).
+A per-repo install is self-contained. The fullsend workflow shim lives inside the target repo under `.fullsend/`, and it calls the public action workflows in the upstream `fullsend-ai/fullsend` repository directly. Because the caller and the called workflow are in the same repo (or the called repo is public), there are no cross-repo visibility constraints. Per-repo install works for any private repo on any GitHub plan.
 
 ## How private repos differ from public repos
 
 Fullsend treats all repositories the same at the infrastructure level — the same agents, harness, and pipeline run regardless of visibility. The differences are operational, not architectural:
 
-1. **Information disclosure risk.** Agents process repository content (code, issues, PR descriptions) and produce output (comments, commits, filed issues) that may reference that content. In a public repo this is harmless — the content is already public. In a private repo, agent output that crosses a visibility boundary (e.g., an issue filed in a public `.fullsend` config repo) can leak private information. See [#1189](https://github.com/fullsend-ai/fullsend/issues/1189) for a concrete example involving the retro agent.
+1. **Information disclosure risk.** Agents process repository content (code, issues, PR descriptions) and produce output (comments, commits, filed issues) that may reference that content. In a public repo this is harmless — the content is already public. In a private repo, agent output that crosses a visibility boundary (e.g., an issue filed in a public repository) can leak private information. See [#1189](https://github.com/fullsend-ai/fullsend/issues/1189) for a concrete example involving the retro agent.
 
 2. **Sensitive data exposure.** Private repos are more likely to contain credentials, PII, internal hostnames, or proprietary logic. Agents may reproduce this content in their output — not because they are instructed to, but because quoting context is a natural part of code review, triage summaries, and retrospective analysis. The [security threat model](../../problems/security-threat-model.md#indirect-information-disclosure) documents how indirect disclosure bypasses content-level guardrails.
 
-3. **`.fullsend` config repo Actions logs (per-org install only).** If your org uses per-org install, agent workflows in `.fullsend` may log run artifacts that reference private repo content. Consider whether your `.fullsend` repo's Actions log visibility needs to be restricted, particularly if `.fullsend` is public but enrolled repos are private.
+## Private Jira projects need a private repository
+
+If you connect fullsend to a private Jira project, prefer a private
+repository. The repository's visibility, not the Jira project's, decides who
+can read what an agent run produces.
+
+The [Jira integration](../user/jira-integration.md) runs agents in the
+repository where fullsend is installed. A run that starts from a Jira issue
+reads that issue's title, description, comments, and other fields, including
+custom fields. By default (`artifacts` level `all`), the run artifact holds
+the run's `output/` directory. These JSONL files in the artifact record what
+the agent read:
+
+| File | Contents |
+|------|----------|
+| `output.jsonl` | The raw conversation stream for each iteration, including tool results such as Jira API responses |
+| `transcripts/*.jsonl` | The agent session transcripts for each iteration |
+| `run-telemetry.jsonl` | Run spans, which carry conversation content when content capture is on |
+
+On a public GitHub repository, any signed-in GitHub user can download this
+artifact until it expires. A public GitLab project can expose its job
+artifacts in the same way. The output scan masks secret values, but it does
+not remove customer names, personal data, or other private business text.
+
+To keep the raw conversation out of the uploaded artifact, set
+`artifacts.by_source.jira: metadata` (or `none`) in `.fullsend/config.yaml`.
+See [Run artifacts and private data](../user/run-artifacts-and-private-data.md)
+for the levels and how to check the result. The setting is defined by
+[ADR 0161](../../ADRs/0161-repo-config-limits-run-artifact-content.md).
+
+That setting does not cover everything. Agents can also quote Jira text in
+pull requests, commits, and workflow logs on the code host. If that text must
+stay confidential, use a private repository. The broader risk of private
+content crossing into public places is tracked in
+[#1189](https://github.com/fullsend-ai/fullsend/issues/1189).
 
 ## Which agents are safe to enable by default
 
@@ -51,25 +64,19 @@ All agents are designed to operate safely, but some produce output with higher d
 
 > **Recommendation:** Start with **triage**, **coder**, and **review** on private repos. Enable **retro** and **prioritize** only after configuring the guardrails described below.
 
-To limit which agents run, edit the `roles` list in `config.yaml`:
+To limit which agents run, add `enabled: false` to their entry on the `agents`
+list. For default agents, add an entry with their name:
 
-- **Per-repo install:** `.fullsend/config.yaml` in the target repo. List only the roles you want enabled:
-  ```yaml
-  version: "1"
-  roles: [triage, coder, review]   # retro and prioritize omitted
-  ```
-
-- **Per-org install:** `.fullsend` config repo's `config.yaml`. Use `defaults.roles` for an org-wide default, or add a per-repo override under `repos`:
-  ```yaml
-  defaults:
-    roles: [fullsend, triage, coder, review, retro, prioritize]
-  repos:
-    my-private-repo:
-      enabled: true
-      roles: [triage, coder, review]   # retro and prioritize disabled for this repo
-  ```
-
-Roles omitted from the list are not dispatched — the dispatcher blocks them before any agent runs.
+```yaml
+version: "1"
+agents:
+  - name: retro
+    enabled: false
+  - name: prioritize
+    enabled: false
+  - name: fix
+    enabled: false
+```
 
 ## Configuring AGENTS.md for private repos
 
@@ -162,12 +169,12 @@ If the retro agent is enabled, trigger it on a merged PR and check the filed iss
 
 ### 4. Review Actions logs
 
-Check the GitHub Actions logs for agent runs in both the target repo and `.fullsend`:
+Check the GitHub Actions logs for agent runs in the target repo:
 
 - Do log outputs contain sensitive values from the private repo?
-- Are the harness-level [secret redaction](../user/customizing-agents.md#harness-yaml-structure) and output scanning working as expected?
+- Are the harness-level [secret redaction](../../reference/harness-reference.md) and output scanning working as expected?
 
-> **Note:** Agent output goes through the harness-level `SecretRedactor` pipeline before being applied (see [ADR 0022](../../ADRs/0022-harness-level-output-schema-enforcement.md)). This catches known secret patterns but cannot catch all forms of sensitive content — `AGENTS.md` instructions are your primary defense for context-specific information.
+> **Note:** Agent output goes through the harness-level `SecretRedactor` pipeline before being applied. This catches known secret patterns but cannot catch all forms of sensitive content — `AGENTS.md` instructions are your primary defense for context-specific information.
 
 ## What should not be deployed based on data sensitivity
 
@@ -178,7 +185,6 @@ Not all private repos are equal. A repo containing open-source code that happens
 - **Enable only:** triage, coder, review
 - **Disable:** retro, prioritize (any agent that produces cross-repo output)
 - **Require:** `AGENTS.md` with the private repository rules above
-- **Consider:** Restricting the `.fullsend` config repo Actions log visibility, since workflow logs may contain references to private repo content
 
 ### Medium-sensitivity repos (proprietary code, internal tooling)
 
@@ -193,7 +199,8 @@ Not all private repos are equal. A repo containing open-source code that happens
 
 ## See also
 
-- [Installation guide](../getting-started/installation.md) — Initial fullsend setup
-- [Customizing agents](../user/customizing-agents.md) — Harness configuration and layered overrides
+- [Getting Started](../getting-started/) — Initial fullsend setup
+- [Configuring agent behavior](../user/customizing-agents.md) — Harness configuration and layered overrides
+- [Jira Integration](../user/jira-integration.md) — Connecting fullsend to a Jira project
 - [Security threat model](../../problems/security-threat-model.md) — Threat priority and defense considerations
 - [#1189](https://github.com/fullsend-ai/fullsend/issues/1189) — Retro agent private content leak risk

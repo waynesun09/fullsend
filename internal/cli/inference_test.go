@@ -1,11 +1,17 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"testing"
 
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/fullsend-ai/fullsend/internal/dispatch/gcf"
+	"github.com/fullsend-ai/fullsend/internal/ui"
 )
 
 func TestInferenceCommand_HasSubcommands(t *testing.T) {
@@ -549,4 +555,425 @@ func TestInferenceDeprovisionCmd_DoesNotRequireGitHubToken(t *testing.T) {
 		"--dry-run"})
 	err := cmd.Execute()
 	require.NoError(t, err)
+}
+
+// --- runInferenceStatus integration tests ---
+
+func newStatusCmd(client gcf.GCFClient) (*cobra.Command, *bytes.Buffer) {
+	var buf bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	return cmd, &buf
+}
+
+func TestRunInferenceStatus_RepoConditionMatch(t *testing.T) {
+	client := gcf.NewFakeGCFClient(
+		gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+			AttributeCondition: "assertion.repository == 'acme/widget'",
+		}),
+	)
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "acme", "acme/widget", "my-project", "fullsend-inference", "github-oidc", "json", client)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+	assert.Equal(t, "healthy", parsed["status"])
+}
+
+func TestRunInferenceStatus_ProviderNotUsable(t *testing.T) {
+	tests := []struct {
+		name       string
+		info       gcf.WIFProviderInfo
+		wantDetail string
+	}{
+		{
+			// providers.get returns a soft-deleted provider with 200 and
+			// its condition intact, so the condition check alone passes.
+			name:       "soft-deleted",
+			info:       gcf.WIFProviderInfo{AttributeCondition: "assertion.repository == 'acme/widget'", State: "DELETED"},
+			wantDetail: "WIF provider state is DELETED",
+		},
+		{
+			name:       "disabled",
+			info:       gcf.WIFProviderInfo{AttributeCondition: "assertion.repository == 'acme/widget'", State: "ACTIVE", Disabled: true},
+			wantDetail: "WIF provider is disabled",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info := tt.info
+			client := gcf.NewFakeGCFClient(gcf.WithFakeWIFProvider(&info))
+			cmd, buf := newStatusCmd(client)
+			err := runInferenceStatus(cmd, "acme", "acme/widget", "my-project", "fullsend-inference", "github-oidc", "json", client)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "unhealthy")
+
+			var parsed map[string]interface{}
+			require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+			assert.Equal(t, "unhealthy", parsed["status"])
+			assert.Contains(t, buf.String(), tt.wantDetail)
+		})
+	}
+}
+
+func TestRunInferenceStatus_OrgProviderDisabled(t *testing.T) {
+	client := gcf.NewFakeGCFClient(gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+		AttributeCondition: "assertion.repository_owner == 'acme'",
+		State:              gcf.WIFProviderStateActive,
+		Disabled:           true,
+	}))
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "acme", "", "my-project", "fullsend-inference", "github-oidc", "json", client)
+	require.Error(t, err)
+	assert.Contains(t, buf.String(), "WIF provider is disabled")
+}
+
+func TestRunInferenceStatus_TextFormatUnhealthyHasNoConditionClaim(t *testing.T) {
+	// The condition matches; only the state is wrong, so the headline must
+	// not blame the condition.
+	client := gcf.NewFakeGCFClient(gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+		AttributeCondition: "assertion.repository == 'acme/widget'",
+		State:              "DELETED",
+	}))
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "acme", "acme/widget", "my-project", "fullsend-inference", "github-oidc", "text", client)
+	require.Error(t, err)
+	assert.Contains(t, buf.String(), "Status: unhealthy")
+	assert.NotContains(t, buf.String(), "condition mismatch")
+	assert.Contains(t, buf.String(), "WIF provider state is DELETED")
+}
+
+func TestRunInferenceStatus_ActiveProviderHealthy(t *testing.T) {
+	client := gcf.NewFakeGCFClient(gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+		AttributeCondition: "assertion.repository == 'acme/widget'",
+		State:              gcf.WIFProviderStateActive,
+	}))
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "acme", "acme/widget", "my-project", "fullsend-inference", "github-oidc", "json", client)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+	assert.Equal(t, "healthy", parsed["status"])
+}
+
+func TestRunInferenceStatus_RepoConditionCaseInsensitiveMatch(t *testing.T) {
+	client := gcf.NewFakeGCFClient(
+		gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+			AttributeCondition: "assertion.repository == 'RedHatProductSecurity/osidb-bindings'",
+		}),
+	)
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "redhatproductsecurity", "redhatproductsecurity/osidb-bindings", "my-project", "fullsend-inference", "github-oidc", "json", client)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+	assert.Equal(t, "healthy", parsed["status"])
+}
+
+func TestRunInferenceStatus_RepoConditionMismatch(t *testing.T) {
+	client := gcf.NewFakeGCFClient(
+		gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+			AttributeCondition: "assertion.repository == 'acme/widget'",
+		}),
+	)
+	cmd, _ := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "acme", "acme/other-repo", "my-project", "fullsend-inference", "github-oidc", "json", client)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unhealthy")
+}
+
+func TestRunInferenceStatus_OrgConditionMatch(t *testing.T) {
+	client := gcf.NewFakeGCFClient(
+		gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+			AttributeCondition: "assertion.repository_owner == 'acme'",
+		}),
+	)
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "acme", "", "my-project", "fullsend-inference", "github-oidc", "json", client)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+	assert.Equal(t, "healthy", parsed["status"])
+}
+
+func TestRunInferenceStatus_OrgConditionCaseInsensitiveMatch(t *testing.T) {
+	client := gcf.NewFakeGCFClient(
+		gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+			AttributeCondition: "assertion.repository_owner == 'GoogleCloudPlatform'",
+		}),
+	)
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "googlecloudplatform", "", "my-project", "fullsend-inference", "github-oidc", "json", client)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+	assert.Equal(t, "healthy", parsed["status"])
+}
+
+func TestRunInferenceStatus_OrgMultiOrgPoolMatch(t *testing.T) {
+	client := gcf.NewFakeGCFClient(
+		gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+			AttributeCondition: "assertion.repository_owner in ['acme', 'BigCorp']",
+		}),
+	)
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "bigcorp", "", "my-project", "fullsend-inference", "github-oidc", "json", client)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+	assert.Equal(t, "healthy", parsed["status"])
+}
+
+func TestRunInferenceStatus_OrgConditionMismatch(t *testing.T) {
+	client := gcf.NewFakeGCFClient(
+		gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+			AttributeCondition: "assertion.repository_owner == 'acme'",
+		}),
+	)
+	cmd, _ := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "other-org", "", "my-project", "fullsend-inference", "github-oidc", "json", client)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unhealthy")
+}
+
+func TestRunInferenceStatus_NotProvisioned(t *testing.T) {
+	client := gcf.NewFakeGCFClient()
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "acme", "", "my-project", "fullsend-inference", "github-oidc", "json", client)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+	assert.Equal(t, "not_provisioned", parsed["status"])
+}
+
+func TestRunInferenceStatus_EnvFormat(t *testing.T) {
+	client := gcf.NewFakeGCFClient(
+		gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+			AttributeCondition: "assertion.repository_owner == 'acme'",
+		}),
+	)
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "acme", "", "my-project", "fullsend-inference", "github-oidc", "env", client)
+	require.NoError(t, err)
+	assert.Contains(t, buf.String(), "FULLSEND_INFERENCE_STATUS=healthy")
+}
+
+func TestRunInferenceStatus_TextFormat(t *testing.T) {
+	client := gcf.NewFakeGCFClient(
+		gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+			AttributeCondition: "assertion.repository_owner == 'acme'",
+		}),
+	)
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "acme", "", "my-project", "fullsend-inference", "github-oidc", "text", client)
+	require.NoError(t, err)
+	assert.Contains(t, buf.String(), "Status: healthy")
+}
+
+// --- conditionMatchesRepo tests ---
+
+func TestConditionMatchesRepo_ExactCase(t *testing.T) {
+	assert.True(t, conditionMatchesRepo(
+		"assertion.repository == 'acme/widget'",
+		"acme/widget",
+	))
+}
+
+func TestConditionMatchesRepo_MixedCaseOrg(t *testing.T) {
+	// GitHub OIDC tokens preserve canonical display case.
+	// A provision with mixed-case input writes a mixed-case condition,
+	// and status should report it as healthy.
+	assert.True(t, conditionMatchesRepo(
+		"assertion.repository == 'RedHatProductSecurity/osidb-bindings'",
+		"RedHatProductSecurity/osidb-bindings",
+	))
+}
+
+func TestConditionMatchesRepo_CaseInsensitiveMatch(t *testing.T) {
+	// Condition was provisioned with mixed case; status queried with lowercase.
+	assert.True(t, conditionMatchesRepo(
+		"assertion.repository == 'RedHatProductSecurity/osidb-bindings'",
+		"redhatproductsecurity/osidb-bindings",
+	))
+	// Condition was provisioned with lowercase; status queried with mixed case.
+	assert.True(t, conditionMatchesRepo(
+		"assertion.repository == 'redhatproductsecurity/osidb-bindings'",
+		"RedHatProductSecurity/osidb-bindings",
+	))
+}
+
+func TestConditionMatchesRepo_Mismatch(t *testing.T) {
+	assert.False(t, conditionMatchesRepo(
+		"assertion.repository == 'acme/widget'",
+		"acme/other-repo",
+	))
+}
+
+// --- conditionMatchesOrg tests ---
+
+func TestConditionMatchesOrg_ExactCase(t *testing.T) {
+	assert.True(t, conditionMatchesOrg(
+		"assertion.repository_owner == 'acme'",
+		"acme",
+	))
+}
+
+func TestConditionMatchesOrg_MixedCaseOrg(t *testing.T) {
+	assert.True(t, conditionMatchesOrg(
+		"assertion.repository_owner == 'GoogleCloudPlatform'",
+		"GoogleCloudPlatform",
+	))
+}
+
+func TestConditionMatchesOrg_CaseInsensitiveMatch(t *testing.T) {
+	// Condition was provisioned with mixed case; status queried with lowercase.
+	assert.True(t, conditionMatchesOrg(
+		"assertion.repository_owner == 'GoogleCloudPlatform'",
+		"googlecloudplatform",
+	))
+	// Condition was provisioned with lowercase; status queried with mixed case.
+	assert.True(t, conditionMatchesOrg(
+		"assertion.repository_owner == 'googlecloudplatform'",
+		"GoogleCloudPlatform",
+	))
+}
+
+func TestConditionMatchesOrg_MultiOrgPool(t *testing.T) {
+	condition := "assertion.repository_owner in ['acme', 'BigCorp']"
+	assert.True(t, conditionMatchesOrg(condition, "acme"))
+	assert.True(t, conditionMatchesOrg(condition, "BigCorp"))
+	assert.True(t, conditionMatchesOrg(condition, "bigcorp"))
+	assert.True(t, conditionMatchesOrg(condition, "ACME"))
+}
+
+func TestConditionMatchesOrg_Mismatch(t *testing.T) {
+	assert.False(t, conditionMatchesOrg(
+		"assertion.repository_owner == 'acme'",
+		"other-org",
+	))
+}
+
+// --- provision --forge gitlab tests ---
+
+func TestInferenceProvisionCmd_GitLabFlags(t *testing.T) {
+	cmd := newInferenceProvisionCmd()
+
+	forgeFlag := cmd.Flags().Lookup("forge")
+	require.NotNil(t, forgeFlag, "expected --forge flag")
+	assert.Equal(t, "github", forgeFlag.DefValue)
+
+	require.NotNil(t, cmd.Flags().Lookup("gitlab-project-id"), "expected --gitlab-project-id flag")
+
+	urlFlag := cmd.Flags().Lookup("gitlab-url")
+	require.NotNil(t, urlFlag, "expected --gitlab-url flag")
+	assert.Equal(t, "https://gitlab.com", urlFlag.DefValue)
+}
+
+func TestInferenceProvisionCmd_GitLabDryRun(t *testing.T) {
+	t.Setenv("GITLAB_TOKEN", "")
+
+	var buf bytes.Buffer
+	cmd := newRootCmd()
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{"inference", "provision", "acme/team/app",
+		"--forge", "gitlab",
+		"--gitlab-project-id", "12345",
+		"--gitlab-url", "https://gitlab.example.com",
+		"--project", "my-project",
+		"--dry-run"})
+	require.NoError(t, cmd.Execute())
+
+	out := buf.String()
+	assert.Contains(t, out, "gl-acme-team-app")
+	assert.Contains(t, out, "https://gitlab.example.com")
+	assert.Contains(t, out, "assertion.project_id == '12345' && assertion.project_path == 'acme/team/app'")
+	assert.Contains(t, out, "attribute.project_path/acme/team/app")
+}
+
+func TestInferenceProvisionCmd_GitLabValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name:    "missing project id",
+			args:    []string{"acme/app", "--forge", "gitlab"},
+			wantErr: "--gitlab-project-id is required",
+		},
+		{
+			name:    "invalid project id",
+			args:    []string{"acme/app", "--forge", "gitlab", "--gitlab-project-id", "abc"},
+			wantErr: "invalid GitLab project ID",
+		},
+		{
+			name:    "invalid project path",
+			args:    []string{"app", "--forge", "gitlab", "--gitlab-project-id", "1"},
+			wantErr: "invalid GitLab project path",
+		},
+		{
+			name:    "invalid gitlab url",
+			args:    []string{"acme/app", "--forge", "gitlab", "--gitlab-project-id", "1", "--gitlab-url", "http://gitlab.example.com"},
+			wantErr: "invalid GitLab URL",
+		},
+		{
+			name:    "provider rejected",
+			args:    []string{"acme/app", "--forge", "gitlab", "--gitlab-project-id", "1", "--provider", "x"},
+			wantErr: "--provider is not supported with --forge gitlab",
+		},
+		{
+			name:    "gitlab flags need gitlab forge",
+			args:    []string{"acme/app", "--gitlab-project-id", "1"},
+			wantErr: "require --forge gitlab",
+		},
+		{
+			name:    "unknown forge",
+			args:    []string{"acme/app", "--forge", "forgejo"},
+			wantErr: "--forge must be one of",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := newRootCmd()
+			args := append([]string{"inference", "provision"}, tc.args...)
+			args = append(args, "--project", "my-project", "--dry-run")
+			cmd.SetArgs(args)
+			err := cmd.Execute()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+func TestRunInferenceProvisionGitLab(t *testing.T) {
+	gl := gcf.GitLabProject{Path: "acme/team/app", ID: "12345"}
+
+	t.Run("success prints handoff", func(t *testing.T) {
+		client := gcf.NewFakeGCFClient()
+		cmd, buf := newStatusCmd(client)
+		err := runInferenceProvisionGitLab(cmd, ui.New(buf), gl, "my-project", "fullsend-inference", client)
+		require.NoError(t, err)
+		out := buf.String()
+		assert.Contains(t, out, "providers/gl-acme-team-app")
+		assert.Contains(t, out, "fullsend repos install acme/team/app")
+		assert.Contains(t, out, "--vertex-wif-provider=projects/")
+	})
+
+	t.Run("failure", func(t *testing.T) {
+		client := gcf.NewFakeGCFClient(gcf.WithFakeErrors(map[string]error{
+			"SetProjectIAMBinding": errors.New("denied"),
+		}))
+		cmd, buf := newStatusCmd(client)
+		err := runInferenceProvisionGitLab(cmd, ui.New(buf), gl, "my-project", "fullsend-inference", client)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "provisioning WIF for inference")
+	})
 }

@@ -1,0 +1,63 @@
+name: Prepare Workspace
+description: >-
+  Layer upstream defaults with per-repo overrides and validate the repository.
+  Must be called AFTER the caller repository and upstream defaults have been
+  checked out (the checkout steps must be inline in the job because this
+  action is only available once .defaults/ exists on disk).
+
+inputs:
+  defaults_root:
+    description: Root directory containing the checked-out upstream defaults
+    required: false
+    default: .defaults
+  source_repo:
+    description: Target repository in owner/name form
+    required: true
+
+outputs:
+  repo_name:
+    description: Short repo name extracted by validate-enrollment
+    value: ${{ steps.repo-parts.outputs.name }}
+
+runs:
+  using: composite
+  steps:
+    - name: Prepare workspace (upstream defaults + repo overrides)
+      shell: bash
+      env:
+        DEFAULTS_ROOT: ${{ inputs.defaults_root }}
+      run: |
+        set -euo pipefail
+        SRC="${DEFAULTS_ROOT}/internal/scaffold/fullsend-repo"
+        LAYERED_DIRS="agents skills schemas harness plugins scripts env"
+        DEST=".fullsend/"
+        for dir in ${LAYERED_DIRS}; do
+          if [[ -d "${SRC}/${dir}" ]]; then
+            mkdir -p "${DEST}${dir}"
+            cp -r "${SRC}/${dir}/." "${DEST}${dir}/"
+          fi
+        done
+        mkdir -p .github/scripts
+        cp "${SRC}/.github/scripts/setup-agent-env.sh" .github/scripts/setup-agent-env.sh
+
+    - name: Validate enrollment and extract repo metadata
+      id: repo-parts
+      shell: bash
+      env:
+        SOURCE_REPO: ${{ inputs.source_repo }}
+      run: |
+        set -euo pipefail
+        : "${SOURCE_REPO:?SOURCE_REPO is required}"
+        : "${GITHUB_REPOSITORY_OWNER:?GITHUB_REPOSITORY_OWNER is required}"
+        if [[ ! "${SOURCE_REPO}" =~ ^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$ ]]; then
+          echo "::error::Invalid source_repo format: must be owner/repo"
+          exit 1
+        fi
+        repo_owner="${SOURCE_REPO%%/*}"
+        if [[ "${repo_owner}" != "${GITHUB_REPOSITORY_OWNER}" ]]; then
+          echo "::error::source_repo owner does not match org"
+          exit 1
+        fi
+        echo "Per-repo mode — skipping config.yaml enrollment check (self-enrolled)"
+        echo "Validation passed for ${SOURCE_REPO}"
+        echo "name=${SOURCE_REPO##*/}" >> "${GITHUB_OUTPUT}"

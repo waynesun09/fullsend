@@ -1,9 +1,10 @@
 ---
 name: mint-enroll
 description: >
-  SRE runbook for enrolling new GitHub orgs or repos into the fullsend token
-  mint service using the fullsend CLI. Use when onboarding a new org, adding a
-  per-repo WIF provider, or re-enrolling after infrastructure changes.
+  SRE runbook for enrolling new GitHub repos into the fullsend token
+  mint service using `go run ./cmd/fullsend` from this checkout. Use when
+  onboarding a new repo, adding a per-repo WIF provider, or re-enrolling after
+  infrastructure changes.
 allowed-tools: Bash
 triggers:
   - mint enroll
@@ -15,8 +16,9 @@ triggers:
 
 # Mint Service Enrollment
 
-Enroll a new GitHub org or per-repo into the fullsend token mint using the
-`fullsend mint` CLI. The mint is a stateless GCP Cloud Function that exchanges
+Enroll a new GitHub repository into the fullsend token mint using
+`go run ./cmd/fullsend mint` from this checkout. The mint is a stateless
+service (deployed on GCP Cloud Function or Cloudflare Worker) that exchanges
 GitHub OIDC JWTs for scoped GitHub App installation tokens.
 
 Follow these steps in order. Do not skip steps.
@@ -24,6 +26,17 @@ Follow these steps in order. Do not skip steps.
 **Always ask the operator for the GCP project ID.** Do not infer it from
 `gcloud config get-value project` — the local config may point at the
 wrong project.
+
+**Always run the CLI from this checkout via `go run`.** From the repo root:
+
+```bash
+go run ./cmd/fullsend <subcommand> …
+```
+
+Do **not** use a `fullsend` binary from mise, `$PATH`, `go install`, or
+another checkout. A stale CLI can rewrite hosted-mint env vars with obsolete
+merge logic (this previously dropped `e2e`/`fix` from `ALLOWED_ROLES` and
+broke e2e). See [Running the fullsend CLI](../../docs/contributing/go-code.md#running-the-fullsend-cli).
 
 ## Setup
 
@@ -33,23 +46,25 @@ wrong project.
   infer from `gcloud config get-value project`.
 - `MINT_REGION` — the Cloud region (default: `us-central1`). Confirm with
   the operator if unsure.
-- `TARGET` — the GitHub org (`acme`) or repo (`acme/widget`) to enroll.
+- `TARGET` — the GitHub repo (`acme/widget`) to enroll. `mint enroll`
+  accepts only `owner/repo`; a bare org is rejected with an error.
 
 ```bash
 GCP_PROJECT="<your-gcp-project-id>"
 MINT_REGION="us-central1"   # default; change if deployed elsewhere
 ```
 
-Verify the operator has the required IAM roles: Secret Manager Admin,
-Workload Identity Pool Admin, Cloud Functions Viewer, Cloud Run Admin.
-Per-repo enrollment additionally requires Project IAM Admin (to grant
-`roles/aiplatform.user` to the repo WIF principal).
+Verify the operator has the required IAM roles: Workload Identity Pool Admin,
+Cloud Functions Viewer, Cloud Run Admin. Secret Manager Admin is only needed
+for initial PEM bootstrap (`mint deploy --pem-dir`), not for enrollment.
+Enrollment does not grant any IAM roles; Vertex AI access for a repo is
+provisioned separately via `fullsend inference provision`.
 
-Verify credentials and that the fullsend CLI is available:
+Verify credentials and that this checkout's CLI builds:
 
 ```bash
 gcloud auth list --filter=status:ACTIVE --format="value(account)"
-fullsend --version
+go run ./cmd/fullsend --version
 ```
 
 ## Constraints
@@ -61,8 +76,9 @@ fullsend --version
   before the repo admin triggers a workflow.
 - **Use `--dry-run` first** — especially for new operators or unfamiliar
   environments. Dry run previews all changes without applying them.
-- **Do not enroll `.fullsend` repos** — `.fullsend` repos use the shared
-  per-org WIF provider. Enroll the org instead.
+- **Do not enroll `.fullsend` repos** — `<org>/.fullsend` config repos
+  belonged to the removed per-org installation mode and do not call the
+  mint. Enroll each repository that runs fullsend workflows instead.
 
 ## Shared App Model
 
@@ -70,50 +86,65 @@ The fullsend-ai org maintains public GitHub Apps shared across orgs.
 
 | Role | App Slug | Notes |
 |------|----------|-------|
-| fullsend | fullsend-ai-fullsend | Dispatch/admin. Per-org only — excluded from per-repo installs. |
+| fullsend | fullsend-ai-fullsend | Dispatch/admin. Not used by per-repo installs. |
 | triage | fullsend-ai-triage | |
 | coder | fullsend-ai-coder | `fix` role shares this app and PEM but has distinct token permissions. |
 | review | fullsend-ai-review | |
 | retro | fullsend-ai-retro | |
 | prioritize | fullsend-ai-prioritize | |
 
-PEM keys are tied to the app, not the org. Enrolling a new org copies PEMs
-from the app set (default: `fullsend-ai`).
+PEM keys and app IDs are tied to the role, not the org. Secrets use role-only naming
+(`fullsend-{role}-app-pem`) — one secret per role, shared across orgs on the
+mint. `ROLE_APP_IDS` uses the same model: one GitHub App ID per role (e.g.,
+`coder` → `123456`), shared by all enrolled repos. PEMs and app IDs must already
+exist (from `mint deploy --pem-dir`, `go run ./cmd/fullsend mint add-role <role> --project <gcp-project> --org <org>`, or the
+deprecated `go run ./cmd/fullsend admin install <owner/repo>`); enrollment
+does not create, copy, or modify PEM secrets or app ID mappings.
 
 Apps must be installed on the target org before the mint can produce tokens.
 An org admin installs via `https://github.com/apps/{slug}/installations/new`
-or by running `fullsend admin install`.
+or by running the deprecated `go run ./cmd/fullsend admin install <owner/repo>`.
 
 ## Enrollment Steps
 
 ### 1. Triage
 
-Determine enrollment type and target. Choose one:
+Determine the target repository:
 
 ```bash
-# Per-org enrollment
-TARGET="<github-org>"
-
-# Per-repo enrollment
 TARGET="<github-org>/<repo-name>"
 ```
 
-Validate the target is a valid GitHub org or owner/repo name before
-proceeding.
+Validate the target is a valid `owner/repo` name before proceeding.
 
 ### 2. Pre-check current state
 
-Run `mint status` to see the current mint state, enrolled orgs, Cloud Run
-revision info, and PEM health:
+Run `mint status --project` to see the current mint state, enrolled repos,
+Cloud Run revision info, and PEM health — this is the enrollment/admin
+pre-check step and must be run with `--project`, since only GCP-based mode
+reports PEM health, Cloud Run revision info, and template divergence. If
+`FULLSEND_MINT_URL` is set in the environment, pass `--mint-url=` (empty)
+to force GCP-based mode — otherwise the CLI errors with "ambiguous mode":
 
 ```bash
-fullsend mint status --project="$GCP_PROJECT" --region="$MINT_REGION"
+go run ./cmd/fullsend mint status --mint-url= --project="$GCP_PROJECT" --region="$MINT_REGION"
+```
+
+When `FULLSEND_MINT_URL` is already configured, `mint status --mint-url`
+is available as a lighter diagnostics command (no GCP IAM roles required),
+but it only reports version, commit, org, roles, and
+workflow-host repos — it does **not** show PEM health, Cloud Run revision
+info, or the health summary, so it does not replace the `--project`
+pre-check above:
+
+```bash
+go run ./cmd/fullsend mint status --mint-url="$FULLSEND_MINT_URL"
 ```
 
 If the mint is not deployed yet, deploy it first:
 
 ```bash
-fullsend mint deploy --project="$GCP_PROJECT" --region="$MINT_REGION"
+go run ./cmd/fullsend mint deploy --project="$GCP_PROJECT" --region="$MINT_REGION"
 ```
 
 Check the status output for:
@@ -122,14 +153,15 @@ Check the status output for:
 - **Template divergence**: if the service template diverges from the
   traffic-serving revision, enrollment will fix this (the CLI uses
   REVISION-pinned traffic routing)
-- **Existing enrollment**: if the target org is already listed, re-enrollment
-  is safe — the CLI merges entries idempotently
+- **Existing enrollment**: if the target repo is already listed in the
+  per-repo WIF repos, re-enrollment is safe — the CLI merges entries
+  idempotently
 
-For per-org drill-down into PEM status (accepts org name only, not
-`owner/repo` — for per-repo enrollment, use just the org portion):
+For an org-level drill-down into PEM status (accepts org name only, not
+`owner/repo` — use just the owner portion of the target):
 
 ```bash
-fullsend mint status "<github-org>" --project="$GCP_PROJECT" --region="$MINT_REGION"
+go run ./cmd/fullsend mint status "<github-org>" --mint-url= --project="$GCP_PROJECT" --region="$MINT_REGION"
 ```
 
 **STOP — show the status output to the operator.** Confirm the mint is
@@ -140,7 +172,7 @@ healthy and the enrollment target is correct before proceeding.
 Preview the enrollment first with `--dry-run`:
 
 ```bash
-fullsend mint enroll "$TARGET" \
+go run ./cmd/fullsend mint enroll "$TARGET" \
   --project="$GCP_PROJECT" \
   --region="$MINT_REGION" \
   --dry-run
@@ -153,51 +185,45 @@ If the preview looks correct and the operator confirms, run the actual
 enrollment:
 
 ```bash
-fullsend mint enroll "$TARGET" \
+go run ./cmd/fullsend mint enroll "$TARGET" \
   --project="$GCP_PROJECT" \
   --region="$MINT_REGION"
 ```
 
 The CLI performs the following automatically:
 
-1. Discovers the existing mint infrastructure and resolves role→app-id mappings
-2. Copies PEM secrets from the app set to the new org's scoped keys
-3. Updates Cloud Run service env vars (ALLOWED_ORGS, ROLE_APP_IDS) using
-   REVISION-pinned traffic routing
-4. Runs post-enrollment verification
-5. Configures WIF provider (shared for per-org, dedicated for per-repo)
+1. Discovers the existing mint infrastructure and verifies shared role→app-id mappings exist
+2. Adds the repo to Cloud Run service env var `PER_REPO_WIF_REPOS` using REVISION-pinned traffic routing
+3. Creates a dedicated WIF provider for the repo
 
-**Optional flags:**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--app-set` | `fullsend-ai` | App set to copy PEMs and app IDs from |
-| `--role-app-ids` | | Explicit JSON map of role→app-id (overrides `--app-set`) |
-| `--roles` | `fullsend,triage,coder,review,retro,prioritize` | Comma-separated roles to enroll |
+On a public mint (`PER_REPO_WIF_REPOS=*`) the command reports public mode
+and exits successfully without changing configuration.
 
 ### 4. Verify
 
-The CLI runs post-enrollment verification automatically. Check its output for:
+Run `mint status` after enrollment (pass `--mint-url=` to force GCP-based
+mode if `FULLSEND_MINT_URL` is set in the environment):
+
+```bash
+go run ./cmd/fullsend mint status --mint-url= --project="$GCP_PROJECT" --region="$MINT_REGION"
+```
+
+Check its output for:
 
 - **Revision state**: confirms which Cloud Run revision is serving traffic
   and whether it matches the latest template
-- **ALLOWED_ORGS**: confirms the enrolled org is present in the
-  traffic-serving revision's env vars
-- **ROLE_APP_IDS**: confirms all expected role keys are present
-
-If the CLI reports "Post-write verification FAILED", run `mint status` to
-diagnose:
-
-```bash
-fullsend mint status --project="$GCP_PROJECT" --region="$MINT_REGION"
-```
+- **Per-Repo WIF Repos**: confirms the enrolled repo is listed. This list is
+  read from the traffic-serving Cloud Run revision (falling back to Cloud
+  Functions metadata only when revision env vars are unavailable); the
+  traffic-serving revision is the authoritative enrollment check
+- **ROLE_APP_IDS**: confirms shared role keys (e.g., `coder`, `review`) are configured on the mint
 
 Common causes of verification failure:
 
 - **Template/traffic divergence** — traffic routing step didn't complete.
   Re-run enrollment to trigger a new revision cycle.
-- **Missing role keys** — the app set doesn't have all roles. Use
-  `--role-app-ids` to provide explicitly.
+- **Missing shared app IDs** — the mint has no role-keyed `ROLE_APP_IDS` entries.
+  Run `mint deploy --pem-dir`, `go run ./cmd/fullsend mint add-role <role> --project <gcp-project> --org <org>`, or `go run ./cmd/fullsend admin install <owner/repo>` on the mint project first.
 
 ### 5. Handoff to repo admin
 
@@ -205,72 +231,65 @@ The mint SRE does not configure target repos. Inform the repo admin that
 mint-side enrollment is complete and provide:
 
 - **Mint URL**: shown in `mint status` output
-- GitHub Actions org variable `FULLSEND_MINT_URL` (set by `fullsend admin install` or manually)
+- GitHub Actions repository variable `FULLSEND_MINT_URL` (set per repo by `go run ./cmd/fullsend github setup <owner/repo>` or manually)
 - `.github/workflows/fullsend.yaml` shim workflow in the target repo
 
-For per-repo enrollments, also provide:
+Also provide:
 
 - **WIF Provider ID**: shown in the enrollment output (needed for the
   `google-github-actions/auth` step)
 
-For per-org, the `repo-maintenance` workflow in `.fullsend` handles shim
-deployment. For per-repo, the admin runs
-`fullsend admin install <owner/repo>` or configures manually.
+The admin runs `go run ./cmd/fullsend github setup <owner/repo>` for each
+repository (the CLI no longer supports org-targeted installs) or configures
+it manually.
 
 Verify that all required GitHub Apps are installed on the target org
 before the admin triggers a workflow.
 
 ## Rollback
 
-**STOP — unenroll is a destructive operation that removes an org or repo
-from the mint. Always run `--dry-run` first and confirm with the operator
+**STOP — unenroll is a destructive operation that removes a repo from the
+mint. Always run `--dry-run` first and confirm with the operator
 before proceeding.**
 
 Use the CLI to unenroll:
 
 ```bash
 # Dry-run first
-fullsend mint unenroll "$TARGET" \
+go run ./cmd/fullsend mint unenroll "$TARGET" \
   --project="$GCP_PROJECT" --region="$MINT_REGION" --dry-run
 
 # Actual unenroll (after operator confirms dry-run output)
-fullsend mint unenroll "$TARGET" \
+go run ./cmd/fullsend mint unenroll "$TARGET" \
   --project="$GCP_PROJECT" --region="$MINT_REGION"
 ```
 
 Unenroll is interactive — it requires typing the target name to confirm.
 Use `--yolo` to skip confirmation in automated contexts.
 
-By default, org-scoped unenroll disables (not deletes) PEM secrets and
-removes the org from the shared WIF provider's attribute condition.
-Repo-scoped unenroll disables the repo-specific WIF provider — it does
-not touch PEM secrets. Both are reversible — re-enrollment will re-enable
-disabled resources and re-add the org to the WIF condition.
+`$TARGET` must be `owner/repo`; a bare org is rejected because per-org
+unenrollment was removed. Unenroll removes the repo from
+`PER_REPO_WIF_REPOS` and disables the repo-specific WIF provider — it does
+not touch PEM secrets. Org entries left on older mints (`ALLOWED_ORGS`, org
+entries in the shared WIF provider condition) need manual cleanup; see
+"Cleaning up legacy per-org mint state" in
+`docs/guides/infrastructure/mint-administration.md`.
 
-To permanently delete instead of disable, add `--delete-secrets` (org only)
-or `--delete-provider` (repo only) to the same unenroll command. These are
-flags on a single invocation, not separate follow-up commands:
+To permanently delete the repo's WIF provider instead of disabling it,
+add `--delete-provider` to the unenroll command:
 
 ```bash
-# Preview permanent secret deletion first
-fullsend mint unenroll "$TARGET" \
-  --project="$GCP_PROJECT" --region="$MINT_REGION" --delete-secrets --dry-run
-
-# Permanently delete PEM secrets (org-scoped only, after dry-run confirms)
-fullsend mint unenroll "$TARGET" \
-  --project="$GCP_PROJECT" --region="$MINT_REGION" --delete-secrets
-
-# Preview permanent WIF provider deletion first (repo-scoped only)
-fullsend mint unenroll "$TARGET" \
+# Preview permanent WIF provider deletion first
+go run ./cmd/fullsend mint unenroll "$TARGET" \
   --project="$GCP_PROJECT" --region="$MINT_REGION" --delete-provider --dry-run
 
-# Permanently delete WIF provider (repo-scoped only, after dry-run confirms)
-fullsend mint unenroll "$TARGET" \
+# Permanently delete WIF provider (after dry-run confirms)
+go run ./cmd/fullsend mint unenroll "$TARGET" \
   --project="$GCP_PROJECT" --region="$MINT_REGION" --delete-provider
 ```
 
-Only use `--delete-secrets` or `--delete-provider` after confirming no
-workflows depend on the resources.
+Only use `--delete-provider` after confirming no workflows depend on the
+provider.
 
 ## Troubleshooting
 
@@ -280,7 +299,7 @@ modify the mint.
 
 **DANGER — never use `--set-env-vars` to modify the mint service.** The
 `--set-env-vars` flag **replaces all** env vars, wiping out every other
-variable (ALLOWED_ORGS, ROLE_APP_IDS, PEM secret references, etc.). If
+variable (PER_REPO_WIF_REPOS, ROLE_APP_IDS, PEM secret references, etc.). If
 you need to fix an env var manually, use `--update-env-vars` which
 **merges** the provided values into the existing set:
 
@@ -294,7 +313,7 @@ gcloud run services update "$MINT_SERVICE" \
 # gcloud run services update "$MINT_SERVICE" --set-env-vars="KEY=value"
 ```
 
-Prefer `fullsend mint enroll` over manual `gcloud` env var edits — the
+Prefer `go run ./cmd/fullsend mint enroll` over manual `gcloud` env var edits — the
 CLI handles read-merge-write with REVISION-pinned traffic routing.
 
 Set these variables for the commands below:
@@ -340,14 +359,14 @@ gcloud run revisions list \
 ### Check PEM secrets
 
 ```bash
-# List all PEM secrets for the org
+# List role PEM secrets (shared across orgs on the mint)
 gcloud secrets list --project="$GCP_PROJECT" \
-  --filter="name:fullsend-${ORG}--" \
+  --filter="name:fullsend- AND name:-app-pem" \
   --format="table(name,createTime)"
 
-# Check if a specific secret has an enabled version
+# Check if a specific role secret has an enabled version
 gcloud secrets versions describe latest \
-  --secret="fullsend-${ORG}--coder-app-pem" \
+  --secret="fullsend-coder-app-pem" \
   --project="$GCP_PROJECT" --format="value(state)"
 ```
 
@@ -379,5 +398,5 @@ gcloud functions logs read fullsend-mint \
 ```
 
 For more troubleshooting scenarios, see the
-[Troubleshooting section](../../docs/guides/infrastructure/mint-administration.md#troubleshooting)
+[mint administration guide](../../docs/guides/infrastructure/mint-administration.md)
 in the mint administration guide.

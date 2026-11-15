@@ -1,0 +1,356 @@
+package forge
+
+import (
+	"fmt"
+	"net/url"
+	"os"
+	"strings"
+)
+
+// ForgeURLInfo contains the parsed components of a forge URL.
+type ForgeURLInfo struct {
+	Forge    string // "github", "gitlab", or the host of another GitHub instance
+	Owner    string
+	Repo     string
+	Path     string // path within the repo (e.g., "skills/pr-review")
+	Ref      string // commit SHA, tag, or branch name
+	PathType string // "tree" (directory), "blob" (file), or "" (raw content URLs)
+}
+
+// ParseForgeURL extracts forge, owner, repo, path, and ref from an HTTPS URL
+// pointing to a supported git forge. Returns an error if the URL is not from a
+// recognized forge or cannot be parsed.
+//
+// Any #sha256=... fragment is stripped before parsing — handle integrity hashes
+// separately via ParseIntegrityHash.
+//
+// Accepted GitHub formats:
+//
+//	https://github.com/{owner}/{repo}/tree/{ref}/{path}   (directory)
+//	https://github.com/{owner}/{repo}/blob/{ref}/{path}   (file)
+//
+// Accepted GitLab formats (supports nested groups):
+//
+//	https://gitlab.com/{group}[/subgroup...]/{repo}/-/tree/{ref}/{path}
+//	https://gitlab.com/{group}[/subgroup...]/{repo}/-/blob/{ref}/{path}
+func ParseForgeURL(rawURL string) (*ForgeURLInfo, error) {
+	// Strip fragment (including #sha256=... integrity hashes) before parsing.
+	if idx := strings.LastIndex(rawURL, "#"); idx != -1 {
+		rawURL = rawURL[:idx]
+	}
+
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid URL: %w", err)
+	}
+	if u.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported scheme %q: only https is accepted", u.Scheme)
+	}
+
+	hostname := u.Hostname()
+	if !isRecognizedForge(hostname) {
+		return nil, fmt.Errorf("unsupported forge host %q", hostname)
+	}
+
+	// Determine forge name from hostname.
+	forgeName := hostnameToForge(hostname)
+
+	// Split the path into segments, filtering out empty strings from leading/trailing slashes.
+	var segments []string
+	for _, s := range strings.Split(u.Path, "/") {
+		if s != "" {
+			segments = append(segments, s)
+		}
+	}
+
+	if forgeName == "gitlab" {
+		return parseGitLabURL(segments)
+	}
+
+	// GitHub format: /{owner}/{repo}/{tree|blob}/{ref}/{path...}
+	// Need at least 4 segments: owner, repo, type (tree/blob), ref.
+	if len(segments) < 4 {
+		return nil, fmt.Errorf("URL path too short: need at least /{owner}/{repo}/{tree|blob}/{ref}")
+	}
+
+	owner := segments[0]
+	repo := segments[1]
+	pathType := segments[2]
+	ref := segments[3]
+
+	if owner == "" {
+		return nil, fmt.Errorf("empty owner in URL")
+	}
+	if repo == "" {
+		return nil, fmt.Errorf("empty repo in URL")
+	}
+	if ref == "" {
+		return nil, fmt.Errorf("empty ref in URL")
+	}
+
+	if pathType != "tree" && pathType != "blob" {
+		return nil, fmt.Errorf("unsupported path type %q: expected \"tree\" or \"blob\"", pathType)
+	}
+
+	// Everything after the ref is the path within the repo.
+	var repoPath string
+	if len(segments) > 4 {
+		repoPath = strings.Join(segments[4:], "/")
+	}
+
+	return &ForgeURLInfo{
+		Forge:    forgeName,
+		Owner:    owner,
+		Repo:     repo,
+		Path:     repoPath,
+		Ref:      ref,
+		PathType: pathType,
+	}, nil
+}
+
+// parseGitLabURL parses a GitLab URL path (segments after the host).
+// GitLab uses "/-/" as a separator between the project path and
+// resource type. Nested groups are supported (e.g., group/subgroup/repo).
+//
+// Format: {group}[/subgroup...]/{repo}/-/{tree|blob}/{ref}/{path...}
+func parseGitLabURL(segments []string) (*ForgeURLInfo, error) {
+	// Find the "/-/" separator (represented as "-" in segments).
+	dashIdx := -1
+	for i, s := range segments {
+		if s == "-" {
+			dashIdx = i
+			break
+		}
+	}
+
+	if dashIdx < 0 {
+		return nil, fmt.Errorf("URL path too short: need at least /{group}/{repo}/-/{tree|blob}/{ref}")
+	}
+
+	// Need at least 2 segments before dash (group + repo) and 2 after (type + ref).
+	if dashIdx < 2 {
+		return nil, fmt.Errorf("URL path too short: need at least /{group}/{repo}/-/{tree|blob}/{ref}")
+	}
+	if len(segments) < dashIdx+3 {
+		return nil, fmt.Errorf("URL path too short: need at least /{group}/{repo}/-/{tree|blob}/{ref}")
+	}
+
+	// Everything before dash except the last segment is the owner (group/subgroups).
+	// The last segment before dash is the repo.
+	owner := strings.Join(segments[:dashIdx-1], "/")
+	repo := segments[dashIdx-1]
+	pathType := segments[dashIdx+1]
+	ref := segments[dashIdx+2]
+
+	if pathType != "tree" && pathType != "blob" {
+		return nil, fmt.Errorf("unsupported path type %q: expected \"tree\" or \"blob\"", pathType)
+	}
+
+	var repoPath string
+	if len(segments) > dashIdx+3 {
+		repoPath = strings.Join(segments[dashIdx+3:], "/")
+	}
+
+	return &ForgeURLInfo{
+		Forge:    "gitlab",
+		Owner:    owner,
+		Repo:     repo,
+		Path:     repoPath,
+		Ref:      ref,
+		PathType: pathType,
+	}, nil
+}
+
+// hostnameToForge maps a forge hostname to its short name.
+func hostnameToForge(hostname string) string {
+	switch hostname {
+	case "github.com":
+		return "github"
+	case "gitlab.com":
+		return "gitlab"
+	default:
+		return hostname
+	}
+}
+
+// GitHubServerURLEnv names the environment variable GitHub Actions sets to the
+// URL of the GitHub instance running the workflow (e.g.
+// "https://ghe.example.com" on GitHub Enterprise Server).
+const GitHubServerURLEnv = "GITHUB_SERVER_URL"
+
+// ConfiguredGitHubURL returns the URL of the GitHub instance this process
+// runs against, for ParseRawContentURLOnHost. It is empty when unset, in which
+// case only raw.githubusercontent.com URLs are accepted.
+func ConfiguredGitHubURL() string {
+	return strings.TrimSpace(os.Getenv(GitHubServerURLEnv))
+}
+
+// ParseRawContentURL extracts forge, owner, repo, path, and ref from a
+// raw.githubusercontent.com URL.
+//
+// Accepted format:
+//
+//	https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{path...}
+//
+// The ref is a commit SHA, tag, or branch name. Everything after it is the
+// file/directory path within the repo (may be empty).
+//
+// Use ParseRawContentURLOnHost to also accept raw-content URLs served by a
+// configured GitHub host other than github.com.
+func ParseRawContentURL(rawURL string) (*ForgeURLInfo, error) {
+	return ParseRawContentURLOnHost(rawURL, "")
+}
+
+// ParseRawContentURLOnHost is ParseRawContentURL that also accepts
+// raw-content URLs served by a GitHub host other than github.com, such as a
+// GitHub Enterprise Server instance. githubURL is that instance's URL, as
+// configured in forge.github.url (e.g. "https://ghe.example.com"). Such a
+// host serves raw content from the host itself, with a literal "raw" segment
+// after the repository:
+//
+//	https://{host}/{owner}/{repo}/raw/{ref}/{path...}
+//
+// The URL's host, including any port, must match githubURL's host. The
+// result's Forge is that host, so CloneURL clones from it rather than from
+// github.com. When githubURL is empty or names github.com, only
+// raw.githubusercontent.com URLs are accepted, exactly as by
+// ParseRawContentURL.
+func ParseRawContentURLOnHost(rawURL, githubURL string) (*ForgeURLInfo, error) {
+	if idx := strings.LastIndex(rawURL, "#"); idx != -1 {
+		rawURL = rawURL[:idx]
+	}
+
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid URL: %w", err)
+	}
+	if u.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported scheme %q: only https is accepted", u.Scheme)
+	}
+	if u.Hostname() != "raw.githubusercontent.com" {
+		host := enterpriseGitHubHost(githubURL)
+		if host == "" || !strings.EqualFold(u.Host, host) {
+			return nil, fmt.Errorf("not a raw.githubusercontent.com URL: %s", u.Hostname())
+		}
+		return parseEnterpriseRawPath(host, u.Path)
+	}
+
+	var segments []string
+	for _, s := range strings.Split(u.Path, "/") {
+		if s != "" {
+			segments = append(segments, s)
+		}
+	}
+
+	// Need at least 3 segments: owner, repo, ref.
+	if len(segments) < 3 {
+		return nil, fmt.Errorf("URL path too short: need at least /{owner}/{repo}/{ref}")
+	}
+
+	owner := segments[0]
+	repo := segments[1]
+	ref := segments[2]
+
+	if owner == "" {
+		return nil, fmt.Errorf("empty owner in URL")
+	}
+	if repo == "" {
+		return nil, fmt.Errorf("empty repo in URL")
+	}
+	if ref == "" {
+		return nil, fmt.Errorf("empty ref in URL")
+	}
+
+	var repoPath string
+	if len(segments) > 3 {
+		repoPath = strings.Join(segments[3:], "/")
+	}
+
+	return &ForgeURLInfo{
+		Forge:    "github",
+		Owner:    owner,
+		Repo:     repo,
+		Path:     repoPath,
+		Ref:      ref,
+		PathType: "blob",
+	}, nil
+}
+
+// enterpriseGitHubHost returns the lowercased host (including any port) of a
+// GitHub instance URL, or "" when the URL is empty, unparseable, or names
+// github.com, whose raw content is served from raw.githubusercontent.com.
+//
+// It also returns "" for the single-label hosts "github" and "gitlab": the
+// host becomes ForgeURLInfo.Forge, where those values are the sentinels
+// forgeHost maps to github.com and gitlab.com, so such a host would make
+// CloneURL point at a public forge instead of the configured one.
+func enterpriseGitHubHost(githubURL string) string {
+	u, err := url.Parse(strings.TrimSpace(githubURL))
+	if err != nil || u.Host == "" || strings.EqualFold(u.Hostname(), "github.com") {
+		return ""
+	}
+	switch strings.ToLower(u.Hostname()) {
+	case "github", "gitlab":
+		return ""
+	}
+	return strings.ToLower(u.Host)
+}
+
+// parseEnterpriseRawPath parses the path of a raw-content URL served by the
+// GitHub host itself: /{owner}/{repo}/raw/{ref}/{path...}. The returned
+// ForgeURLInfo carries host as its Forge.
+func parseEnterpriseRawPath(host, urlPath string) (*ForgeURLInfo, error) {
+	var segments []string
+	for _, s := range strings.Split(urlPath, "/") {
+		if s != "" {
+			segments = append(segments, s)
+		}
+	}
+
+	// Need at least 4 segments: owner, repo, "raw", ref.
+	if len(segments) < 4 {
+		return nil, fmt.Errorf("URL path too short: need at least /{owner}/{repo}/raw/{ref}")
+	}
+	if segments[2] != "raw" {
+		return nil, fmt.Errorf("unsupported path type %q: expected \"raw\"", segments[2])
+	}
+
+	return &ForgeURLInfo{
+		Forge:    host,
+		Owner:    segments[0],
+		Repo:     segments[1],
+		Path:     strings.Join(segments[4:], "/"),
+		Ref:      segments[3],
+		PathType: "blob",
+	}, nil
+}
+
+// CloneURL returns the HTTPS clone URL for the repository.
+func (f *ForgeURLInfo) CloneURL() string {
+	return fmt.Sprintf("https://%s/%s/%s.git", forgeHost(f.Forge), f.Owner, f.Repo)
+}
+
+func forgeHost(forge string) string {
+	switch forge {
+	case "github":
+		return "github.com"
+	case "gitlab":
+		return "gitlab.com"
+	default:
+		return forge
+	}
+}
+
+// IsSupportedForge returns true if the hostname belongs to a forge with
+// full fetch/clone support. Use this for validating user-facing URLs
+// (e.g., skill references) where the system must actually be able to
+// retrieve content.
+func IsSupportedForge(hostname string) bool {
+	return hostname == "github.com"
+}
+
+// isRecognizedForge returns true for any forge whose URL format we can parse,
+// even if fetch support has not landed yet.
+func isRecognizedForge(hostname string) bool {
+	return hostname == "github.com" || hostname == "gitlab.com"
+}

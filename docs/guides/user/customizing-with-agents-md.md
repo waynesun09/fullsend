@@ -1,16 +1,16 @@
-# Customizing Agents with AGENTS.md
+# Configuring Agents with AGENTS.md
 
 Fullsend agents operate on your repository using Claude Code inside a sandboxed
 environment. Because agents run with your repo checked out, they automatically
 read its `AGENTS.md` file — the same file human contributors use. No fullsend
 configuration changes needed.
 
-For agent-specific customization using skills, see
-[Customizing with Skills](customizing-with-skills.md).
+For agent-specific configuration using skills, see
+[Configuring with Skills](customizing-with-skills.md).
 
 ## What to put in AGENTS.md
 
-`AGENTS.md` is the [open standard](https://agentskills.io/) that any agent
+`AGENTS.md` is the [open standard](https://agents.md/) that any agent
 tool can discover. The recommended approach is to keep your `CLAUDE.md`
 lightweight and have it point at `AGENTS.md`:
 
@@ -87,6 +87,52 @@ Your repo has a complex domain model and triage often miscategorizes issues:
 - The `api/` directory is auto-generated from protobuf — never modify it directly.
 ```
 
+## How AGENTS.md interacts with agent definitions
+
+Fullsend agents have two layers of instructions, loaded through different
+mechanisms:
+
+1. **Agent definition** — the system prompt loaded via `--agent <name>`.
+   Fullsend controls this. It defines the agent's role, task, allowed tools,
+   model, and which built-in skills to load. Repos cannot modify it.
+
+2. **Project instructions** — `CLAUDE.md` and `AGENTS.md` auto-loaded from
+   the working directory. Your repo controls these. They provide conventions,
+   architecture context, and domain knowledge.
+
+These layers **compose** — they don't compete. The agent definition sets
+*what* the agent does (review code, implement a feature). Your AGENTS.md
+sets *how* it should work in your repo (test commands, code style, domain
+context). If AGENTS.md contradicts the agent definition, the agent definition
+takes precedence.
+
+### What AGENTS.md can do
+
+- Guide agent behavior within its defined role (coding conventions, test
+  strategy, architecture rules)
+- Reference repo skills by name — the agent will invoke them if they exist
+  in `.claude/skills/`
+- Provide domain context that helps the agent make better decisions
+
+### What AGENTS.md cannot do
+
+- Override the agent definition's tool restrictions (e.g., the review agent
+  cannot write files regardless of what AGENTS.md says)
+- Remove or replace built-in skills — use
+  [config-driven agent registration](customizing-with-skills.md#overriding-built-in-skills)
+  for that
+- Change the agent's model or execution parameters
+
+### Injection handling
+
+When the target repo has no AGENTS.md, fullsend injects a fallback `AGENTS.md`
+from the configured fullsend content directory. When the repo has AGENTS.md but no CLAUDE.md, fullsend
+injects a bridge CLAUDE.md that points to AGENTS.md. Both injected files are
+hidden from git so agents don't accidentally commit them.
+
+All repo context files (AGENTS.md, CLAUDE.md, SKILL.md) are scanned for
+prompt injection before the agent starts.
+
 ## What not to do
 
 - **Don't write agent-specific instructions.** All agents read the same
@@ -99,3 +145,10 @@ Your repo has a complex domain model and triage often miscategorizes issues:
   detailed context in the package directory where it's relevant rather than
   loading every agent with everything. For example, database migration
   review checklists belong in `db/migrations/AGENTS.md`, not the root file.
+
+## See also
+
+- [Customizing Agents](customizing-overview.md) — overview of all customization approaches
+- [Configuring with Skills](customizing-with-skills.md) — agent-specific domain knowledge
+- [Default, derived, and custom agents](default-vs-custom.md)
+  — `AGENTS.md` configuration keeps you in "configured default agent" territory

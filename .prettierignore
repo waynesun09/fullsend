@@ -1,0 +1,15 @@
+dist/
+node_modules/
+cloudflare_site/
+*.md
+*.yaml
+*.yml
+*.go
+*.py
+hack/
+internal/
+docs/*
+!docs/.vitepress/
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+web/public/

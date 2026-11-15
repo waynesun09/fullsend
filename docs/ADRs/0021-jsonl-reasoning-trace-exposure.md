@@ -19,6 +19,10 @@ Date: 2026-04-15
 
 Accepted
 
+*Amended by [ADR 0161](0161-repo-config-limits-run-artifact-content.md), which
+replaces the per-agent suppression opt-out with a repo-level `artifacts`
+setting in `config.yaml`.*
+
 ## Context
 
 The retro agent needs access to the raw JSONL conversation transcripts that
@@ -162,4 +166,4 @@ it suppresses JSONL for nearly all useful runs on private repos.
 - Raw JSONL serves per-run consumers (retro agent, session resumption,
   human debugging). Complementary structured extraction via OpenTelemetry
   could power aggregate analysis at scale (pattern detection across many
-  runs) — a future decision, not in scope here.
+  runs) — subsequently decided in [ADR 0050](0050-distributed-tracing-instrumentation.md).

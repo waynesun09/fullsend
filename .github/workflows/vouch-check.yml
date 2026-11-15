@@ -1,0 +1,49 @@
+name: Vouch Check
+
+# Closes PRs from contributors who are neither write+ collaborators nor listed
+# in VOUCHED.td on the `vouched` branch (docs/contributing/vouch-system.md).
+#
+# Runs on a schedule, not on a PR event (#9245): GitHub blocks
+# pull_request_target by default from 2026-12-02, fork PRs get a read-only
+# token on pull_request, and this repo requires approval before a first-time
+# contributor's pull_request run starts, which is exactly who this gate is for.
+# The job never checks out PR code; it reads PR metadata through the API.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report what would be closed without closing anything
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: vouch-check
+  cancel-in-progress: false
+
+jobs:
+  vouch-gate:
+    if: github.repository_owner == 'fullsend-ai'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Close PRs from unvouched contributors
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          args=()
+          [[ "${DRY_RUN}" == "true" ]] && args+=(--dry-run)
+          bash scripts/vouch-sweep.sh "${args[@]}" "${REPO}"

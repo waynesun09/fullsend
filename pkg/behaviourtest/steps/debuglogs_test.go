@@ -1,0 +1,1994 @@
+package steps
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/fullsend-ai/fullsend/internal/forge"
+	"github.com/fullsend-ai/fullsend/pkg/behaviourtest/drivers/ci"
+	"github.com/fullsend-ai/fullsend/pkg/behaviourtest/drivers/scm"
+	"github.com/fullsend-ai/fullsend/pkg/behaviourtest/world"
+)
+
+func TestSaveWorkflowRunLogs_NilRun(t *testing.T) {
+	t.Parallel()
+	var logged []string
+	w := &world.World{
+		Logf: func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) },
+	}
+	// Should be a no-op — no panic, no log.
+	saveWorkflowRunLogs(context.Background(), w, "triage", nil)
+	assert.Empty(t, logged)
+}
+
+func TestSaveWorkflowRunLogs_SkipsWhenArtifactDirUnset(t *testing.T) {
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", "")
+
+	var logged []string
+	w := &world.World{
+		Logf: func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) },
+	}
+
+	run := &forge.WorkflowRun{ID: 10}
+	saveWorkflowRunLogs(context.Background(), w, "triage", run)
+
+	require.Len(t, logged, 1)
+	assert.Contains(t, logged[0], "BEHAVIOUR_ARTIFACT_DIR unset")
+	assert.Contains(t, logged[0], "skipping log collection")
+}
+
+func TestSaveWorkflowRunLogs_WritesLogs(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	var logged []string
+	fakeCI := &fakeDebugCI{logs: "=== triage run logs ==="}
+	w := &world.World{
+		Org:      "org",
+		RepoName: "repo",
+		CI:       fakeCI,
+		Logf:     func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) },
+	}
+
+	run := &forge.WorkflowRun{ID: 42, Status: "completed"}
+	saveWorkflowRunLogs(context.Background(), w, "triage", run)
+
+	// Verify the log file was written.
+	logPath := filepath.Join(artifactDir, "debug-triage-run-42", "workflow-logs.txt")
+	data, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	assert.Equal(t, "=== triage run logs ===", string(data))
+
+	// Verify success was logged.
+	require.Len(t, logged, 1)
+	assert.Contains(t, logged[0], "logs saved to")
+	assert.True(t, w.SavedLogRunIDs[42], "a saved run must be recorded so failure collection skips it")
+}
+
+func TestSaveWorkflowRunLogs_GetRunLogsError(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	var logged []string
+	fakeCI := &fakeDebugCI{logsErr: fmt.Errorf("API error")}
+	w := &world.World{
+		Org:      "org",
+		RepoName: "repo",
+		CI:       fakeCI,
+		Logf:     func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) },
+	}
+
+	run := &forge.WorkflowRun{ID: 99}
+	saveWorkflowRunLogs(context.Background(), w, "agent", run)
+
+	// Should log the error, not panic or fail.
+	require.Len(t, logged, 1)
+	assert.Contains(t, logged[0], "fetch logs")
+	assert.Contains(t, logged[0], "API error")
+
+	// No log file should exist.
+	logPath := filepath.Join(artifactDir, "debug-agent-run-99", "workflow-logs.txt")
+	_, err := os.Stat(logPath)
+	assert.True(t, os.IsNotExist(err))
+
+	// An explicit note states why the logs are missing.
+	notePath := filepath.Join(artifactDir, "debug-agent-run-99", runLogsUnavailableFile)
+	note, err := os.ReadFile(notePath)
+	require.NoError(t, err, "a failed log fetch must leave an explanatory artifact")
+	assert.Contains(t, string(note), "could not be collected")
+	assert.Contains(t, string(note), "API error")
+	info, err := os.Stat(notePath)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+	assert.False(t, w.SavedLogRunIDs[99], "a run whose logs were not saved must not be recorded as saved")
+}
+
+func TestSaveWorkflowRunLogs_NilLogf(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	fakeCI := &fakeDebugCI{logs: "log content"}
+	w := &world.World{
+		Org:      "org",
+		RepoName: "repo",
+		CI:       fakeCI,
+		// Logf deliberately nil — worldLogf guards it.
+	}
+
+	run := &forge.WorkflowRun{ID: 1}
+	// Should not panic even with nil Logf.
+	saveWorkflowRunLogs(context.Background(), w, "triage", run)
+
+	logPath := filepath.Join(artifactDir, "debug-triage-run-1", "workflow-logs.txt")
+	data, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	assert.Equal(t, "log content", string(data))
+}
+
+func TestPrepareDebugDir_WithArtifactDir(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	dir, err := prepareDebugDir("triage", 123)
+	require.NoError(t, err)
+
+	expected := filepath.Join(artifactDir, "debug-triage-run-123")
+	assert.Equal(t, expected, dir)
+	assert.DirExists(t, dir)
+}
+
+func TestPrepareDebugDir_WithoutArtifactDir(t *testing.T) {
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", "")
+
+	_, err := prepareDebugDir("agent", 456)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "BEHAVIOUR_ARTIFACT_DIR is not set")
+}
+
+// fakeDebugCI implements ci.Driver for debug log tests. Unused methods
+// come from the embedded interface and panic when called.
+type fakeDebugCI struct {
+	ci.Driver
+
+	logs    string
+	logsErr error
+}
+
+func (f *fakeDebugCI) GetRunLogs(context.Context, string, string, int) (string, error) {
+	return f.logs, f.logsErr
+}
+
+// fakeHarnessWaitCI answers WaitForHarnessAgent with a fixed run and
+// error, and GetRunLogs with fixed logs.
+type fakeHarnessWaitCI struct {
+	fakeDebugCI
+	run *forge.WorkflowRun
+	err error
+}
+
+func (f *fakeHarnessWaitCI) WaitForHarnessAgent(context.Context, string, string, string, time.Time) (*forge.WorkflowRun, error) {
+	return f.run, f.err
+}
+
+// TestThenHarnessWorkflowCompletes_SavesFailedRunLogs checks that a
+// harness run that concluded with a failure leaves its logs in the
+// artifact dir: the pool repo, and with it the run's logs, is deleted
+// when the lease ends.
+func TestThenHarnessWorkflowCompletes_SavesFailedRunLogs(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	w := &world.World{
+		Org:           "org",
+		RepoName:      "repo",
+		ScenarioStart: time.Now(),
+		CI: &fakeHarnessWaitCI{
+			fakeDebugCI: fakeDebugCI{logs: "=== pi-smoke failed run ==="},
+			run:         &forge.WorkflowRun{ID: 77, Conclusion: "failure"},
+			err:         fmt.Errorf(`harness agent "pi-smoke": workflow run 77 concluded with "failure" before producing artifact`),
+		},
+		Logf: func(string, ...any) {},
+	}
+
+	err := thenHarnessWorkflowCompletes(w, "pi-smoke")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "before producing artifact")
+
+	data, readErr := os.ReadFile(filepath.Join(artifactDir, "debug-pi-smoke-run-77", "workflow-logs.txt"))
+	require.NoError(t, readErr, "the failed run's logs must be saved")
+	assert.Equal(t, "=== pi-smoke failed run ===", string(data))
+}
+
+// TestThenHarnessWorkflowCompletes_TimeoutWithoutRun keeps the timeout
+// path (no run) an error with nothing saved by the step itself; the
+// After hook's CollectFailureLogs covers it (see
+// TestCollectFailureLogs_TimeoutWithoutRunSavesListedRun).
+func TestThenHarnessWorkflowCompletes_TimeoutWithoutRun(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	w := &world.World{
+		Org:           "org",
+		RepoName:      "repo",
+		ScenarioStart: time.Now(),
+		CI:            &fakeHarnessWaitCI{err: fmt.Errorf(`harness agent "pi-smoke" did not complete successfully`)},
+		Logf:          func(string, ...any) {},
+	}
+
+	require.Error(t, thenHarnessWorkflowCompletes(w, "pi-smoke"))
+	entries, err := os.ReadDir(artifactDir)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+// TestSaveWorkflowRunLogs_RedactsAndRestrictsMode checks that saved logs
+// are redacted and written 0o600: they are external content uploaded as
+// a CI artifact.
+func TestSaveWorkflowRunLogs_RedactsAndRestrictsMode(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	token := "ghp_" + strings.Repeat("A", 36)
+	w := &world.World{
+		Org:      "org",
+		RepoName: "repo",
+		CI:       &fakeDebugCI{logs: "step output\nGH_TOKEN=" + token + "\ndone"},
+		Logf:     func(string, ...any) {},
+	}
+
+	saveWorkflowRunLogs(context.Background(), w, "pi-smoke", &forge.WorkflowRun{ID: 5})
+
+	logPath := filepath.Join(artifactDir, "debug-pi-smoke-run-5", "workflow-logs.txt")
+	data, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), token, "a token in the logs must be redacted")
+	assert.Contains(t, string(data), "step output")
+
+	info, err := os.Stat(logPath)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+}
+
+// fakeListerCI implements ci.Driver and ci.RunLister for failure log
+// collection tests: ListRecentRuns answers with runs (or listErr), and
+// GetRunLogs answers per run ID from logs, or with logsErr[runID].
+type fakeListerCI struct {
+	ci.Driver
+
+	runs    []forge.WorkflowRun
+	listErr error
+	logs    map[int]string
+	logsErr map[int]error
+	fetched []int
+}
+
+func (f *fakeListerCI) ListRecentRuns(context.Context, string, string, int) ([]forge.WorkflowRun, error) {
+	return f.runs, f.listErr
+}
+
+func (f *fakeListerCI) GetRunLogs(_ context.Context, _, _ string, runID int) (string, error) {
+	f.fetched = append(f.fetched, runID)
+	if err := f.logsErr[runID]; err != nil {
+		return "", err
+	}
+	return f.logs[runID], nil
+}
+
+// readFailureSummary returns the single failure summary written under
+// artifactDir, checking it is written 0o600.
+func readFailureSummary(t *testing.T, artifactDir string) string {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(artifactDir, "debug-scenario-*", failureSummaryFile))
+	require.NoError(t, err)
+	require.Len(t, matches, 1, "a failed scenario must leave exactly one failure summary")
+	info, err := os.Stat(matches[0])
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+	data, err := os.ReadFile(matches[0])
+	require.NoError(t, err)
+	return string(data)
+}
+
+func TestCollectFailureLogs_NilWorld(t *testing.T) {
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", t.TempDir())
+	CollectFailureLogs(context.Background(), nil, fmt.Errorf("boom"))
+}
+
+func TestCollectFailureLogs_SkipsWhenArtifactDirUnset(t *testing.T) {
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", "")
+
+	var logged []string
+	fake := &fakeListerCI{runs: []forge.WorkflowRun{{ID: 1}}}
+	w := &world.World{
+		Org: "org", RepoName: "repo", CI: fake,
+		Logf: func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) },
+	}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("boom"))
+
+	assert.Empty(t, fake.fetched, "nothing is fetched when there is nowhere to save it")
+	require.Len(t, logged, 1)
+	assert.Contains(t, logged[0], "BEHAVIOUR_ARTIFACT_DIR unset")
+}
+
+// TestCollectFailureLogs_TimeoutWithoutRunSavesListedRun covers the path
+// #8037 reports: a harness wait timed out, so no step got a run and no
+// logs were saved; the After hook finds the run in the repository and
+// saves its logs before the lease ends.
+func TestCollectFailureLogs_TimeoutWithoutRunSavesListedRun(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	fake := &fakeListerCI{
+		runs: []forge.WorkflowRun{{ID: 31, Name: "Fullsend", Status: "completed", Conclusion: "failure", HTMLURL: "https://github.com/org/test-repo-03/actions/runs/31"}},
+		logs: map[int]string{31: "=== timed-out harness run ==="},
+	}
+	w := &world.World{
+		Org: "org", RepoName: "test-repo-03", CI: fake,
+		ScenarioName: "pi runtime smoke",
+		Logf:         func(string, ...any) {},
+	}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf(`harness agent "pi-smoke" did not complete successfully`))
+
+	data, err := os.ReadFile(filepath.Join(artifactDir, "debug-fullsend-run-31", "workflow-logs.txt"))
+	require.NoError(t, err, "the run no step resolved must have its logs saved")
+	assert.Equal(t, "=== timed-out harness run ===", string(data))
+
+	summary := readFailureSummary(t, artifactDir)
+	assert.Contains(t, summary, "Scenario: pi runtime smoke")
+	assert.Contains(t, summary, `did not complete successfully`)
+	assert.Contains(t, summary, "Repository: org/test-repo-03")
+	assert.Contains(t, summary, "run 31")
+	assert.Contains(t, summary, "actions/runs/31")
+	assert.Contains(t, summary, "logs saved to")
+}
+
+func TestCollectFailureLogs_SkipsAlreadySavedAndReportsFetchErrors(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	fake := &fakeListerCI{
+		runs: []forge.WorkflowRun{
+			{ID: 3, Name: "Fullsend", Status: "in_progress"},
+			{ID: 2, Name: "Fullsend", Status: "completed", Conclusion: "failure"},
+			{ID: 1, Name: "Fullsend", Status: "completed", Conclusion: "success"},
+		},
+		logs:    map[int]string{2: "run 2 logs"},
+		logsErr: map[int]error{3: fmt.Errorf("logs not available for an in-progress run")},
+	}
+	w := &world.World{
+		Org: "org", RepoName: "repo", CI: fake,
+		ScenarioName: "triage",
+		// The step-resolved run duplicates a listed run; it is fetched once.
+		WorkflowRun:    &forge.WorkflowRun{ID: 2, Name: "Fullsend"},
+		SavedLogRunIDs: map[int]bool{1: true},
+		Logf:           func(string, ...any) {},
+	}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("boom"))
+
+	assert.ElementsMatch(t, []int{2, 3}, fake.fetched, "already-saved runs are not fetched again, duplicates once")
+	_, err := os.ReadFile(filepath.Join(artifactDir, "debug-fullsend-run-2", "workflow-logs.txt"))
+	require.NoError(t, err)
+	note, err := os.ReadFile(filepath.Join(artifactDir, "debug-fullsend-run-3", runLogsUnavailableFile))
+	require.NoError(t, err, "a run whose logs cannot be fetched gets an explanatory note")
+	assert.Contains(t, string(note), "in-progress run")
+
+	summary := readFailureSummary(t, artifactDir)
+	assert.Contains(t, summary, "run 1")
+	assert.Contains(t, summary, "logs already saved during the scenario")
+	assert.Contains(t, summary, "logs could not be collected")
+	assert.Contains(t, summary, "in-progress run")
+	assert.Equal(t, 1, strings.Count(summary, "run 2 "), "a run is listed once")
+}
+
+func TestCollectFailureLogs_ListErrorStillCollectsResolvedRun(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	fake := &fakeListerCI{
+		listErr: fmt.Errorf("API rate limit exceeded"),
+		logs:    map[int]string{8: "resolved run logs"},
+	}
+	w := &world.World{
+		Org: "org", RepoName: "repo", CI: fake,
+		WorkflowRun: &forge.WorkflowRun{ID: 8, Name: "Fullsend"},
+		Logf:        func(string, ...any) {},
+	}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("boom"))
+
+	_, err := os.ReadFile(filepath.Join(artifactDir, "debug-fullsend-run-8", "workflow-logs.txt"))
+	require.NoError(t, err)
+	summary := readFailureSummary(t, artifactDir)
+	assert.Contains(t, summary, "listing the repository's workflow runs failed")
+	assert.Contains(t, summary, "API rate limit exceeded")
+}
+
+func TestCollectFailureLogs_DriverWithoutRunLister(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	w := &world.World{
+		Org: "org", RepoName: "repo",
+		CI:          &fakeDebugCI{logs: "resolved run logs"},
+		WorkflowRun: &forge.WorkflowRun{ID: 4, Name: "Fullsend"},
+		Logf:        func(string, ...any) {},
+	}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("boom"))
+
+	_, err := os.ReadFile(filepath.Join(artifactDir, "debug-fullsend-run-4", "workflow-logs.txt"))
+	require.NoError(t, err)
+	assert.Contains(t, readFailureSummary(t, artifactDir), "does not implement ci.RunLister")
+}
+
+func TestCollectFailureLogs_NoRunsFound(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	w := &world.World{Org: "org", RepoName: "repo", CI: &fakeListerCI{}, Logf: func(string, ...any) {}}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("creating issue: 502"))
+
+	summary := readFailureSummary(t, artifactDir)
+	assert.Contains(t, summary, "creating issue: 502")
+	assert.Contains(t, summary, "no workflow run was found")
+}
+
+func TestCollectFailureLogs_NoRepository(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	w := &world.World{ScenarioName: "setup fails", Logf: func(string, ...any) {}}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("allocating repo: pool exhausted"))
+
+	summary := readFailureSummary(t, artifactDir)
+	assert.Contains(t, summary, "allocating repo: pool exhausted")
+	assert.Contains(t, summary, "Repository: (none)")
+	assert.Contains(t, summary, "repository identity is unavailable")
+	assert.NotContains(t, summary, "there are no workflow runs")
+}
+
+func TestCollectFailureLogs_NoCIDriver(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	w := &world.World{Org: "org", RepoName: "repo", Logf: func(string, ...any) {}}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("boom"))
+
+	assert.Contains(t, readFailureSummary(t, artifactDir), "no CI driver is configured")
+}
+
+func TestCollectFailureLogs_SkipsRunsBeforeScenario(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	begin := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	fake := &fakeListerCI{
+		runs: []forge.WorkflowRun{
+			{ID: 20, Name: "Fullsend", CreatedAt: begin.Add(time.Minute).Format(time.RFC3339)},
+			// Within the clock-skew buffer: kept.
+			{ID: 19, Name: "Fullsend", CreatedAt: begin.Add(-10 * time.Second).Format(time.RFC3339)},
+			// Unparsable creation time: kept rather than dropped.
+			{ID: 18, Name: "Fullsend", CreatedAt: "not-a-time"},
+			// A previous scenario's run on a long-lived repository: skipped.
+			{ID: 17, Name: "Fullsend", CreatedAt: begin.Add(-time.Hour).Format(time.RFC3339)},
+		},
+		logs: map[int]string{20: "a", 19: "b", 18: "c", 17: "d"},
+	}
+	w := &world.World{
+		Org: "org", RepoName: "repo", CI: fake,
+		ScenarioBegin: begin,
+		Logf:          func(string, ...any) {},
+	}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("boom"))
+
+	assert.ElementsMatch(t, []int{20, 19, 18}, fake.fetched)
+	assert.NotContains(t, readFailureSummary(t, artifactDir), "run 17")
+}
+
+// TestCollectFailureLogs_RedactsSummaryAndLogs checks that the summary
+// (which embeds the scenario error) and collected logs are redacted.
+func TestCollectFailureLogs_RedactsSummaryAndLogs(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	token := "ghp_" + strings.Repeat("B", 36)
+	fake := &fakeListerCI{
+		runs: []forge.WorkflowRun{{ID: 6, Name: "Fullsend"}},
+		logs: map[int]string{6: "GH_TOKEN=" + token},
+	}
+	w := &world.World{Org: "org", RepoName: "repo", CI: fake, Logf: func(string, ...any) {}}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("request failed with token %s", token))
+
+	assert.NotContains(t, readFailureSummary(t, artifactDir), token)
+	logPath := filepath.Join(artifactDir, "debug-fullsend-run-6", "workflow-logs.txt")
+	data, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), token)
+	info, err := os.Stat(logPath)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+}
+
+// limitRecordingCI wraps fakeListerCI to record the listing limit requested.
+type limitRecordingCI struct {
+	fakeListerCI
+	limit int
+}
+
+func (f *limitRecordingCI) ListRecentRuns(ctx context.Context, owner, repo string, limit int) ([]forge.WorkflowRun, error) {
+	f.limit = limit
+	return f.fakeListerCI.ListRecentRuns(ctx, owner, repo, limit)
+}
+
+// TestCollectFailureLogs_OlderUnsavedRunBeyondFirstTen checks that an
+// unsaved failed run behind more than ten newer, already-saved runs is
+// still collected: the listing is larger than the fetch cap and saved runs
+// do not consume the cap.
+func TestCollectFailureLogs_OlderUnsavedRunBeyondFirstTen(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	fake := &limitRecordingCI{}
+	saved := make(map[int]bool)
+	for id := 100; id < 112; id++ {
+		fake.runs = append(fake.runs, forge.WorkflowRun{ID: id, Name: "Newer", Status: "completed"})
+		saved[id] = true
+	}
+	fake.runs = append(fake.runs, forge.WorkflowRun{ID: 7, Name: "Older Failure", Status: "completed", Conclusion: "failure"})
+	fake.logs = map[int]string{7: "older failure logs"}
+	w := &world.World{Org: "org", RepoName: "repo", CI: fake, SavedLogRunIDs: saved, Logf: func(string, ...any) {}}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("boom"))
+
+	assert.Greater(t, fake.limit, maxFailureLogRuns, "the listing must be larger than the fetch cap")
+	assert.Equal(t, []int{7}, fake.fetched)
+	data, err := os.ReadFile(filepath.Join(artifactDir, "debug-older-failure-run-7", "workflow-logs.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, "older failure logs", string(data))
+}
+
+// TestCollectFailureLogs_FetchCapAndTruncationAreReported checks that
+// runs beyond the fetch cap, and a listing that fills its limit, are
+// stated in the summary rather than silently dropped.
+func TestCollectFailureLogs_FetchCapAndTruncationAreReported(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	fake := &fakeListerCI{logs: map[int]string{}}
+	for id := 1; id <= maxListedFailureRuns; id++ {
+		fake.runs = append(fake.runs, forge.WorkflowRun{ID: id, Name: "Run", Status: "completed"})
+	}
+	w := &world.World{Org: "org", RepoName: "repo", CI: fake, Logf: func(string, ...any) {}}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("boom"))
+
+	assert.Len(t, fake.fetched, maxFailureLogRuns)
+	summary := readFailureSummary(t, artifactDir)
+	assert.Contains(t, summary, "older runs may exist")
+	assert.Contains(t, summary, "log fetches was reached")
+}
+
+// TestCollectFailureLogs_RedactsOpaqueCredentialLiterals checks that an
+// opaque credential with no recognisable prefix — World.Token and a
+// sensitive runner environment value — is masked in the summary, console
+// diagnostics, workflow-derived directory names and saved logs.
+func TestCollectFailureLogs_RedactsOpaqueCredentialLiterals(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	token := "opaquetokenvalue9f3a7c1e5b"
+	envSecret := "plainenvsecretvalue4d8b2a6f"
+	t.Setenv("SOME_RUNNER_API_TOKEN", envSecret)
+
+	fake := &fakeListerCI{
+		runs: []forge.WorkflowRun{{ID: 9, Name: "Deploy " + token}},
+		logs: map[int]string{9: "using " + token + " and " + envSecret},
+	}
+	var logged []string
+	w := &world.World{
+		Org: "org", RepoName: "repo", CI: fake, Token: token,
+		ScenarioName: "scenario " + envSecret,
+		Logf:         func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) },
+	}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("auth failed for %s", token))
+
+	assertNoLiteral := func(where, s string) {
+		assert.NotContains(t, s, token, where)
+		assert.NotContains(t, s, envSecret, where)
+	}
+	assertNoLiteral("summary", readFailureSummary(t, artifactDir))
+	for _, line := range logged {
+		assertNoLiteral("console log", line)
+	}
+	require.NoError(t, filepath.WalkDir(artifactDir, func(path string, d os.DirEntry, err error) error {
+		require.NoError(t, err)
+		rel, relErr := filepath.Rel(artifactDir, path)
+		require.NoError(t, relErr)
+		assertNoLiteral("path "+rel, rel)
+		if !d.IsDir() {
+			data, readErr := os.ReadFile(path)
+			require.NoError(t, readErr)
+			assertNoLiteral("content of "+rel, string(data))
+		}
+		return nil
+	}))
+}
+
+// TestCollectFailureLogs_RedactsShortSensitiveValues checks that a sensitive
+// value the shared redactor declines as too short (under 8 bytes) is still
+// masked in the summary, console diagnostics, directory names and saved logs.
+func TestCollectFailureLogs_RedactsShortSensitiveValues(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	token := "tK9#zq"
+	envSecret := "s3cr3t"
+	t.Setenv("SOME_RUNNER_API_TOKEN", envSecret)
+
+	fake := &fakeListerCI{
+		runs: []forge.WorkflowRun{{ID: 9, Name: "Deploy " + token}},
+		logs: map[int]string{9: "using " + token + " and " + envSecret},
+	}
+	var logged []string
+	w := &world.World{
+		Org: "org", RepoName: "repo", CI: fake, Token: token,
+		ScenarioName: "scenario " + envSecret,
+		Logf:         func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) },
+	}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("auth failed for %s", token))
+
+	assertNoLiteral := func(where, s string) {
+		assert.NotContains(t, s, token, where)
+		assert.NotContains(t, s, envSecret, where)
+	}
+	assertNoLiteral("summary", readFailureSummary(t, artifactDir))
+	for _, line := range logged {
+		assertNoLiteral("console log", line)
+	}
+	require.NoError(t, filepath.WalkDir(artifactDir, func(path string, d os.DirEntry, err error) error {
+		require.NoError(t, err)
+		rel, relErr := filepath.Rel(artifactDir, path)
+		require.NoError(t, relErr)
+		assertNoLiteral("path "+rel, rel)
+		if !d.IsDir() {
+			data, readErr := os.ReadFile(path)
+			require.NoError(t, readErr)
+			assertNoLiteral("content of "+rel, string(data))
+		}
+		return nil
+	}))
+}
+
+func TestCollectFailureLogs_SameScenarioNameDoesNotOverwrite(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	w := &world.World{ScenarioName: "outline row", Logf: func(string, ...any) {}}
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("first"))
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("second"))
+
+	matches, err := filepath.Glob(filepath.Join(artifactDir, "debug-scenario-outline-row-*", failureSummaryFile))
+	require.NoError(t, err)
+	assert.Len(t, matches, 2)
+}
+
+func TestPathSlug(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		in, want string
+	}{
+		{"Fullsend", "fullsend"},
+		{"Triage Agent / run #3", "triage-agent-run-3"},
+		{"../../etc", "etc"},
+		{"", "fallback"},
+		{"!!!", "fallback"},
+		{strings.Repeat("a", 50), strings.Repeat("a", 40)},
+		// Truncation that ends on a separator does not leave a trailing '-'.
+		{strings.Repeat("abc ", 12), strings.TrimSuffix(strings.Repeat("abc-", 10), "-")},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, tt.want, pathSlug(tt.in, 40, "fallback"), "pathSlug(%q)", tt.in)
+	}
+}
+
+// TestSaveWorkflowRunLogs_PartialSnapshotNotDeduplicated checks that a log
+// fetch that succeeds but is incomplete (run still in progress, or a job's
+// log replaced by a fetch-failure note) is not recorded as saved, so the
+// After hook collects the run again.
+func TestSaveWorkflowRunLogs_PartialSnapshotNotDeduplicated(t *testing.T) {
+	tests := []struct {
+		name string
+		run  forge.WorkflowRun
+		logs string
+	}{
+		{"run not terminal", forge.WorkflowRun{ID: 7, Status: "in_progress"}, "=== job ==="},
+		{"queued run", forge.WorkflowRun{ID: 7, Status: "queued"}, "=== job ==="},
+		{"job fetch failed", forge.WorkflowRun{ID: 7, Status: "completed"}, "=== job ===\n[failed to fetch logs: boom]\n"},
+		{"job unavailable", forge.WorkflowRun{ID: 7, Status: "completed"}, "[logs unavailable: HTTP 404]"},
+		{"job read failed", forge.WorkflowRun{ID: 7, Status: "completed"}, "[failed to read logs: EOF]"},
+		{"gitlab trace fetch failed", forge.WorkflowRun{ID: 7, Status: "completed"}, "=== Job 1 (x): error fetching trace: boom ==="},
+		{"gitlab trace read failed", forge.WorkflowRun{ID: 7, Status: "completed"}, "=== Job 1 (x): error reading trace: boom ==="},
+		{"gitlab aggregate limit", forge.WorkflowRun{ID: 7, Status: "completed"}, "=== aggregate trace limit (1 bytes) reached ==="},
+		{"github job log truncated", forge.WorkflowRun{ID: 7, Status: "completed"}, "x\n[log truncated: job 1 exceeds 1048576 bytes]\n"},
+		{"github job list truncated", forge.WorkflowRun{ID: 7, Status: "completed"}, "[job list truncated: 100 of 130 jobs included]\n"},
+		{"gitlab trace truncated", forge.WorkflowRun{ID: 7, Status: "completed"}, "=== Job 1 (x): trace truncated at 10485760 bytes ===\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			artifactDir := t.TempDir()
+			t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+			w := &world.World{Org: "org", RepoName: "repo", CI: &fakeDebugCI{logs: tt.logs}, Logf: func(string, ...any) {}}
+
+			run := tt.run
+			saveWorkflowRunLogs(context.Background(), w, "triage", &run)
+
+			_, err := os.Stat(filepath.Join(artifactDir, "debug-triage-run-7", "workflow-logs.txt"))
+			require.NoError(t, err, "the partial snapshot is still preserved")
+			assert.False(t, w.SavedLogRunIDs[7], "a partial snapshot must not be recorded as saved")
+		})
+	}
+}
+
+// TestCollectFailureLogs_RefetchesPartialSnapshot checks the After hook
+// replaces an early, partial snapshot with a complete one.
+func TestCollectFailureLogs_RefetchesPartialSnapshot(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	fake := &fakeListerCI{
+		runs: []forge.WorkflowRun{{ID: 9, Name: "Fullsend", Status: "completed", Conclusion: "failure"}},
+		logs: map[int]string{9: "=== complete logs ==="},
+	}
+	w := &world.World{
+		Org: "org", RepoName: "repo", CI: fake,
+		ScenarioName: "partial",
+		Logf:         func(string, ...any) {},
+	}
+
+	// Early fetch while the run is still in progress, with a stale run value.
+	early := forge.WorkflowRun{ID: 9, Name: "Fullsend", Status: "in_progress"}
+	fake.logs[9] = "=== partial logs ===\n[failed to fetch logs: boom]\n"
+	saveWorkflowRunLogs(context.Background(), w, "fullsend", &early)
+	require.False(t, w.SavedLogRunIDs[9])
+
+	fake.logs[9] = "=== complete logs ==="
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("boom"))
+
+	data, err := os.ReadFile(filepath.Join(artifactDir, "debug-fullsend-run-9", "workflow-logs.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, "=== complete logs ===", string(data), "the After hook must replace the partial snapshot")
+	assert.Equal(t, []int{9, 9}, fake.fetched)
+	assert.Contains(t, readFailureSummary(t, artifactDir), "logs saved to")
+}
+
+// TestCollectFailureLogs_ListingMetadataWinsOverStaleResolvedRun checks a
+// step-resolved run captured while in progress is reported with the
+// listing's completed/failure metadata, and its complete logs are
+// classified as complete.
+func TestCollectFailureLogs_ListingMetadataWinsOverStaleResolvedRun(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	fake := &fakeListerCI{
+		runs: []forge.WorkflowRun{{ID: 5, Name: "Fullsend", Status: "completed", Conclusion: "failure"}},
+		logs: map[int]string{5: "=== complete logs ==="},
+	}
+	w := &world.World{
+		Org: "org", RepoName: "repo", CI: fake,
+		ScenarioName: "stale",
+		WorkflowRun:  &forge.WorkflowRun{ID: 5, Name: "Fullsend", Status: "in_progress"},
+		Logf:         func(string, ...any) {},
+	}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("boom"))
+
+	summary := readFailureSummary(t, artifactDir)
+	assert.Contains(t, summary, `(status "completed", conclusion "failure")`)
+	assert.NotContains(t, summary, "in_progress")
+	assert.NotContains(t, summary, "incomplete")
+	assert.Contains(t, summary, "logs saved to")
+	assert.True(t, w.SavedLogRunIDs[5], "complete logs of a finished run are recorded as saved")
+	assert.Equal(t, []int{5}, fake.fetched)
+}
+
+// TestLogRedacted checks diagnostic console messages are redacted after
+// formatting, and a nil logger is tolerated.
+func TestLogRedacted(t *testing.T) {
+	t.Parallel()
+	token := "ghp_" + strings.Repeat("C", 36)
+	var logged []string
+	w := &world.World{Logf: func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }}
+
+	logRedacted(w, "collect failure logs: %v for %q", fmt.Errorf("request failed with token %s", token), "scenario "+token)
+
+	require.Len(t, logged, 1)
+	assert.NotContains(t, logged[0], token)
+	assert.Contains(t, logged[0], "collect failure logs")
+
+	assert.NotPanics(t, func() { logRedacted(&world.World{}, "no logger %s", token) })
+}
+
+// TestRedactText_RedactsRegisteredSecretLiteral checks the exported helper
+// masks a message containing literals registered by the debug-log
+// collection's registration path — a full-length token the shared redactor
+// accepts, and a short sensitive value it declines and this package masks
+// locally — so failure messages recorded at record time get the same
+// redaction as the artifacts.
+func TestRedactText_RedactsRegisteredSecretLiteral(t *testing.T) {
+	token := "opaqueredactliteral6b3f8c2e4a"
+	short := "rt5#k9"
+	t.Setenv("SOME_RUNNER_API_TOKEN", short)
+
+	RegisterRedactionLiterals(&world.World{Token: token})
+
+	got := RedactText(fmt.Sprintf("dispatch failed with token %s and pin %s", token, short))
+	assert.NotContains(t, got, token)
+	assert.NotContains(t, got, short)
+	assert.Contains(t, got, "dispatch failed with token")
+	assert.Contains(t, got, "and pin")
+}
+
+// TestCollectFailureLogs_RedactsConsoleLogs checks that errors, scenario
+// names and summary paths reach World.Logf redacted.
+func TestCollectFailureLogs_RedactsConsoleLogs(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	key := "sk-" + strings.Repeat("a", 24)
+	token := "ghp_" + strings.Repeat("D", 36)
+	fake := &fakeListerCI{
+		runs:    []forge.WorkflowRun{{ID: 12, Name: "Fullsend"}},
+		logsErr: map[int]error{12: fmt.Errorf("fetch failed with token %s", token)},
+	}
+	var logged []string
+	w := &world.World{
+		Org: "org", RepoName: "repo", CI: fake,
+		ScenarioName: "scenario " + key,
+		Logf:         func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) },
+	}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("boom"))
+
+	require.NotEmpty(t, logged)
+	for _, line := range logged {
+		assert.NotContains(t, line, token)
+		assert.NotContains(t, line, key)
+	}
+}
+
+// TestCollectFailureLogs_RedactsDirectoryNames checks scenario and workflow
+// names are redacted before they become artifact directory names.
+func TestCollectFailureLogs_RedactsDirectoryNames(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	key := "sk-" + strings.Repeat("a", 24)
+	fake := &fakeListerCI{
+		runs: []forge.WorkflowRun{{ID: 13, Name: "run " + key}},
+		logs: map[int]string{13: "logs"},
+	}
+	w := &world.World{
+		Org: "org", RepoName: "repo", CI: fake,
+		ScenarioName: "scenario " + key,
+		Logf:         func(string, ...any) {},
+	}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("boom"))
+
+	entries, err := os.ReadDir(artifactDir)
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+	for _, e := range entries {
+		assert.NotContains(t, e.Name(), strings.Repeat("a", 24), "directory name must not carry the secret")
+	}
+}
+
+// TestSaveWorkflowRunLogs_RedactsAndConstrainsLabel checks the label passed
+// by an in-scenario caller is redacted and path-safe in the generated
+// directory name, not only in the failure-hook names.
+func TestSaveWorkflowRunLogs_RedactsAndConstrainsLabel(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	token := "opaquelabeltoken7e2c9a41d6"
+	envSecret := "labelenvsecretvalue3b8d5f20"
+	t.Setenv("SOME_RUNNER_API_TOKEN", envSecret)
+
+	w := &world.World{Org: "org", RepoName: "repo", Token: token, CI: &fakeDebugCI{logs: "logs"}, Logf: func(string, ...any) {}}
+	saveWorkflowRunLogs(context.Background(), w, "../agent-"+token+"/"+envSecret, &forge.WorkflowRun{ID: 5})
+
+	entries, err := os.ReadDir(artifactDir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	name := entries[0].Name()
+	assert.NotContains(t, name, token)
+	assert.NotContains(t, name, envSecret)
+	assert.NotContains(t, name, "/")
+	assert.NotContains(t, name, "..")
+	assert.True(t, strings.HasSuffix(name, "-run-5"), name)
+}
+
+// TestCollectFailureLogs_RedactsCredentialsWithQuotesAndBackslashes checks
+// that fields are redacted before %q quoting: quoting escapes quotes and
+// backslashes, which would otherwise change a registered credential's
+// representation and evade exact-string matching.
+func TestCollectFailureLogs_RedactsCredentialsWithQuotesAndBackslashes(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	token := `opaque"quoted\token7e2c9a41d6`
+	escaped := strconv.Quote(token)
+	escaped = escaped[1 : len(escaped)-1]
+	require.NotEqual(t, token, escaped)
+
+	fake := &fakeListerCI{
+		runs: []forge.WorkflowRun{{ID: 9, Name: "Deploy " + token, Status: token, Conclusion: token}},
+		logsErr: map[int]error{
+			9: fmt.Errorf("fetch failed"),
+		},
+	}
+	var logged []string
+	w := &world.World{
+		Org: "org", RepoName: "repo", CI: fake, Token: token,
+		ScenarioName: "scenario " + token,
+		Logf:         func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) },
+	}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("boom"))
+
+	assertNoCredential := func(where, s string) {
+		assert.NotContains(t, s, token, where)
+		assert.NotContains(t, s, escaped, where)
+	}
+	assertNoCredential("summary", readFailureSummary(t, artifactDir))
+	require.NotEmpty(t, logged)
+	for _, line := range logged {
+		assertNoCredential("console log", line)
+	}
+	require.NoError(t, filepath.WalkDir(artifactDir, func(path string, d os.DirEntry, err error) error {
+		require.NoError(t, err)
+		if !d.IsDir() {
+			data, readErr := os.ReadFile(path)
+			require.NoError(t, readErr)
+			assertNoCredential("content of "+path, string(data))
+		}
+		return nil
+	}))
+
+	// The unavailable-log note uses describeRun too.
+	notes, err := filepath.Glob(filepath.Join(artifactDir, "debug-*-run-9", runLogsUnavailableFile))
+	require.NoError(t, err)
+	require.Len(t, notes, 1)
+}
+
+// TestCollectFailureLogs_TruncatedSnapshotIsExplained checks a run whose
+// fetched logs carry a forge truncation note is not treated as complete and
+// the summary explains the snapshot is incomplete.
+func TestCollectFailureLogs_TruncatedSnapshotIsExplained(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	fake := &fakeListerCI{
+		runs: []forge.WorkflowRun{{ID: 9, Name: "Fullsend", Status: "completed", Conclusion: "failure"}},
+		logs: map[int]string{9: "=== job ===\n[log truncated: job 1 exceeds 1048576 bytes]\n"},
+	}
+	w := &world.World{Org: "org", RepoName: "repo", CI: fake, ScenarioName: "truncated", Logf: func(string, ...any) {}}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("boom"))
+
+	assert.False(t, w.SavedLogRunIDs[9])
+	assert.Contains(t, readFailureSummary(t, artifactDir), "the snapshot is incomplete")
+}
+
+// TestCollectFailureLogs_EmptyLogsAreUnavailable checks a completed failed
+// run whose driver returns empty logs and no error is not reported as saved:
+// the artifact explains the logs are unavailable and the run stays unsaved.
+func TestCollectFailureLogs_EmptyLogsAreUnavailable(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	fake := &fakeListerCI{
+		runs: []forge.WorkflowRun{{ID: 9, Name: "Fullsend", Status: "completed", Conclusion: "failure"}},
+		logs: map[int]string{9: ""},
+	}
+	w := &world.World{Org: "org", RepoName: "repo", CI: fake, ScenarioName: "empty", Logf: func(string, ...any) {}}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("boom"))
+
+	assert.False(t, w.SavedLogRunIDs[9], "an empty log response must not be recorded as a saved snapshot")
+
+	runDir := filepath.Join(artifactDir, "debug-fullsend-run-9")
+	_, err := os.Stat(filepath.Join(runDir, "workflow-logs.txt"))
+	assert.True(t, os.IsNotExist(err), "no empty workflow-logs.txt should be written")
+	note, err := os.ReadFile(filepath.Join(runDir, runLogsUnavailableFile))
+	require.NoError(t, err, "empty logs must leave an explanatory artifact")
+	assert.Contains(t, string(note), "could not be collected")
+	assert.Contains(t, string(note), "no log output")
+
+	summary := readFailureSummary(t, artifactDir)
+	assert.Contains(t, summary, "logs could not be collected")
+	assert.Contains(t, summary, "no log output")
+	assert.NotContains(t, summary, "logs saved to")
+}
+
+// sequenceLogsCI implements ci.Driver with a scripted GetRunLogs: each call
+// consumes the next response.
+type sequenceLogsCI struct {
+	ci.Driver
+
+	responses []sequenceLogsResponse
+	calls     int
+}
+
+type sequenceLogsResponse struct {
+	logs string
+	err  error
+}
+
+func (f *sequenceLogsCI) GetRunLogs(context.Context, string, string, int) (string, error) {
+	r := f.responses[f.calls]
+	f.calls++
+	return r.logs, r.err
+}
+
+// TestWriteWorkflowRunLogs_SuccessRemovesEarlierUnavailableNote checks a
+// failed first collection followed by a successful one into the same
+// directory does not leave contradictory artifacts.
+func TestWriteWorkflowRunLogs_SuccessRemovesEarlierUnavailableNote(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	fake := &sequenceLogsCI{responses: []sequenceLogsResponse{
+		{err: fmt.Errorf("transient failure")},
+		{logs: "=== job ===\nok\n"},
+	}}
+	w := &world.World{Org: "org", RepoName: "repo", CI: fake, Logf: func(string, ...any) {}}
+	run := forge.WorkflowRun{ID: 11, Status: "completed", Conclusion: "failure"}
+
+	_, err := writeWorkflowRunLogs(context.Background(), w, "triage", &run)
+	require.Error(t, err)
+	runDir := filepath.Join(artifactDir, "debug-triage-run-11")
+	require.FileExists(t, filepath.Join(runDir, runLogsUnavailableFile))
+
+	logPath, err := writeWorkflowRunLogs(context.Background(), w, "triage", &run)
+	require.NoError(t, err)
+	assert.FileExists(t, logPath)
+	_, statErr := os.Stat(filepath.Join(runDir, runLogsUnavailableFile))
+	assert.True(t, os.IsNotExist(statErr), "the obsolete unavailable note must be removed after a successful write")
+}
+
+// TestWriteWorkflowRunLogs_DirErrorIsNotWrappedTwice checks the debug-dir
+// error is reported once, without a stuttering wrapper.
+func TestWriteWorkflowRunLogs_DirErrorIsNotWrappedTwice(t *testing.T) {
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", "")
+	w := &world.World{Org: "org", RepoName: "repo", CI: &fakeDebugCI{logs: "x"}, Logf: func(string, ...any) {}}
+
+	_, err := writeWorkflowRunLogs(context.Background(), w, "triage", &forge.WorkflowRun{ID: 1})
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "create debug dir")
+}
+
+// TestCollectFailureLogs_RedactsEscapedCredentialInProducerErrors checks a
+// registered credential that an error producer already quoted (fmt %q) is
+// redacted from the summary and notes, for scenario, list and log-fetch errors.
+func TestCollectFailureLogs_RedactsEscapedCredentialInProducerErrors(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	token := `opaque"quoted\token5b8e1d03a9`
+	escaped := strconv.Quote(token)
+	escaped = escaped[1 : len(escaped)-1]
+	require.NotEqual(t, token, escaped)
+
+	fake := &fakeListerCI{
+		runs:    []forge.WorkflowRun{{ID: 9, Name: "Fullsend"}},
+		listErr: fmt.Errorf("list failed for %q", token),
+		logsErr: map[int]error{9: fmt.Errorf("fetch failed for %q", token)},
+	}
+	var logged []string
+	w := &world.World{
+		Org: "org", RepoName: "repo", CI: fake, Token: token, ScenarioName: "escaped",
+		Logf: func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) },
+	}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("scenario failed for %q", token))
+
+	assertNoCredential := func(where, s string) {
+		assert.NotContains(t, s, token, where)
+		assert.NotContains(t, s, escaped, where)
+	}
+	summary := readFailureSummary(t, artifactDir)
+	assertNoCredential("summary", summary)
+	assert.Contains(t, summary, "scenario failed for", "the rest of the message is kept")
+	assert.Contains(t, summary, "list failed for")
+	assert.Contains(t, summary, "fetch failed for")
+	for _, line := range logged {
+		assertNoCredential("console log", line)
+	}
+	notes, err := filepath.Glob(filepath.Join(artifactDir, "debug-*-run-9", runLogsUnavailableFile))
+	require.NoError(t, err)
+	require.Len(t, notes, 1)
+	data, err := os.ReadFile(notes[0])
+	require.NoError(t, err)
+	assertNoCredential("unavailable note", string(data))
+}
+
+// TestWriteRedactedArtifact_ReplacesPermissiveFile checks an existing
+// world-readable file is replaced by a private one, not rewritten in place.
+func TestWriteRedactedArtifact_ReplacesPermissiveFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "workflow-logs.txt")
+	require.NoError(t, os.WriteFile(path, []byte("old"), 0o644))
+	require.NoError(t, os.Chmod(path, 0o644))
+
+	require.NoError(t, writeRedactedArtifact(path, "new"))
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, "new", string(data))
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	assert.Len(t, entries, 1, "no temp file may be left behind")
+}
+
+// TestWriteRedactedArtifact_DoesNotFollowSymlink checks a symlink planted at
+// the destination is replaced, and its target is left untouched.
+func TestWriteRedactedArtifact_DoesNotFollowSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "victim.txt")
+	require.NoError(t, os.WriteFile(target, []byte("victim"), 0o600))
+	path := filepath.Join(dir, "workflow-logs.txt")
+	if err := os.Symlink(target, path); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	require.NoError(t, writeRedactedArtifact(path, "logs"))
+
+	victim, err := os.ReadFile(target)
+	require.NoError(t, err)
+	assert.Equal(t, "victim", string(victim), "the symlink target must not be written")
+	info, err := os.Lstat(path)
+	require.NoError(t, err)
+	assert.True(t, info.Mode().IsRegular(), "the destination must be a regular file, not a symlink")
+}
+
+// TestPrepareDebugDir_RejectsSymlinkedDirectory checks a pre-existing
+// symlink where the debug directory belongs is refused.
+func TestPrepareDebugDir_RejectsSymlinkedDirectory(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(artifactDir, "debug-triage-run-3")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	_, err := prepareDebugDir("triage", 3)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "symlinks are not followed")
+}
+
+// TestPrepareDebugDir_CreatesPrivateDirectory checks collector-owned
+// directories are created 0o700.
+func TestPrepareDebugDir_CreatesPrivateDirectory(t *testing.T) {
+	artifactDir := filepath.Join(t.TempDir(), "artifacts")
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	dir, err := prepareDebugDir("triage", 4)
+	require.NoError(t, err)
+
+	info, err := os.Stat(dir)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o700), info.Mode().Perm())
+}
+
+// TestWriteWorkflowRunLogs_PartialFetchKeepsCompleteSnapshot checks a later
+// partial fetch of an already-saved run does not replace the complete
+// snapshot, including through the After hook's failure collection.
+func TestWriteWorkflowRunLogs_PartialFetchKeepsCompleteSnapshot(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	fake := &sequenceLogsCI{responses: []sequenceLogsResponse{
+		{logs: "=== job ===\ncomplete output\n"},
+		{logs: "=== job ===\n[failed to fetch logs: boom]\n"},
+	}}
+	w := &world.World{Org: "org", RepoName: "repo", CI: fake, Logf: func(string, ...any) {}}
+	run := forge.WorkflowRun{ID: 21, Status: "completed", Conclusion: "failure"}
+
+	logPath, err := writeWorkflowRunLogs(context.Background(), w, "triage", &run)
+	require.NoError(t, err)
+	require.True(t, w.SavedLogRunIDs[21])
+
+	_, err = writeWorkflowRunLogs(context.Background(), w, "triage", &run)
+	require.NoError(t, err)
+	assert.True(t, w.SavedLogRunIDs[21])
+	data, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "complete output")
+	assert.NotContains(t, string(data), "failed to fetch logs")
+
+	w.WorkflowRun = &run
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("boom"))
+	data, err = os.ReadFile(logPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "complete output")
+	assert.Contains(t, readFailureSummary(t, artifactDir), "logs already saved during the scenario")
+}
+
+// TestWriteWorkflowRunLogs_FetchErrorSurvivesDirError checks the empty-log
+// diagnostic and the fetch error are kept when the debug directory also fails.
+func TestWriteWorkflowRunLogs_FetchErrorSurvivesDirError(t *testing.T) {
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", "")
+
+	empty := &world.World{Org: "org", RepoName: "repo", CI: &fakeDebugCI{logs: ""}, Logf: func(string, ...any) {}}
+	_, err := writeWorkflowRunLogs(context.Background(), empty, "triage", &forge.WorkflowRun{ID: 1})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no log output")
+	assert.Contains(t, err.Error(), "BEHAVIOUR_ARTIFACT_DIR is not set")
+
+	failing := &world.World{Org: "org", RepoName: "repo", CI: &fakeDebugCI{logsErr: fmt.Errorf("api down")}, Logf: func(string, ...any) {}}
+	_, err = writeWorkflowRunLogs(context.Background(), failing, "triage", &forge.WorkflowRun{ID: 1})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "fetch logs for triage run 1")
+	assert.Contains(t, err.Error(), "api down")
+}
+
+// TestRegisterRedactionLiterals_InfrastructureIdentifiers checks sensitive
+// infrastructure identifiers that no name suffix matches are redacted from
+// summaries and name-derived directory names.
+func TestRegisterRedactionLiterals_InfrastructureIdentifiers(t *testing.T) {
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	values := map[string]string{
+		"E2E_GCP_PROJECT_ID":      "gcpprojectidentifier3b7d91",
+		"E2E_GCP_WIF_PROVIDER":    "wifproviderresourcename5c2e80",
+		"E2E_GCP_SERVICE_ACCOUNT": "svcaccountidentifier7a1f64",
+		"CLOUDFLARE_ACCOUNT_ID":   "cfaccountidentifier9e4d27",
+	}
+	var scenario string
+	for name, value := range values {
+		t.Setenv(name, value)
+		scenario += " " + value
+	}
+
+	fake := &fakeListerCI{runs: []forge.WorkflowRun{{ID: 31, Name: "Deploy " + values["E2E_GCP_PROJECT_ID"]}}}
+	w := &world.World{Org: "org", RepoName: "repo", CI: fake, ScenarioName: "scenario" + scenario, Logf: func(string, ...any) {}}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("denied for %s", values["E2E_GCP_SERVICE_ACCOUNT"]))
+
+	require.NoError(t, filepath.WalkDir(artifactDir, func(path string, d os.DirEntry, err error) error {
+		require.NoError(t, err)
+		rel, relErr := filepath.Rel(artifactDir, path)
+		require.NoError(t, relErr)
+		for _, v := range values {
+			assert.NotContains(t, rel, v, "path")
+			if !d.IsDir() {
+				data, readErr := os.ReadFile(path)
+				require.NoError(t, readErr)
+				assert.NotContains(t, string(data), v, "content of "+rel)
+			}
+		}
+		return nil
+	}))
+}
+
+// TestLogRedacted_NeutralizesWorkflowCommands checks forge-supplied text with
+// newlines or workflow-command delimiters cannot start a console command line.
+func TestLogRedacted_NeutralizesWorkflowCommands(t *testing.T) {
+	var logged []string
+	w := &world.World{Logf: func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }}
+
+	logRedacted(w, "collect failure logs: %v", fmt.Errorf("bad response\n::warning::injected\r\n::error::more\x1b[31m\x00"))
+
+	require.Len(t, logged, 1)
+	assert.NotContains(t, logged[0], "\n")
+	assert.NotContains(t, logged[0], "\r")
+	assert.NotContains(t, logged[0], "\x1b")
+	assert.NotContains(t, logged[0], "\x00")
+	assert.NotContains(t, logged[0], "::")
+	assert.Contains(t, logged[0], "injected")
+}
+
+// sharedLogNotes maps each log-note constant to the note text the forge
+// clients wrote before the constants existed: sharing where the text lives
+// must not change the text itself.
+var sharedLogNotes = map[string]string{
+	"LogNoteFailedToFetchLogs":   "[failed to fetch logs:",
+	"LogNoteLogsUnavailable":     "[logs unavailable:",
+	"LogNoteFailedToReadLogs":    "[failed to read logs:",
+	"LogNoteJobListTruncated":    "[job list truncated:",
+	"LogNoteLogTruncated":        "[log truncated:",
+	"LogNoteErrorFetchingTrace":  "error fetching trace:",
+	"LogNoteErrorReadingTrace":   "error reading trace:",
+	"LogNoteAggregateTraceLimit": "aggregate trace limit",
+	"LogNoteTraceTruncated":      "trace truncated at",
+}
+
+// TestLogNoteMarkersAreSharedWithForge keeps the log-note markers one
+// definition. The GitHub and GitLab clients embed these notes in band, and
+// without an error, when a job's log (or the whole aggregate) could not be
+// fetched in full, and partialLogMarker matches them to tell a failed fetch
+// from a complete snapshot. The markers live as constants in internal/forge,
+// the one package both the writers and this reader import, so a rename is a
+// compile error. This test pins their values and checks that the reader
+// matches exactly the shared set, by comparing values, not source text.
+func TestLogNoteMarkersAreSharedWithForge(t *testing.T) {
+	constants := map[string]string{
+		"LogNoteFailedToFetchLogs":   forge.LogNoteFailedToFetchLogs,
+		"LogNoteLogsUnavailable":     forge.LogNoteLogsUnavailable,
+		"LogNoteFailedToReadLogs":    forge.LogNoteFailedToReadLogs,
+		"LogNoteJobListTruncated":    forge.LogNoteJobListTruncated,
+		"LogNoteLogTruncated":        forge.LogNoteLogTruncated,
+		"LogNoteErrorFetchingTrace":  forge.LogNoteErrorFetchingTrace,
+		"LogNoteErrorReadingTrace":   forge.LogNoteErrorReadingTrace,
+		"LogNoteAggregateTraceLimit": forge.LogNoteAggregateTraceLimit,
+		"LogNoteTraceTruncated":      forge.LogNoteTraceTruncated,
+	}
+	require.Len(t, constants, len(sharedLogNotes))
+
+	// Each constant keeps the text the clients have always written.
+	for name, text := range sharedLogNotes {
+		assert.Equal(t, text, constants[name], "forge.%s", name)
+	}
+
+	// The reader looks for exactly the shared notes, no more and no fewer.
+	want := map[string]bool{}
+	for _, text := range sharedLogNotes {
+		want[text] = true
+	}
+	got := map[string]bool{}
+	for _, note := range partialLogNotes {
+		got[note.marker] = true
+	}
+	assert.Equal(t, want, got, "partialLogNotes matches the shared log notes")
+	assert.Len(t, partialLogNotes, len(sharedLogNotes), "partialLogNotes lists each shared note once")
+}
+
+// --- dispatch diagnostics (#9469) ---
+
+// fakeIssueSCM answers GetIssue with a fixed issue or error and records
+// the requested number.
+type fakeIssueSCM struct {
+	scm.Driver
+
+	issue     *forge.Issue
+	err       error
+	requested int
+}
+
+func (f *fakeIssueSCM) GetIssue(_ context.Context, _, _ string, number int) (*forge.Issue, error) {
+	f.requested = number
+	return f.issue, f.err
+}
+
+// shortenDispatchGrace sets dispatchDiagnosticsGrace for one test and
+// gives the test a fresh, unused grace budget, of total when given (a
+// positive value) and dispatchGraceBudgetTotal otherwise. Both are
+// restored when the test ends.
+func shortenDispatchGrace(t *testing.T, d time.Duration, total ...time.Duration) {
+	t.Helper()
+	ResetDispatchGraceForTest(t)
+	dispatchDiagnosticsGrace = d
+	if len(total) > 0 && total[0] > 0 {
+		dispatchGraceBudget = newGraceBudget(total[0])
+	}
+}
+
+// fakeDispatchClock replaces the grace wait's clock for one test. The
+// clock starts at start; a grace wait returns at once and advances it by
+// the waited duration, after calling onWait (if set). It returns a
+// pointer to the number of waits.
+func fakeDispatchClock(t *testing.T, start time.Time, onWait func()) *int {
+	t.Helper()
+	origNow, origAfter := dispatchNow, dispatchAfter
+	var mu sync.Mutex
+	now := start
+	waits := 0
+	dispatchNow = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}
+	dispatchAfter = func(d time.Duration) <-chan time.Time {
+		mu.Lock()
+		now = now.Add(d)
+		waits++
+		mu.Unlock()
+		if onWait != nil {
+			onWait()
+		}
+		ch := make(chan time.Time, 1)
+		ch <- start
+		return ch
+	}
+	t.Cleanup(func() { dispatchNow, dispatchAfter = origNow, origAfter })
+	return &waits
+}
+
+// notDispatchedErr builds the wrapped timeout a step returns when the
+// GitHub Actions driver's WaitForWorkflow saw no fullsend.yaml run for
+// the issues event.
+func notDispatchedErr() error {
+	return fmt.Errorf("waiting for issue-open workflow: %w",
+		&ci.NotDispatchedError{WorkflowFile: "fullsend.yaml", Event: "issues"})
+}
+
+func TestNotDispatchedError_MessageAndSentinel(t *testing.T) {
+	t.Parallel()
+	err := notDispatchedErr()
+	assert.ErrorIs(t, err, ci.ErrWorkflowNotDispatched)
+	assert.Equal(t, "waiting for issue-open workflow: workflow fullsend.yaml (issues) was not dispatched", err.Error())
+	assert.Equal(t, "workflow fullsend.yaml was not dispatched (failed on 1 of 2 polls)",
+		(&ci.NotDispatchedError{WorkflowFile: "fullsend.yaml", Detail: " (failed on 1 of 2 polls)"}).Error())
+}
+
+func TestCollectFailureLogs_DispatchDiagnosticsReportLateRun(t *testing.T) {
+	shortenDispatchGrace(t, 2*time.Minute)
+	// Runner clock at the end of the 5-minute wait.
+	waitEnd := time.Date(2026, 11, 14, 0, 10, 58, 0, time.UTC)
+	waits := fakeDispatchClock(t, waitEnd, nil)
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	fake := &fakeListerCI{
+		runs: []forge.WorkflowRun{
+			// The waited-for run, created 10s into the grace period.
+			{ID: 90, Name: "fullsend", Event: "issues", Status: "queued", CreatedAt: "2026-11-14T00:11:08Z", Path: ".github/workflows/fullsend.yaml"},
+			// Same workflow, other event: listed, not matched.
+			{ID: 91, Name: "fullsend", Event: "issue_comment", Status: "queued", CreatedAt: "2026-11-14T00:11:30Z", Path: ".github/workflows/fullsend.yaml"},
+			{ID: 12, Name: "setup", Event: "push", Status: "completed", Conclusion: "success", CreatedAt: "2026-11-14T00:04:00Z", Path: ".github/workflows/setup.yaml"},
+		},
+	}
+	issues := &fakeIssueSCM{issue: &forge.Issue{Number: 7, CreatedAt: "2026-11-14T00:05:58Z", State: "open"}}
+	w := &world.World{
+		Org: "halfsend-22", RepoName: "test-repo-03", CI: fake, SCM: issues,
+		IssueNumber: 7, ScenarioName: "OWNERS alias resolves to grant access",
+		Logf: func(string, ...any) {},
+	}
+
+	CollectFailureLogs(context.Background(), w, notDispatchedErr())
+
+	summary := readFailureSummary(t, artifactDir)
+	assert.Equal(t, 1, *waits)
+	assert.Contains(t, summary, "\nDispatch diagnostics:\n")
+	assert.Contains(t, summary, "repository: halfsend-22/test-repo-03")
+	assert.Contains(t, summary, "listed at: 2026-11-14T00:12:58Z (runner clock), after a 2m0s grace period that began at 2026-11-14T00:10:58Z")
+	assert.Equal(t, 7, issues.requested)
+	assert.Contains(t, summary, "issue #7: created_at 2026-11-14T00:05:58Z, state open")
+	assert.Contains(t, summary, "workflow runs (3, no time filter)")
+	assert.Contains(t, summary, `run 90: workflow ".github/workflows/fullsend.yaml", event "issues", created_at 2026-11-14T00:11:08Z, status "queued", conclusion ""`)
+	assert.Contains(t, summary, `run 12: workflow ".github/workflows/setup.yaml", event "push", created_at 2026-11-14T00:04:00Z, status "completed", conclusion "success"`,
+		"a run from before the scenario is listed without the time filter")
+	assert.Contains(t, summary, "matching fullsend.yaml (issues) runs (gap measured on GitHub's clock):\n    - run 90: created_at 2026-11-14T00:11:08Z, +5m10s after the issue's created_at\n")
+	assert.NotContains(t, summary, "run 91: created_at", "a run for another event is not a matching run")
+	assert.Contains(t, summary, "matching fullsend.yaml (issues) run created after the wait ended: yes (run 90, created_at 2026-11-14T00:11:08Z; compared with the runner clock, allowing 30s of clock skew)")
+	assert.NotContains(t, summary, "grace wait:", "a full wait needs no budget note")
+}
+
+func TestCollectFailureLogs_DispatchDiagnosticsSkewAllowance(t *testing.T) {
+	shortenDispatchGrace(t, 2*time.Minute)
+	waitEnd := time.Date(2026, 11, 14, 0, 10, 58, 0, time.UTC)
+
+	tests := map[string]struct {
+		created string
+		want    string
+	}{
+		// 20s before the runner says the wait ended: within the 30s skew
+		// allowance, so it counts as after the wait.
+		"within skew":   {created: "2026-11-14T00:10:38Z", want: "after the wait ended: yes (run 90"},
+		"beyond skew":   {created: "2026-11-14T00:10:20Z", want: "after the wait ended: no (compared with the runner clock, allowing 30s of clock skew): the matching runs listed above predate the end of the wait"},
+		"unparseable":   {created: "", want: "run 90: created_at (unknown), unknown after the issue's created_at"},
+		"issue unknown": {created: "2026-11-14T00:11:08Z", want: "run 90: created_at 2026-11-14T00:11:08Z, unknown after the issue's created_at"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			artifactDir := t.TempDir()
+			t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+			shortenDispatchGrace(t, 2*time.Minute)
+			fakeDispatchClock(t, waitEnd, nil)
+			issue := &forge.Issue{Number: 7, CreatedAt: "2026-11-14T00:05:58Z", State: "open"}
+			if name == "issue unknown" {
+				issue.CreatedAt = ""
+			}
+			w := &world.World{
+				Org: "org", RepoName: "repo", IssueNumber: 7, ScenarioName: name,
+				CI: &fakeListerCI{runs: []forge.WorkflowRun{
+					{ID: 90, Event: "issues", CreatedAt: tc.created, Path: ".github/workflows/fullsend.yaml"},
+				}},
+				SCM:  &fakeIssueSCM{issue: issue},
+				Logf: func(string, ...any) {},
+			}
+
+			CollectFailureLogs(context.Background(), w, notDispatchedErr())
+
+			assert.Contains(t, readFailureSummary(t, artifactDir), tc.want)
+		})
+	}
+}
+
+func TestCollectFailureLogs_DispatchDiagnosticsReportNoRun(t *testing.T) {
+	shortenDispatchGrace(t, 2*time.Minute)
+	fakeDispatchClock(t, time.Date(2026, 11, 14, 0, 10, 58, 0, time.UTC), nil)
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	late := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	fake := &fakeListerCI{
+		runs: []forge.WorkflowRun{
+			// A late run of another workflow, and one with no reported
+			// file, do not count as the dispatch workflow's run.
+			{ID: 5, Name: "other", Event: "issues", CreatedAt: late, Path: ".github/workflows/other.yaml"},
+			{ID: 6, Name: "Named only", Event: "issues", CreatedAt: ""},
+		},
+	}
+	w := &world.World{
+		Org: "org", RepoName: "repo", CI: fake,
+		SCM: &fakeIssueSCM{err: fmt.Errorf("get issue #3: 502")}, IssueNumber: 3,
+		ScenarioName: "overlay refused", Logf: func(string, ...any) {},
+	}
+
+	CollectFailureLogs(context.Background(), w, notDispatchedErr())
+
+	summary := readFailureSummary(t, artifactDir)
+	assert.Contains(t, summary, "issue #3: lookup failed: get issue #3: 502")
+	assert.Contains(t, summary, `run 6: workflow "Named only", event "issues", created_at (unknown)`)
+	assert.Contains(t, summary, "matching fullsend.yaml (issues) runs: none")
+	assert.Contains(t, summary, "matching fullsend.yaml (issues) run created after the wait ended: no (compared with the runner clock, allowing 30s of clock skew): no matching run exists")
+}
+
+// TestCollectFailureLogs_DispatchDiagnosticsInconclusiveVerdicts checks
+// the cases where a verdict would overreach: no grace wait configured, a
+// truncated listing, and matching runs that predate a wait which fell
+// short. None of them may say the event produced no run or give a clean
+// "predate" verdict.
+func TestCollectFailureLogs_DispatchDiagnosticsInconclusiveVerdicts(t *testing.T) {
+	const skew = "compared with the runner clock, allowing 30s of clock skew"
+	waitEnd := time.Date(2026, 11, 14, 0, 10, 58, 0, time.UTC)
+	truncatedRuns := func() []forge.WorkflowRun {
+		runs := make([]forge.WorkflowRun, 0, maxListedFailureRuns)
+		for id := 1; id <= maxListedFailureRuns; id++ {
+			runs = append(runs, forge.WorkflowRun{ID: id, Event: "push", CreatedAt: "2026-11-14T00:04:00Z", Path: ".github/workflows/setup.yaml"})
+		}
+		return runs
+	}
+	oldMatch := []forge.WorkflowRun{{ID: 90, Event: "issues", CreatedAt: "2026-11-14T00:01:00Z", Path: ".github/workflows/fullsend.yaml"}}
+
+	tests := map[string]struct {
+		grace  time.Duration
+		runs   []forge.WorkflowRun
+		budget time.Duration // zero keeps the default budget
+		want   string
+	}{
+		"no grace wait configured": {
+			grace: 0,
+			want:  "run created after the wait ended: no (inconclusive: no grace wait is configured; " + skew + ")\n",
+		},
+		"listing truncated": {
+			grace: 2 * time.Minute,
+			runs:  truncatedRuns(),
+			want:  "run created after the wait ended: no (inconclusive: the listing was truncated; " + skew + ")\n",
+		},
+		"no grace and truncated": {
+			grace: 0,
+			runs:  truncatedRuns(),
+			want:  "no (inconclusive: no grace wait is configured; the listing was truncated; " + skew + ")\n",
+		},
+		"predating runs after a shortened wait": {
+			grace:  2 * time.Minute,
+			runs:   oldMatch,
+			budget: time.Minute,
+			want:   "run created after the wait ended: no (inconclusive: the grace wait was shortened to 1m0s; " + skew + "): the matching runs listed above predate the end of the wait\n",
+		},
+		"predating runs with no grace wait": {
+			grace: 0,
+			runs:  oldMatch,
+			want:  "no (inconclusive: no grace wait is configured; " + skew + "): the matching runs listed above predate",
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			shortenDispatchGrace(t, tc.grace, tc.budget)
+			waits := fakeDispatchClock(t, waitEnd, nil)
+			artifactDir := t.TempDir()
+			t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+			w := &world.World{Org: "org", RepoName: "repo", CI: &fakeListerCI{runs: tc.runs}, ScenarioName: name, Logf: func(string, ...any) {}}
+
+			CollectFailureLogs(context.Background(), w, notDispatchedErr())
+
+			summary := readFailureSummary(t, artifactDir)
+			assert.Contains(t, summary, tc.want)
+			assert.NotContains(t, summary, "suggests the event produced no run")
+			if tc.grace <= 0 {
+				assert.Zero(t, *waits, "no grace wait is configured, so none runs")
+				assert.Empty(t, dispatchGraceBudget.covered, "a zero grace does not use the budget")
+			}
+		})
+	}
+}
+
+// TestCollectFailureLogs_NoDispatchDiagnosticsForBareSentinel checks
+// that a not-dispatched timeout wrapping only the sentinel, as the GitLab
+// CI driver returns, gets no dispatch diagnostics and no grace wait: they
+// are for *ci.NotDispatchedError (GitHub Actions) only.
+func TestCollectFailureLogs_NoDispatchDiagnosticsForBareSentinel(t *testing.T) {
+	shortenDispatchGrace(t, 2*time.Minute)
+	waits := fakeDispatchClock(t, time.Date(2026, 11, 14, 0, 10, 58, 0, time.UTC), nil)
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+	w := &world.World{Org: "org", RepoName: "repo", CI: &fakeListerCI{}, ScenarioName: "gitlab timeout", Logf: func(string, ...any) {}}
+
+	err := fmt.Errorf("waiting for issue-open workflow: %w",
+		fmt.Errorf("pipeline (issues) %w", ci.ErrWorkflowNotDispatched))
+	require.ErrorIs(t, err, ci.ErrWorkflowNotDispatched)
+	CollectFailureLogs(context.Background(), w, err)
+
+	summary := readFailureSummary(t, artifactDir)
+	assert.Contains(t, summary, "Error: waiting for issue-open workflow: pipeline (issues) was not dispatched")
+	assert.NotContains(t, summary, "Dispatch diagnostics:")
+	assert.Zero(t, *waits, "no grace wait without the GitHub Actions details")
+	assert.Empty(t, dispatchGraceBudget.covered)
+}
+
+func TestCollectFailureLogs_DispatchDiagnosticsLookupGaps(t *testing.T) {
+	shortenDispatchGrace(t, 0)
+
+	tests := map[string]struct {
+		world *world.World
+		want  []string
+	}{
+		"listing fails and no issue recorded": {
+			world: &world.World{Org: "org", RepoName: "repo", CI: &fakeListerCI{listErr: fmt.Errorf("list recent workflow runs: 500")}},
+			want:  []string{"issue: none recorded for this scenario", "workflow runs: listing failed: list recent workflow runs: 500"},
+		},
+		"driver cannot list and no SCM driver": {
+			world: &world.World{Org: "org", RepoName: "repo", CI: &fakeDebugCI{}, IssueNumber: 4},
+			want:  []string{"issue #4: not looked up: no SCM driver is configured", "workflow runs: not listed: the CI driver cannot list workflow runs"},
+		},
+		"empty listing": {
+			world: &world.World{Org: "org", RepoName: "repo", CI: &fakeListerCI{}},
+			want:  []string{"workflow runs (0, no time filter):\n    none\n", "matching fullsend.yaml (issues) run created after the wait ended: no"},
+		},
+		"no repository": {
+			world: &world.World{},
+			want:  []string{"Dispatch diagnostics:\n  none: the repository identity is unavailable"},
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			artifactDir := t.TempDir()
+			t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+			tc.world.ScenarioName = name
+			tc.world.Logf = func(string, ...any) {}
+
+			CollectFailureLogs(context.Background(), tc.world, notDispatchedErr())
+
+			summary := readFailureSummary(t, artifactDir)
+			for _, want := range tc.want {
+				assert.Contains(t, summary, want)
+			}
+		})
+	}
+}
+
+// TestCollectFailureLogs_DispatchDiagnosticsGraceCutShort checks that a
+// context already cancelled before the wait skips it, reports it as cut
+// short with an inconclusive verdict, and does not use up the budget.
+func TestCollectFailureLogs_DispatchDiagnosticsGraceCutShort(t *testing.T) {
+	shortenDispatchGrace(t, time.Minute)
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	w := &world.World{Org: "org", RepoName: "repo", CI: &fakeListerCI{}, ScenarioName: "cancelled", Logf: func(string, ...any) {}}
+
+	CollectFailureLogs(ctx, w, notDispatchedErr())
+
+	summary := readFailureSummary(t, artifactDir)
+	assert.Contains(t, summary, "the grace period was cut short: context canceled")
+	assert.Contains(t, summary, "after a 0s grace period", "the line reports the real elapsed wait, not the configured one")
+	assert.Contains(t, summary, "run created after the wait ended: no (inconclusive: the grace wait was cut short after 0s;")
+	assert.NotContains(t, summary, "suggests the event produced no run", "a cut-short wait proves nothing about the event")
+	assert.Empty(t, dispatchGraceBudget.covered, "a cancelled context does not use up the budget")
+}
+
+// TestCollectFailureLogs_DispatchGraceBudgetUsedUp checks the
+// process-wide budget end to end: back-to-back waits each cost their own
+// time, a wait that would exceed the budget is shortened to what is
+// left, and once it is used up a later scenario skips the wait, still
+// lists the repository, says why it did not wait, and reports the
+// verdict as inconclusive.
+func TestCollectFailureLogs_DispatchGraceBudgetUsedUp(t *testing.T) {
+	shortenDispatchGrace(t, 2*time.Minute, 5*time.Minute)
+	// The fake clock advances only while a scenario waits, so these
+	// waits are back to back and do not overlap.
+	waits := fakeDispatchClock(t, time.Date(2026, 11, 14, 0, 10, 58, 0, time.UTC), nil)
+
+	run := func(name string) string {
+		artifactDir := t.TempDir()
+		t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+		w := &world.World{Org: "org", RepoName: "repo", CI: &fakeListerCI{}, ScenarioName: name, Logf: func(string, ...any) {}}
+		CollectFailureLogs(context.Background(), w, notDispatchedErr())
+		return readFailureSummary(t, artifactDir)
+	}
+
+	first, second := run("first"), run("second")
+	assert.Contains(t, first, "after a 2m0s grace period")
+	assert.Contains(t, second, "after a 2m0s grace period")
+	assert.Contains(t, first, "suggests the event produced no run", "a full wait with no run is a verdict")
+	third := run("third")
+	assert.Contains(t, third, "grace wait: shortened to 1m0s: the total grace wait time (5m0s per test process) runs out then")
+	assert.Contains(t, third, "after a 1m0s grace period")
+	assert.Contains(t, third, "run created after the wait ended: no (inconclusive: the grace wait was shortened to 1m0s;")
+	assert.NotContains(t, third, "suggests the event produced no run")
+	assert.Equal(t, 3, *waits)
+
+	fourth := run("fourth")
+	assert.Equal(t, 3, *waits, "a used-up budget skips the wait")
+	assert.Contains(t, fourth, "grace wait: skipped: the total grace wait time (5m0s per test process) is used up")
+	assert.Contains(t, fourth, "after a 0s grace period")
+	assert.Contains(t, fourth, "workflow runs (0, no time filter)", "the repository is still listed")
+	assert.Contains(t, fourth, "run created after the wait ended: no (inconclusive: the grace wait was skipped;")
+	assert.NotContains(t, fourth, "suggests the event produced no run", "a skipped wait proves nothing about the event")
+}
+
+// TestGraceBudget_ConcurrentWaitsCountOnce checks that overlapping waits
+// do not use each other up: a burst of scenarios starting together all
+// get the full wait, and the burst costs its wall time once. Run with
+// -race.
+func TestGraceBudget_ConcurrentWaitsCountOnce(t *testing.T) {
+	t.Parallel()
+	g := newGraceBudget(6 * time.Minute)
+	start := time.Date(2026, 11, 14, 0, 0, 0, 0, time.UTC)
+	var mu sync.Mutex
+	var grants []time.Duration
+	var wg sync.WaitGroup
+	for i := range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Starts spread over the first 20s, all inside the first wait.
+			got := g.grant(start.Add(time.Duration(i)*time.Second), 2*time.Minute)
+			mu.Lock()
+			grants = append(grants, got)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	require.Len(t, grants, 20)
+	for _, got := range grants {
+		assert.Equal(t, 2*time.Minute, got, "an overlapping wait gets the full grace period")
+	}
+	g.mu.Lock()
+	require.Len(t, g.covered, 1, "the burst is one covered interval")
+	assert.Equal(t, 2*time.Minute+19*time.Second, g.covered[0].end.Sub(g.covered[0].start))
+	g.mu.Unlock()
+	assert.Zero(t, g.grant(start, 0), "no wait wanted, none granted")
+}
+
+// TestGraceBudget_IsolatedLaterWaitStillWaits checks that a failure long
+// after the first one still gets its full wait while the covered time is
+// below the budget, and that the budget, once used up, shortens and then
+// skips later waits.
+func TestGraceBudget_IsolatedLaterWaitStillWaits(t *testing.T) {
+	t.Parallel()
+	g := newGraceBudget(6 * time.Minute)
+	start := time.Date(2026, 11, 14, 0, 0, 0, 0, time.UTC)
+
+	assert.Equal(t, 2*time.Minute, g.grant(start, 2*time.Minute))
+	assert.Equal(t, 2*time.Minute, g.grant(start.Add(30*time.Minute), 2*time.Minute), "an isolated wait well after the first still gets 2m")
+	// Overlaps the second wait's last minute: that minute is free, the
+	// next minute is charged (5m covered).
+	assert.Equal(t, 2*time.Minute, g.grant(start.Add(31*time.Minute), 2*time.Minute))
+	assert.Equal(t, time.Minute, g.grant(start.Add(3*time.Hour), 2*time.Minute), "shortened to the budget left")
+	assert.Zero(t, g.grant(start.Add(4*time.Hour), 2*time.Minute), "skipped once the budget is used up")
+	// A wait inside an already covered interval costs nothing, so it
+	// still runs to the end of that interval.
+	assert.Equal(t, 30*time.Second, g.grant(start.Add(3*time.Hour+30*time.Second), 2*time.Minute))
+}
+
+// TestGraceBudget_GapBeforeLaterInterval checks the charge when a wait
+// starts before an interval already granted (a clock that steps back):
+// only the uncovered gap is charged.
+func TestGraceBudget_GapBeforeLaterInterval(t *testing.T) {
+	t.Parallel()
+	g := newGraceBudget(3 * time.Minute)
+	start := time.Date(2026, 11, 14, 0, 0, 0, 0, time.UTC)
+
+	assert.Equal(t, 2*time.Minute, g.grant(start.Add(time.Minute), 2*time.Minute))
+	// [0, 1m) is new (1m charged, budget used up), [1m, 3m) is covered.
+	assert.Equal(t, 3*time.Minute, g.grant(start, 5*time.Minute))
+	assert.Zero(t, g.grant(start.Add(10*time.Minute), time.Minute))
+}
+
+// TestCollectFailureLogs_DispatchGraceCancelMidWait checks that a wait
+// cancelled after 30s is reported as cut short with an inconclusive
+// verdict, and keeps its whole reservation: the next isolated wait gets
+// only the 1m left of the 3m budget.
+func TestCollectFailureLogs_DispatchGraceCancelMidWait(t *testing.T) {
+	shortenDispatchGrace(t, 2*time.Minute, 3*time.Minute)
+	fakeDispatchClock(t, time.Date(2026, 11, 14, 0, 10, 58, 0, time.UTC), nil)
+	fakeAfter := dispatchAfter
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// The first wait: 30s pass, then the context is cancelled; the timer
+	// never fires.
+	dispatchAfter = func(time.Duration) <-chan time.Time {
+		<-fakeAfter(30 * time.Second)
+		cancel()
+		return make(chan time.Time)
+	}
+	run := func(ctx context.Context, name string) string {
+		artifactDir := t.TempDir()
+		t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+		w := &world.World{Org: "org", RepoName: "repo", CI: &fakeListerCI{}, ScenarioName: name, Logf: func(string, ...any) {}}
+		CollectFailureLogs(ctx, w, notDispatchedErr())
+		return readFailureSummary(t, artifactDir)
+	}
+
+	first := run(ctx, "cancelled")
+	assert.Contains(t, first, "after a 30s grace period")
+	assert.Contains(t, first, "no (inconclusive: the grace wait was cut short after 30s;")
+
+	// An hour later, so the second wait does not overlap the first one's
+	// reservation; it runs on the fake clock.
+	<-fakeAfter(time.Hour)
+	dispatchAfter = fakeAfter
+	second := run(context.Background(), "second")
+	assert.Contains(t, second, "grace wait: shortened to 1m0s")
+	assert.Contains(t, second, "after a 1m0s grace period")
+}
+
+// TestCollectFailureLogs_DispatchDiagnosticsEarliestLateRun checks that
+// the verdict names the earliest late matching run, whatever the order of
+// the listing.
+func TestCollectFailureLogs_DispatchDiagnosticsEarliestLateRun(t *testing.T) {
+	shortenDispatchGrace(t, 2*time.Minute)
+	fakeDispatchClock(t, time.Date(2026, 11, 14, 0, 10, 58, 0, time.UTC), nil)
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+	w := &world.World{
+		Org: "org", RepoName: "repo", ScenarioName: "two late runs", Logf: func(string, ...any) {},
+		CI: &fakeListerCI{runs: []forge.WorkflowRun{
+			// Newest first, as the forge lists them.
+			{ID: 92, Event: "issues", CreatedAt: "2026-11-14T00:12:00Z", Path: ".github/workflows/fullsend.yaml"},
+			{ID: 91, Event: "issues", CreatedAt: "2026-11-14T00:11:08Z", Path: ".github/workflows/fullsend.yaml"},
+		}},
+	}
+
+	CollectFailureLogs(context.Background(), w, notDispatchedErr())
+
+	assert.Contains(t, readFailureSummary(t, artifactDir), "run created after the wait ended: yes (run 91, created_at 2026-11-14T00:11:08Z;")
+}
+
+// TestResetDispatchGraceForTest checks that the exported helper gives a
+// test a fresh budget and restores the previous budget and grace
+// afterwards.
+func TestResetDispatchGraceForTest(t *testing.T) {
+	orig, origGrace := dispatchGraceBudget, dispatchDiagnosticsGrace
+	t.Run("reset", func(t *testing.T) {
+		ResetDispatchGraceForTest(t)
+		dispatchDiagnosticsGrace = time.Second
+		assert.NotSame(t, orig, dispatchGraceBudget)
+		assert.Equal(t, dispatchGraceBudgetTotal, dispatchGraceBudget.total)
+		assert.Empty(t, dispatchGraceBudget.covered)
+	})
+	assert.Same(t, orig, dispatchGraceBudget, "the previous budget is restored")
+	assert.Equal(t, origGrace, dispatchDiagnosticsGrace, "the previous grace is restored")
+}
+
+// TestCollectFailureLogs_DispatchDiagnosticsNoVerdictSkipsWait checks
+// that the grace wait is skipped, without using the budget, when no
+// verdict can be computed: a NotDispatchedError without a workflow file
+// (reported as unknown, not as "matching runs: none"), or a CI driver
+// that cannot list runs.
+func TestCollectFailureLogs_DispatchDiagnosticsNoVerdictSkipsWait(t *testing.T) {
+	tests := map[string]struct {
+		driver ci.Driver
+		err    error
+		want   string
+	}{
+		"no workflow file": {
+			driver: &fakeListerCI{},
+			err:    fmt.Errorf("wait: %w", &ci.NotDispatchedError{Event: "issues"}),
+			want:   "matching run after the wait: unknown: the error does not record which workflow and event were waited for",
+		},
+		"driver cannot list": {
+			driver: &fakeDebugCI{},
+			err:    notDispatchedErr(),
+			want:   "workflow runs: not listed: the CI driver cannot list workflow runs",
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			shortenDispatchGrace(t, 2*time.Minute)
+			waits := fakeDispatchClock(t, time.Date(2026, 11, 14, 0, 10, 58, 0, time.UTC), nil)
+			artifactDir := t.TempDir()
+			t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+			w := &world.World{Org: "org", RepoName: "repo", CI: tc.driver, ScenarioName: name, Logf: func(string, ...any) {}}
+
+			CollectFailureLogs(context.Background(), w, tc.err)
+
+			summary := readFailureSummary(t, artifactDir)
+			assert.Contains(t, summary, "grace wait: skipped: no verdict can be computed")
+			assert.Contains(t, summary, tc.want)
+			assert.NotContains(t, summary, "runs: none")
+			assert.Zero(t, *waits)
+			assert.Empty(t, dispatchGraceBudget.covered, "a skipped wait does not use the budget")
+		})
+	}
+}
+
+// TestCollectFailureLogs_DispatchDiagnosticsCommentEventHasNoGap checks
+// that a wait for an issue_comment run does not print a gap from the
+// issue's creation, which is not the event that triggered the run.
+func TestCollectFailureLogs_DispatchDiagnosticsCommentEventHasNoGap(t *testing.T) {
+	shortenDispatchGrace(t, 2*time.Minute)
+	fakeDispatchClock(t, time.Date(2026, 11, 14, 0, 10, 58, 0, time.UTC), nil)
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+	w := &world.World{
+		Org: "org", RepoName: "repo", IssueNumber: 7, ScenarioName: "comment",
+		CI: &fakeListerCI{runs: []forge.WorkflowRun{
+			{ID: 95, Event: "issue_comment", CreatedAt: "2026-11-14T00:11:08Z", Path: ".github/workflows/fullsend.yaml"},
+		}},
+		SCM:  &fakeIssueSCM{issue: &forge.Issue{Number: 7, CreatedAt: "2026-11-14T00:05:58Z", State: "open"}},
+		Logf: func(string, ...any) {},
+	}
+
+	CollectFailureLogs(context.Background(), w, fmt.Errorf("waiting for dispatch workflow (issue_comment): %w",
+		&ci.NotDispatchedError{WorkflowFile: "fullsend.yaml", Event: "issue_comment"}))
+
+	summary := readFailureSummary(t, artifactDir)
+	assert.Contains(t, summary, "matching fullsend.yaml (issue_comment) runs (no gap: it is measured only from an issue's creation, and the triggering event here is not the issue):\n    - run 95: created_at 2026-11-14T00:11:08Z\n")
+	assert.NotContains(t, summary, "after the issue's created_at")
+	assert.Contains(t, summary, "matching fullsend.yaml (issue_comment) run created after the wait ended: yes (run 95")
+}
+
+func TestCollectFailureLogs_NoDispatchDiagnosticsForOtherErrors(t *testing.T) {
+	// Default grace; the deadline makes a regression that waits fail
+	// within seconds (the wait is cut short) instead of hanging.
+	shortenDispatchGrace(t, 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	artifactDir := t.TempDir()
+	t.Setenv("BEHAVIOUR_ARTIFACT_DIR", artifactDir)
+
+	issues := &fakeIssueSCM{issue: &forge.Issue{Number: 7}}
+	w := &world.World{
+		Org: "org", RepoName: "repo", CI: &fakeListerCI{}, SCM: issues, IssueNumber: 7,
+		ScenarioName: "other failure", Logf: func(string, ...any) {},
+	}
+
+	CollectFailureLogs(ctx, w, fmt.Errorf("workflow fullsend.yaml run 4 concluded with %q", "failure"))
+
+	require.NoError(t, ctx.Err(), "CollectFailureLogs must not wait for other errors")
+	summary := readFailureSummary(t, artifactDir)
+	assert.NotContains(t, summary, "Dispatch diagnostics")
+	assert.Zero(t, issues.requested, "the issue is not looked up for other failures")
+}

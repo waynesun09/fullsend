@@ -9,7 +9,7 @@ set -euo pipefail
 # endpoint, so this script pre-fetches the OIDC token and rewrites the config
 # to use a file-based credential source instead.
 #
-# Note: the OIDC token expires after ~10 min. The fullsend CLI refreshes it
+# Note: the OIDC token expires after ~5 min. The fullsend CLI refreshes it
 # automatically using FULLSEND_GCP_OIDC_URL and FULLSEND_GCP_OIDC_AUTH_FILE
 # exported below.
 #
@@ -33,7 +33,7 @@ if [[ "$CRED_TYPE" == "external_account" ]]; then
   SANDBOX_CREDS="$RUNNER_TEMP/sandbox-gcp-credentials.json"
   jq '{
     type, audience, subject_token_type, token_url,
-    credential_source: { file: "/tmp/workspace/.gcp-oidc-token", format: .credential_source.format }
+    credential_source: { file: "/sandbox/workspace/.gcp-oidc-token", format: .credential_source.format }
   } + (if .service_account_impersonation_url then
     {service_account_impersonation_url}
   else {} end)' "$CRED_CONFIG" > "$SANDBOX_CREDS"

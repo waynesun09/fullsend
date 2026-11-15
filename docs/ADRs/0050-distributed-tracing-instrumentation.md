@@ -1,0 +1,198 @@
+---
+title: "50. Framework-native distributed tracing with OpenTelemetry"
+status: Accepted
+relates_to:
+  - operational-observability
+topics:
+  - observability
+  - telemetry
+  - opentelemetry
+---
+
+# 50. Framework-native distributed tracing with OpenTelemetry
+
+Date: 2026-05-23
+
+## Status
+
+Accepted
+
+## Context
+
+Fullsend agent runs are opaque. When a multi-agent pipeline dispatches
+triage → code → review, operators have no structured way to understand what
+happened, how long each step took, or where a failure occurred. The
+[operational observability](../problems/operational-observability.md) problem
+doc identifies this as a first-order concern.
+
+Fullsend is distributed to many organizations — not just our team. The
+tracing design must be safe by default without requiring any configuration
+from adopters. Setting an OTLP endpoint must never accidentally expose
+sensitive content (prompts, source code, PII) to shared or SaaS backends.
+
+Prior decisions that inform this one:
+
+- [ADR 0021](0021-jsonl-reasoning-trace-exposure.md) — JSONL reasoning trace
+  exposure (what traces contain, who can access them)
+- [ADR 0018](0018-scripted-pipeline-for-multi-agent-orchestration.md) —
+  scripted multi-agent pipeline whose cross-run correlation this enables
+- [ADR 0022](0022-harness-level-output-schema-enforcement.md) — structured
+  output schemas that `run-summary.json` complements
+
+## Options
+
+### A. Post-hoc parsing (rejected)
+
+External tooling parses CLI stdout after runs to construct spans. Fragile:
+stdout is not a stable contract, timing is approximate, and intermediate
+state is lost. The early Arize Phoenix experiment confirmed this.
+
+### B. Framework-native OpenTelemetry (accepted)
+
+CLI emits OTEL spans at source. Zero-infrastructure baseline (local files),
+one env var enables OTLP export. Backend-agnostic. Content capture requires
+explicit opt-in per OTEL GenAI semantic conventions.
+
+### C. Vendor-specific trace format (rejected)
+
+A runtime-locked trace builder (e.g., Claude-specific). Breaks when fullsend
+adds support for other runtimes (OpenCode, Gemini CLI). Not portable.
+
+## Decision
+
+Fullsend instruments the CLI natively using OpenTelemetry with a three-level
+opt-in model:
+
+**Level 1 — Local baseline (every install, zero config):**
+- Every run produces `run-telemetry.jsonl` and `run-summary.json` in the output
+  directory (uploaded as GHA artifacts alongside transcripts)
+- Metadata only: span hierarchy, timing, token counts, tool names, errors
+- "Errors" covers operational error text on span statuses and exception
+  events — bounded, UTF-8-repaired, and sanitized where agent-controlled; a
+  failed sandbox create embeds excerpts of container/supervisor logs. The
+  Level 3 gate governs prompt/completion capture, which is separate from
+  error reporting.
+- No data leaves the runner. No backend required.
+
+**Level 2 — OTLP export (org opts in by setting endpoint):**
+- When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, metadata spans export via
+  OTLP/HTTP to the org's chosen backend
+- Still metadata only — safe for any backend including shared/SaaS platforms
+- Spans follow [OTEL GenAI Semantic Conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/)
+  (`gen_ai.operation.name`, `gen_ai.agent.name`, `gen_ai.request.model`,
+  `gen_ai.system`)
+- W3C `TRACEPARENT` propagation enables cross-run correlation for dispatched
+  pipelines; separate workflow runs require manual propagation
+
+**Level 3 — Content capture (org explicitly opts in):**
+- When `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` is set, full
+  prompt/completion content is included in spans
+- Org is responsible for ensuring their backend's access controls are
+  appropriate for the content sensitivity
+- Enables LLM-judge evaluation scorers that need to read agent reasoning
+
+**Additional design properties:**
+- Runtime-agnostic: any runtime satisfying a transcript contract (turns,
+  tools, tokens, model, stop reason) gets span promotion
+- If the OTLP endpoint is unreachable, the CLI continues normally — local
+  files still produced, run is not affected
+- Simultaneous export to multiple backends is achieved by deploying an
+  [OTEL Collector](https://opentelemetry.io/docs/collector/) as the endpoint;
+  the CLI exports to one OTLP endpoint, the Collector fans out
+
+**Scope boundary:** This ADR decides how traces are *generated* and how
+content sensitivity is handled. Agent quality evaluation (scoring, regression
+detection, baselines) *consumes* trace data but is a separate architectural
+concern. Choice of backend is an adopter decision, not a platform decision.
+
+## Consequences
+
+- Every org gets structured observability with zero configuration (local files)
+- OTLP export is always safe to enable (metadata only by default)
+- Content capture is an explicit second opt-in — prevents accidental exposure
+  of proprietary code or PII to shared/SaaS backends
+- Any OTLP-compatible backend works (Jaeger, Tempo, MLflow, Phoenix,
+  Langfuse, SigNoz, Honeycomb, Datadog)
+- Cross-run correlation via `TRACEPARENT` for dispatched pipelines
+- GenAI-aware backends get agent dashboards without CLI changes
+- Runtime-agnostic: adding new runtimes doesn't require new trace formats
+- The `gen_ai.*` attributes follow experimental OTEL semantic conventions
+  and may change in future OTEL releases
+
+## Deferred to implementation
+
+These items are in scope for the implementation phase, not this architectural
+decision:
+
+1. **Sub-agent recursive span expansion** — When an agent dispatches sub-agents
+   via `tool:Agent` (e.g., review agent's 6 sub-agents), their turns should
+   become nested span subtrees, not flat spans. The transcript contract must
+   handle recursive agent invocations.
+
+2. **Pre/post script span instrumentation** — Pre-scripts, post-scripts, and
+   validation scripts do significant work but aren't addressed in span
+   structure. Define whether the framework instruments their execution
+   automatically or provides a contract for scripts to emit spans.
+
+## Related issues
+
+- [#294](https://github.com/fullsend-ai/fullsend/issues/294) — Define trace
+  granularity and retention policy
+- [#295](https://github.com/fullsend-ai/fullsend/issues/295) — Define
+  quality metrics for autonomous software factory
+- [#296](https://github.com/fullsend-ai/fullsend/issues/296) — Evaluate
+  Langfuse deployment threshold vs structured logging
+- [#2367](https://github.com/fullsend-ai/fullsend/issues/2367) — Add
+  `fullsend.runtime` trace attribute for multi-runtime observability
+- [#2368](https://github.com/fullsend-ai/fullsend/issues/2368) — Add
+  `fullsend.harness.content_sha` trace attribute for config change correlation
+
+## Annotations
+
+**2026-07-17 — OTel SDK migration (3dc2ca4c):** `run-summary.json` was removed.
+Its contents (cost, token counts, tool calls) are now attributes on the root
+and agent spans in `run-telemetry.jsonl`, which became the sole Level 1
+artifact. OTLP export also changed from post-hoc directory upload to live
+span export via the OTel SDK's batch processor. The core decision (three-level
+opt-in, OTel-native, W3C propagation) is unchanged.
+
+**2026-08-10 — Eval measurements ([ADR 0087](0087-eval-measurements-online-trace-scoring.md)):**
+online scoring of wild-run traces writes `eval-measurements.jsonl`
+beside telemetry when at least one new score is produced (tool-agnostic). Distinct from functional eval fixtures
+([ADR 0051](0051-agent-eval-harness-for-test-infrastructure.md)).
+
+> **Done ([#6459](https://github.com/fullsend-ai/fullsend/pull/6459) /
+> [ADR 0087](0087-eval-measurements-online-trace-scoring.md)):** portable
+> remote score export uses the same OTLP configuration as this ADR — no
+> vendor score adapters in core.
+
+**2026-08-18 — Remove duplicate token/cost from root span (3278b059):**
+`gen_ai.request.model` and `gen_ai.usage.*` token attributes moved to agent
+spans only; the root span keeps `fullsend.cost_usd` and `fullsend.tool_calls`
+(custom-namespaced, not auto-summed by MLflow). This prevents MLflow from
+double-counting token usage across the trace.
+
+**2026-09-03 — Tool-call span topology ([ADR 0108](0108-tool-call-span-topology.md)):**
+each id-bearing tool call the runtime reports — Claude Code today; pi and
+codex emit no call ids — becomes an `execute_tool` child of its iteration's
+`agent` span, up to 1,024 per iteration, metadata only; the message record
+on the `agent` span stays the content carrier. Sub-agent nesting (deferred item 1 above)
+remains deferred.
+
+**2026-11-05 — pi tool I/O ([#7414](https://github.com/fullsend-ai/fullsend/issues/7414)):**
+`tool_call` parts on pi runs now carry ids and arguments, with `tool_call_response`
+parts beside them, and pi's tools have their own entries in the recorded-arguments
+list. The Claude-only wording in the annotations below still holds for codex.
+
+**2026-09-18 — Level 3 input message and tool arguments ([ADR 0108](0108-tool-call-span-topology.md)):**
+under the content gate, a retry iteration that carries validation feedback
+records the prompt the runner composed as `gen_ai.input.messages`, and
+`tool_call` parts on the message record carry the members of the call's
+arguments that name what was called (a path, a pattern, a `Bash` command
+whole, which can embed what it writes), not a `Write`, `Edit` or
+`NotebookEdit` body, an `Agent` or `WebFetch` prompt or the input of an
+MCP tool — Claude Code today
+([#7414](https://github.com/fullsend-ai/fullsend/issues/7414)).
+The rest of the model's input is not recorded
+([reference](../guides/infrastructure/distributed-tracing.md#content-capture-level-3)).
+The gate and the carrier are unchanged.

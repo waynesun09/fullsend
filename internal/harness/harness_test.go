@@ -1,8 +1,10 @@
 package harness
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -12,6 +14,7 @@ import (
 func TestLoad_ValidHarness(t *testing.T) {
 	content := `
 agent: agents/hello-world.md
+role: triage
 image: registry.example.com/sandbox:v1
 skills:
   - skills/hello-world-summary
@@ -31,7 +34,7 @@ timeout_minutes: 5
 
 	assert.Equal(t, "agents/hello-world.md", h.Agent)
 	assert.Equal(t, "registry.example.com/sandbox:v1", h.Image)
-	assert.Equal(t, []string{"skills/hello-world-summary"}, h.Skills)
+	assert.Equal(t, []string{"skills/hello-world-summary"}, SkillSources(h.Skills))
 	require.NotNil(t, h.ValidationLoop)
 	assert.Equal(t, "scripts/validate-output.sh", h.ValidationLoop.Script)
 	assert.Equal(t, 1, h.ValidationLoop.MaxIterations)
@@ -68,6 +71,7 @@ skills:
 func TestLoad_ValidationLoopMissingScript(t *testing.T) {
 	content := `
 agent: agents/test.md
+role: test
 validation_loop:
   max_iterations: 3
 `
@@ -80,16 +84,56 @@ validation_loop:
 	assert.Contains(t, err.Error(), "validation_loop.script is required")
 }
 
+func TestLoad_ValidationLoopFeedbackModeValid(t *testing.T) {
+	for _, mode := range []string{"", "none", "append"} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			y := fmt.Sprintf(`
+agent: agents/test.md
+role: test
+validation_loop:
+  script: validate.sh
+  feedback_mode: %s
+`, mode)
+			dir := t.TempDir()
+			path := filepath.Join(dir, "ok.yaml")
+			require.NoError(t, os.WriteFile(path, []byte(y), 0o644))
+
+			h, err := Load(path)
+			require.NoError(t, err)
+			assert.Equal(t, mode, h.ValidationLoop.FeedbackMode)
+		})
+	}
+}
+
+func TestLoad_ValidationLoopFeedbackModeInvalid(t *testing.T) {
+	content := `
+agent: agents/test.md
+role: test
+validation_loop:
+  script: validate.sh
+  feedback_mode: bogus
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bad.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `validation_loop.feedback_mode must be "none" or "append"`)
+	assert.Contains(t, err.Error(), `"bogus"`)
+}
+
 func TestLoad_HostFiles(t *testing.T) {
 	content := `
 agent: agents/test.md
+role: test
 host_files:
   - src: ${GOOGLE_APPLICATION_CREDENTIALS}
-    dest: /tmp/workspace/.gcp-credentials.json
+    dest: /sandbox/workspace/.gcp-credentials.json
   - src: /etc/ssl/certs/ca-certificates.crt
-    dest: /etc/ssl/certs/ca-certificates.crt
+    dest: /sandbox/workspace/ca-certificates.crt
   - src: env/gcp-vertex.env
-    dest: /tmp/workspace/.env.d/gcp-vertex.env
+    dest: /sandbox/workspace/.env.d/gcp-vertex.env
     expand: true
 `
 	dir := t.TempDir()
@@ -101,21 +145,22 @@ host_files:
 
 	require.Len(t, h.HostFiles, 3)
 	assert.Equal(t, "${GOOGLE_APPLICATION_CREDENTIALS}", h.HostFiles[0].Src)
-	assert.Equal(t, "/tmp/workspace/.gcp-credentials.json", h.HostFiles[0].Dest)
+	assert.Equal(t, "/sandbox/workspace/.gcp-credentials.json", h.HostFiles[0].Dest)
 	assert.False(t, h.HostFiles[0].Expand)
 	assert.Equal(t, "/etc/ssl/certs/ca-certificates.crt", h.HostFiles[1].Src)
-	assert.Equal(t, "/etc/ssl/certs/ca-certificates.crt", h.HostFiles[1].Dest)
+	assert.Equal(t, "/sandbox/workspace/ca-certificates.crt", h.HostFiles[1].Dest)
 	assert.False(t, h.HostFiles[1].Expand)
 	assert.Equal(t, "env/gcp-vertex.env", h.HostFiles[2].Src)
-	assert.Equal(t, "/tmp/workspace/.env.d/gcp-vertex.env", h.HostFiles[2].Dest)
+	assert.Equal(t, "/sandbox/workspace/.env.d/gcp-vertex.env", h.HostFiles[2].Dest)
 	assert.True(t, h.HostFiles[2].Expand)
 }
 
 func TestValidate_HostFileMissingSrc(t *testing.T) {
 	content := `
 agent: agents/test.md
+role: test
 host_files:
-  - dest: /tmp/workspace/.gcp-credentials.json
+  - dest: /sandbox/workspace/.gcp-credentials.json
 `
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bad.yaml")
@@ -129,6 +174,7 @@ host_files:
 func TestValidate_HostFileMissingDest(t *testing.T) {
 	content := `
 agent: agents/test.md
+role: test
 host_files:
   - src: ${GOOGLE_APPLICATION_CREDENTIALS}
 `
@@ -145,7 +191,7 @@ func TestResolveRelativeTo(t *testing.T) {
 	h := &Harness{
 		Agent:      "agents/hello-world.md",
 		Policy:     "policies/readonly.yaml",
-		Skills:     []string{"skills/hello-world-summary"},
+		Skills:     []SkillEntry{{Source: "skills/hello-world-summary"}},
 		PreScript:  "scripts/pre.sh",
 		PostScript: "scripts/post.sh",
 		AgentInput: "agent-input",
@@ -158,7 +204,7 @@ func TestResolveRelativeTo(t *testing.T) {
 
 	assert.Equal(t, "/base/dir/agents/hello-world.md", h.Agent)
 	assert.Equal(t, "/base/dir/policies/readonly.yaml", h.Policy)
-	assert.Equal(t, []string{"/base/dir/skills/hello-world-summary"}, h.Skills)
+	assert.Equal(t, []string{"/base/dir/skills/hello-world-summary"}, SkillSources(h.Skills))
 	assert.Equal(t, "/base/dir/scripts/pre.sh", h.PreScript)
 	assert.Equal(t, "/base/dir/scripts/post.sh", h.PostScript)
 	assert.Equal(t, "/base/dir/agent-input", h.AgentInput)
@@ -169,9 +215,9 @@ func TestResolveRelativeTo_HostFiles(t *testing.T) {
 	h := &Harness{
 		Agent: "agents/test.md",
 		HostFiles: []HostFile{
-			{Src: "env/gcp-vertex.env", Dest: "/tmp/workspace/.env.d/gcp-vertex.env", Expand: true},
-			{Src: "${GOOGLE_APPLICATION_CREDENTIALS}", Dest: "/tmp/workspace/.gcp-credentials.json"},
-			{Src: "/absolute/path/file.txt", Dest: "/tmp/workspace/file.txt"},
+			{Src: "env/gcp-vertex.env", Dest: "/sandbox/workspace/.env.d/gcp-vertex.env", Expand: true},
+			{Src: "${GOOGLE_APPLICATION_CREDENTIALS}", Dest: "/sandbox/workspace/.gcp-credentials.json"},
+			{Src: "/absolute/path/file.txt", Dest: "/sandbox/workspace/file.txt"},
 		},
 	}
 
@@ -183,6 +229,47 @@ func TestResolveRelativeTo_HostFiles(t *testing.T) {
 	assert.Equal(t, "${GOOGLE_APPLICATION_CREDENTIALS}", h.HostFiles[1].Src)
 	// Absolute path is unchanged.
 	assert.Equal(t, "/absolute/path/file.txt", h.HostFiles[2].Src)
+}
+
+func TestResolveRelativeTo_ValidationLoopSchema(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		ValidationLoop: &ValidationLoop{
+			Script: "scripts/validate.sh",
+			Schema: "schemas/result.schema.json",
+		},
+	}
+
+	require.NoError(t, h.ResolveRelativeTo("/base/dir"))
+
+	assert.Equal(t, "/base/dir/schemas/result.schema.json", h.ValidationLoop.Schema)
+}
+
+func TestResolveRelativeTo_ValidationLoopSchemaVarSkipped(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		ValidationLoop: &ValidationLoop{
+			Script: "scripts/validate.sh",
+			Schema: "${FULLSEND_DIR}/schemas/result.schema.json",
+		},
+	}
+
+	require.NoError(t, h.ResolveRelativeTo("/base/dir"))
+
+	assert.Equal(t, "${FULLSEND_DIR}/schemas/result.schema.json", h.ValidationLoop.Schema)
+}
+
+func TestResolveRelativeTo_ValidationLoopSchemaTraversalRejected(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		ValidationLoop: &ValidationLoop{
+			Script: "scripts/validate.sh",
+			Schema: "../../etc/shadow.json",
+		},
+	}
+	err := h.ResolveRelativeTo("/base/dir")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "resolves outside fullsend directory")
 }
 
 func TestResolveRelativeTo_AbsolutePathsUnchanged(t *testing.T) {
@@ -206,7 +293,7 @@ func TestResolveRelativeTo_HostFileTraversalRejected(t *testing.T) {
 	h := &Harness{
 		Agent: "agents/test.md",
 		HostFiles: []HostFile{
-			{Src: "../../../etc/shadow", Dest: "/tmp/workspace/shadow"},
+			{Src: "../../../etc/shadow", Dest: "/sandbox/workspace/shadow"},
 		},
 	}
 	err := h.ResolveRelativeTo("/base/dir")
@@ -218,6 +305,143 @@ func TestLoad_FileNotFound(t *testing.T) {
 	_, err := Load("/nonexistent/path.yaml")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "reading harness file")
+}
+
+func TestLoad_SchemaVersionAccepted(t *testing.T) {
+	// ADR 0127 Decision 1: absent, null, and explicit 1 all mean version 1
+	// and must load through both parse-level entry points.
+	tests := []struct {
+		name    string
+		version string // YAML lines appended to the harness body
+		want    *schemaVersionValue
+	}{
+		{name: "absent", version: "", want: nil},
+		{name: "null", version: "schema_version: null\n", want: nil},
+		{name: "explicit one", version: "schema_version: 1\n", want: schemaVersionPtr(1)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := "agent: agents/test.md\nrole: test\n" + tt.version
+			dir := t.TempDir()
+			path := filepath.Join(dir, "ok.yaml")
+			require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+			h, err := LoadRaw(path)
+			require.NoError(t, err)
+			if tt.want == nil {
+				assert.Nil(t, h.SchemaVersion)
+			} else {
+				require.NotNil(t, h.SchemaVersion)
+				assert.Equal(t, *tt.want, *h.SchemaVersion)
+			}
+
+			// Load runs the same parse funnel plus Validate.
+			_, err = Load(path)
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestLoad_SchemaVersionMalformed(t *testing.T) {
+	// Non-integer values fail inside yaml.v3 during unmarshaling with the
+	// offending line identified (ADR 0127 Decision 1: reject malformed
+	// versions during parsing). Long float literals are truncated in the
+	// type error exactly as yaml.v3 truncates its own long values.
+	tests := []struct {
+		name      string
+		version   string // YAML lines appended to the harness body
+		wantLine  string
+		wantValue string // truncated float literal the type error names; empty skips the assertion
+	}{
+		{name: "string", version: "schema_version: one\n", wantLine: "line 2:"},
+		{name: "float", version: "schema_version: 1.5\n", wantLine: "line 2:"},
+		// The truncated spelling (first seven characters plus an ellipsis,
+		// backtick-quoted) cannot occur inside the untruncated literal, so
+		// its presence proves the truncation branch ran.
+		{name: "long float", version: "schema_version: 1.23456789012345\n", wantLine: "line 2:", wantValue: "`1.23456...`"},
+		{name: "mapping", version: "schema_version:\n  one: two\n", wantLine: "line 3:"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := "agent: agents/test.md\n" + tt.version
+			dir := t.TempDir()
+			path := filepath.Join(dir, "bad.yaml")
+			require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+			_, err := LoadRaw(path)
+			require.Error(t, err)
+			assert.ErrorContains(t, err, "parsing harness YAML:")
+			assert.ErrorContains(t, err, "cannot unmarshal")
+			assert.ErrorContains(t, err, tt.wantLine)
+			if tt.wantValue != "" {
+				assert.ErrorContains(t, err, tt.wantValue)
+			}
+
+			// Load funnels through parseRaw, so it fails identically.
+			_, err = Load(path)
+			require.Error(t, err)
+			assert.ErrorContains(t, err, "parsing harness YAML:")
+			assert.ErrorContains(t, err, "cannot unmarshal")
+		})
+	}
+}
+
+func TestLoad_SchemaVersionOutOfRange(t *testing.T) {
+	// Zero, negative, and unsupported versions are rejected by the
+	// parse-level check with field-named messages (ADR 0127 Decision 1).
+	tests := []struct {
+		name    string
+		version string
+		wantErr string
+	}{
+		{name: "zero", version: "schema_version: 0\n", wantErr: "schema_version must be a positive integer, got 0"},
+		{name: "negative", version: "schema_version: -1\n", wantErr: "schema_version must be a positive integer, got -1"},
+		{
+			name:    "unsupported",
+			version: "schema_version: 2\n",
+			wantErr: "schema_version 2 is not supported by this version of fullsend (maximum supported schema_version: 1)",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := "agent: agents/test.md\n" + tt.version
+			dir := t.TempDir()
+			path := filepath.Join(dir, "bad.yaml")
+			require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+			_, err := LoadRaw(path)
+			require.Error(t, err)
+			assert.ErrorContains(t, err, "parsing harness YAML:")
+			assert.ErrorContains(t, err, tt.wantErr)
+
+			_, err = Load(path)
+			require.Error(t, err)
+			assert.ErrorContains(t, err, "parsing harness YAML:")
+			assert.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+}
+
+func TestLoadWithOpts_SchemaVersionRejectedBeforeResolution(t *testing.T) {
+	// The version check runs inside parseRaw, before validateForge,
+	// forge/overlay resolution, and Validate. Stack failures for the later
+	// stages on the same harness — an unrecognized forge key and a missing
+	// agent — so if any of them ran first, its error would surface instead
+	// of the version rejection.
+	content := `schema_version: 2
+forge:
+  bogus: {}
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bad.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	_, err := LoadWithOpts(path, LoadOpts{ForgePlatform: "github"})
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "parsing harness YAML:")
+	assert.ErrorContains(t, err, "schema_version 2 is not supported by this version of fullsend")
+	assert.NotContains(t, err.Error(), "unrecognized key")        // validateForge did not run
+	assert.NotContains(t, err.Error(), "agent field is required") // Validate did not run
 }
 
 func TestValidateRunnerEnv_UnsetVar(t *testing.T) {
@@ -284,6 +508,7 @@ func TestFailModeClosed_Open(t *testing.T) {
 func TestLoad_SecurityConfig(t *testing.T) {
 	content := `
 agent: agents/test.md
+role: test
 security:
   fail_mode: open
   host_scanners:
@@ -335,7 +560,7 @@ security:
 }
 
 func TestValidate_SecurityInvalidFailMode(t *testing.T) {
-	h := &Harness{Agent: "test.md", Security: &SecurityConfig{FailMode: "invalid"}}
+	h := &Harness{Agent: "test.md", Role: "test", Security: &SecurityConfig{FailMode: "invalid"}}
 	err := h.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "fail_mode")
@@ -344,6 +569,7 @@ func TestValidate_SecurityInvalidFailMode(t *testing.T) {
 func TestValidate_SecurityInvalidLLMGuardThreshold(t *testing.T) {
 	h := &Harness{
 		Agent: "test.md",
+		Role:  "test",
 		Security: &SecurityConfig{
 			HostScanners: &HostScanners{
 				LLMGuard: &LLMGuardConfig{Threshold: 1.5},
@@ -358,6 +584,7 @@ func TestValidate_SecurityInvalidLLMGuardThreshold(t *testing.T) {
 func TestValidate_SecurityInvalidLLMGuardMatchType(t *testing.T) {
 	h := &Harness{
 		Agent: "test.md",
+		Role:  "test",
 		Security: &SecurityConfig{
 			HostScanners: &HostScanners{
 				LLMGuard: &LLMGuardConfig{MatchType: "word"},
@@ -372,6 +599,7 @@ func TestValidate_SecurityInvalidLLMGuardMatchType(t *testing.T) {
 func TestValidate_SecurityInvalidTirithFailOn(t *testing.T) {
 	h := &Harness{
 		Agent: "test.md",
+		Role:  "test",
 		Security: &SecurityConfig{
 			SandboxHooks: &SandboxHooks{
 				Tirith: &TirithConfig{FailOn: "low"},
@@ -386,6 +614,7 @@ func TestValidate_SecurityInvalidTirithFailOn(t *testing.T) {
 func TestValidate_SecurityInvalidEscalation(t *testing.T) {
 	h := &Harness{
 		Agent: "test.md",
+		Role:  "test",
 		Security: &SecurityConfig{
 			Escalation: &EscalationConfig{OnCritical: "ignore"},
 		},
@@ -398,6 +627,7 @@ func TestValidate_SecurityInvalidEscalation(t *testing.T) {
 func TestValidate_SecurityValidConfig(t *testing.T) {
 	h := &Harness{
 		Agent: "test.md",
+		Role:  "test",
 		Security: &SecurityConfig{
 			FailMode: "open",
 			HostScanners: &HostScanners{
@@ -434,6 +664,176 @@ func TestValidateRunnerEnv_PartialExpansion(t *testing.T) {
 	assert.Contains(t, err.Error(), "DEFINITELY_NOT_SET_VAR_XYZ")
 }
 
+func TestValidateRunnerEnvWith_ChecksEnvRunner(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		Env: &EnvConfig{
+			Runner: map[string]string{"KEY": "${MISSING_VAR}"},
+		},
+	}
+	lookup := func(key string) (string, bool) { return "", false }
+	err := h.ValidateRunnerEnvWith(lookup)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "MISSING_VAR")
+}
+
+func TestValidateRunnerEnvWith_ChecksEnvSandbox(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		Env: &EnvConfig{
+			Sandbox: map[string]string{"KEY": "${ALSO_MISSING}"},
+		},
+	}
+	lookup := func(key string) (string, bool) { return "", false }
+	err := h.ValidateRunnerEnvWith(lookup)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ALSO_MISSING")
+}
+
+func TestValidateRunnerEnvWith_ReportsAllMissingVars(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		HostFiles: []HostFile{
+			{Src: "${MISSING_VAR}", Dest: "/tmp/first"},
+		},
+		ValidationLoop: &ValidationLoop{
+			Schema: "${MISSING_DIR}/result.json",
+		},
+		Env: &EnvConfig{
+			Runner: map[string]string{
+				"KEY": "${MISSING_VAR}",
+			},
+			Sandbox: map[string]string{
+				"KEY":     "${ALSO_MISSING}",
+				"SET_KEY": "${SET_VAR}",
+			},
+		},
+	}
+
+	lookup := func(key string) (string, bool) {
+		if key == "SET_VAR" {
+			return "val", true
+		}
+		return "", false
+	}
+	err := h.ValidateRunnerEnvWith(lookup)
+	require.Error(t, err)
+	message := err.Error()
+	assert.Contains(t, message, "3 unresolved host variable(s):")
+
+	assert.Contains(t, message, "env.runner[KEY]")
+	assert.Contains(t, message, "env.sandbox[KEY]")
+	assert.Contains(t, message, "host_files[0].src")
+	assert.Contains(t, message, "validation_loop.schema")
+
+	assert.Contains(t, message, "ALSO_MISSING")
+	assert.Contains(t, message, "MISSING_DIR")
+	assert.Contains(t, message, "MISSING_VAR")
+	assert.NotContains(t, message, "SET_VAR")
+
+	alsoMissing := strings.Index(message, "ALSO_MISSING")
+	missingDir := strings.Index(message, "MISSING_DIR")
+	missingVar := strings.Index(message, "MISSING_VAR")
+	assert.Less(t, alsoMissing, missingDir)
+	assert.Less(t, missingDir, missingVar)
+}
+
+func TestValidateRunnerEnvWith_DoesNotPrintFieldValues(t *testing.T) {
+	const databaseUser = "agent-user"
+	h := &Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		Env: &EnvConfig{
+			Runner: map[string]string{
+				"DATABASE_URL": "postgres://" + databaseUser + "@${DB_HOST}/agent_state",
+			},
+		},
+	}
+
+	err := h.ValidateRunnerEnvWith(func(string) (string, bool) { return "", false })
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), databaseUser)
+}
+
+func TestValidateRunnerEnvWith_EnvAllSet(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		Env: &EnvConfig{
+			Runner:  map[string]string{"KEY": "${SET_VAR}"},
+			Sandbox: map[string]string{"KEY2": "literal"},
+		},
+	}
+	lookup := func(key string) (string, bool) {
+		if key == "SET_VAR" {
+			return "val", true
+		}
+		return "", false
+	}
+	err := h.ValidateRunnerEnvWith(lookup)
+	require.NoError(t, err)
+}
+
+func TestValidateRunnerEnvWith_ChecksValidationLoopSchema(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		ValidationLoop: &ValidationLoop{
+			Script: "scripts/validate.sh",
+			Schema: "${MISSING_DIR}/schemas/result.json",
+		},
+	}
+	lookup := func(key string) (string, bool) { return "", false }
+	err := h.ValidateRunnerEnvWith(lookup)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "MISSING_DIR")
+	assert.Contains(t, err.Error(), "validation_loop.schema")
+}
+
+func TestValidateRunnerEnvWith_ValidationLoopSchemaVarSet(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		ValidationLoop: &ValidationLoop{
+			Script: "scripts/validate.sh",
+			Schema: "${FULLSEND_DIR}/schemas/result.json",
+		},
+	}
+	lookup := func(key string) (string, bool) {
+		if key == "FULLSEND_DIR" {
+			return "/opt/fullsend", true
+		}
+		return "", false
+	}
+	require.NoError(t, h.ValidateRunnerEnvWith(lookup))
+}
+
+func TestValidateRunnerEnvWith_SkipsValidationLoopPreflightCheck(t *testing.T) {
+	// D9 of the preflight-check-credential-safety change: preflight_check
+	// references are validated by the allowlist scan in internal/cli
+	// (runPreflightCheck), not by this host-env validation, so an unset
+	// reference in the command is not an error at this gate.
+	h := &Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		ValidationLoop: &ValidationLoop{
+			Script:         "scripts/validate.sh",
+			PreflightCheck: "test -d ${MISSING_DIR}",
+		},
+	}
+	lookup := func(key string) (string, bool) { return "", false }
+	require.NoError(t, h.ValidateRunnerEnvWith(lookup))
+}
+
+func TestValidateRunnerEnvWith_NilEnvNoError(t *testing.T) {
+	h := &Harness{Agent: "agents/test.md", Role: "test"}
+	err := h.ValidateRunnerEnvWith(func(string) (string, bool) { return "", false })
+	require.NoError(t, err)
+}
+
 func TestValidate_AgentNameInvalid(t *testing.T) {
 	h := &Harness{Agent: "agents/test';echo hack;echo '.md"}
 	err := h.Validate()
@@ -442,7 +842,7 @@ func TestValidate_AgentNameInvalid(t *testing.T) {
 }
 
 func TestValidate_AgentNameValid(t *testing.T) {
-	h := &Harness{Agent: "agents/hello-world_v2.md"}
+	h := &Harness{Agent: "agents/hello-world_v2.md", Role: "test"}
 	require.NoError(t, h.Validate())
 }
 
@@ -460,20 +860,72 @@ func TestValidate_ModelValid(t *testing.T) {
 		"claude-sonnet-4-6@default",
 		"claude-sonnet-4-6@20250514",
 		"claude-opus-4-1@20250805",
+		"google-vertex/gemini-3.8-flash",
+		"xai-vertex/xai/grok-4.6",
+		"anthropic-vertex/claude-opus-4-6",
 	} {
-		h := &Harness{Agent: "agents/test.md", Model: model}
+		h := &Harness{Agent: "agents/test.md", Role: "test", Model: model}
 		require.NoError(t, h.Validate(), "model %q should be valid", model)
 	}
 }
 
+func TestValidate_ModelInvalid_MalformedSlash(t *testing.T) {
+	for _, model := range []string{
+		"/leading",
+		"trailing/",
+		"a//b",
+	} {
+		h := &Harness{Agent: "agents/test.md", Role: "test", Model: model}
+		err := h.Validate()
+		require.Error(t, err, "model %q should be invalid", model)
+		assert.Contains(t, err.Error(), "invalid characters")
+	}
+}
+
+func TestValidate_EffortValid(t *testing.T) {
+	for _, level := range []string{"low", "medium", "high", "xhigh", "max"} {
+		h := &Harness{Agent: "agents/test.md", Role: "test", Effort: level}
+		require.NoError(t, h.Validate(), "level %s should be valid", level)
+	}
+}
+
+func TestValidate_EffortInvalid(t *testing.T) {
+	h := &Harness{Agent: "agents/test.md", Role: "test", Effort: "ultra"}
+	err := h.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "effort")
+	assert.Contains(t, err.Error(), "not valid")
+}
+
+func TestValidate_EffortEmpty(t *testing.T) {
+	h := &Harness{Agent: "agents/test.md", Role: "test"}
+	require.NoError(t, h.Validate())
+}
+
+func TestLoad_EffortField(t *testing.T) {
+	content := `
+agent: agents/test.md
+role: test
+effort: high
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "high", h.Effort)
+}
+
 func TestValidate_PostScriptWithoutValidationLoop(t *testing.T) {
-	h := &Harness{Agent: "agents/test.md", PostScript: "scripts/post.sh"}
+	h := &Harness{Agent: "agents/test.md", Role: "test", PostScript: "scripts/post.sh"}
 	require.NoError(t, h.Validate())
 }
 
 func TestValidate_PostScriptWithValidationLoop(t *testing.T) {
 	h := &Harness{
 		Agent:      "agents/test.md",
+		Role:       "test",
 		PostScript: "scripts/post.sh",
 		ValidationLoop: &ValidationLoop{
 			Script:        "scripts/validate.sh",
@@ -484,56 +936,57 @@ func TestValidate_PostScriptWithValidationLoop(t *testing.T) {
 }
 
 func TestValidate_NegativeTimeout(t *testing.T) {
-	h := &Harness{Agent: "agents/test.md", TimeoutMinutes: -1}
+	h := &Harness{Agent: "agents/test.md", Role: "test", TimeoutMinutes: -1}
 	err := h.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "timeout_minutes must be non-negative")
 }
 
 func TestValidate_NegativeSandboxTimeout(t *testing.T) {
-	h := &Harness{Agent: "agents/test.md", SandboxTimeoutSeconds: -1}
+	h := &Harness{Agent: "agents/test.md", Role: "test", SandboxTimeoutSeconds: -1}
 	err := h.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "sandbox_timeout_seconds must be 0 (default) or between 30 and 600")
 }
 
 func TestValidate_SandboxTimeoutTooSmall(t *testing.T) {
-	h := &Harness{Agent: "agents/test.md", SandboxTimeoutSeconds: 10}
+	h := &Harness{Agent: "agents/test.md", Role: "test", SandboxTimeoutSeconds: 10}
 	err := h.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "sandbox_timeout_seconds must be 0 (default) or between 30 and 600")
 }
 
 func TestValidate_SandboxTimeoutTooLarge(t *testing.T) {
-	h := &Harness{Agent: "agents/test.md", SandboxTimeoutSeconds: 601}
+	h := &Harness{Agent: "agents/test.md", Role: "test", SandboxTimeoutSeconds: 601}
 	err := h.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "sandbox_timeout_seconds must be 0 (default) or between 30 and 600")
 }
 
 func TestValidate_SandboxTimeoutAtMin(t *testing.T) {
-	h := &Harness{Agent: "agents/test.md", SandboxTimeoutSeconds: 30}
+	h := &Harness{Agent: "agents/test.md", Role: "test", SandboxTimeoutSeconds: 30}
 	require.NoError(t, h.Validate())
 }
 
 func TestValidate_SandboxTimeoutAtMax(t *testing.T) {
-	h := &Harness{Agent: "agents/test.md", SandboxTimeoutSeconds: 600}
+	h := &Harness{Agent: "agents/test.md", Role: "test", SandboxTimeoutSeconds: 600}
 	require.NoError(t, h.Validate())
 }
 
 func TestValidate_ZeroSandboxTimeout(t *testing.T) {
-	h := &Harness{Agent: "agents/test.md", SandboxTimeoutSeconds: 0}
+	h := &Harness{Agent: "agents/test.md", Role: "test", SandboxTimeoutSeconds: 0}
 	require.NoError(t, h.Validate())
 }
 
 func TestValidate_PositiveSandboxTimeout(t *testing.T) {
-	h := &Harness{Agent: "agents/test.md", SandboxTimeoutSeconds: 180}
+	h := &Harness{Agent: "agents/test.md", Role: "test", SandboxTimeoutSeconds: 180}
 	require.NoError(t, h.Validate())
 }
 
 func TestLoad_SandboxTimeoutField(t *testing.T) {
 	content := `
 agent: agents/test.md
+role: test
 sandbox_timeout_seconds: 180
 `
 	dir := t.TempDir()
@@ -548,6 +1001,7 @@ sandbox_timeout_seconds: 180
 func TestLoad_ModelField(t *testing.T) {
 	content := `
 agent: agents/test.md
+role: test
 model: sonnet
 `
 	dir := t.TempDir()
@@ -573,7 +1027,8 @@ func TestValidateFilesExist_MissingSkill(t *testing.T) {
 
 	h := &Harness{
 		Agent:  agentFile,
-		Skills: []string{"/nonexistent/skill"},
+		Policy: writeTestPolicy(t, dir),
+		Skills: []SkillEntry{{Source: "/nonexistent/skill"}},
 	}
 	err := h.ValidateFilesExist()
 	require.Error(t, err)
@@ -586,7 +1041,8 @@ func TestValidateFilesExist_SkipsVarPaths(t *testing.T) {
 	require.NoError(t, os.WriteFile(agentFile, []byte("agent"), 0o644))
 
 	h := &Harness{
-		Agent: agentFile,
+		Agent:  agentFile,
+		Policy: writeTestPolicy(t, dir),
 		HostFiles: []HostFile{
 			{Src: "${SOME_VAR}", Dest: "/tmp/dest"},
 		},
@@ -595,10 +1051,49 @@ func TestValidateFilesExist_SkipsVarPaths(t *testing.T) {
 	require.NoError(t, h.ValidateFilesExist())
 }
 
+func TestValidateFilesExist_SkipsSchemaVarPaths(t *testing.T) {
+	dir := t.TempDir()
+	agentFile := filepath.Join(dir, "agent.md")
+	require.NoError(t, os.WriteFile(agentFile, []byte("agent"), 0o644))
+	scriptFile := filepath.Join(dir, "validate.sh")
+	require.NoError(t, os.WriteFile(scriptFile, []byte("#!/bin/bash"), 0o755))
+
+	h := &Harness{
+		Agent:  agentFile,
+		Policy: writeTestPolicy(t, dir),
+		ValidationLoop: &ValidationLoop{
+			Script: scriptFile,
+			Schema: "${FULLSEND_DIR}/schemas/result.schema.json",
+		},
+	}
+	require.NoError(t, h.ValidateFilesExist())
+}
+
+func TestValidateFilesExist_MissingSchema(t *testing.T) {
+	dir := t.TempDir()
+	agentFile := filepath.Join(dir, "agent.md")
+	require.NoError(t, os.WriteFile(agentFile, []byte("agent"), 0o644))
+	scriptFile := filepath.Join(dir, "validate.sh")
+	require.NoError(t, os.WriteFile(scriptFile, []byte("#!/bin/bash"), 0o755))
+
+	h := &Harness{
+		Agent:  agentFile,
+		Policy: writeTestPolicy(t, dir),
+		ValidationLoop: &ValidationLoop{
+			Script: scriptFile,
+			Schema: "/nonexistent/schema.json",
+		},
+	}
+	err := h.ValidateFilesExist()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "validation_loop.schema")
+}
+
 func TestValidate_PluginNameValid(t *testing.T) {
 	h := &Harness{
 		Agent:   "agents/test.md",
-		Plugins: []string{"plugins/gopls-lsp", "plugins/my_plugin-2"},
+		Role:    "test",
+		Plugins: []PluginSpec{{Path: "plugins/gopls-lsp"}, {Path: "plugins/my_plugin-2"}},
 	}
 	require.NoError(t, h.Validate())
 }
@@ -607,7 +1102,8 @@ func TestValidate_PluginNameInvalid(t *testing.T) {
 	for _, name := range []string{"my plugin", "foo;bar", "bad@name"} {
 		h := &Harness{
 			Agent:   "agents/test.md",
-			Plugins: []string{"plugins/" + name},
+			Role:    "test",
+			Plugins: []PluginSpec{{Path: "plugins/" + name}},
 		}
 		err := h.Validate()
 		require.Error(t, err, "expected error for plugin name %q", name)
@@ -618,16 +1114,17 @@ func TestValidate_PluginNameInvalid(t *testing.T) {
 func TestResolveRelativeTo_Plugins(t *testing.T) {
 	h := &Harness{
 		Agent:   "agents/test.md",
-		Plugins: []string{"plugins/gopls-lsp"},
+		Plugins: []PluginSpec{{Path: "plugins/gopls-lsp"}},
 	}
 	require.NoError(t, h.ResolveRelativeTo("/base/dir"))
-	assert.Equal(t, []string{"/base/dir/plugins/gopls-lsp"}, h.Plugins)
+	require.Len(t, h.Plugins, 1)
+	assert.Equal(t, "/base/dir/plugins/gopls-lsp", h.Plugins[0].Path)
 }
 
 func TestResolveRelativeTo_PluginTraversalRejected(t *testing.T) {
 	h := &Harness{
 		Agent:   "agents/test.md",
-		Plugins: []string{"../../etc/evil"},
+		Plugins: []PluginSpec{{Path: "../../etc/evil"}},
 	}
 	err := h.ResolveRelativeTo("/base/dir")
 	require.Error(t, err)
@@ -640,15 +1137,88 @@ func TestResolveRelativeTo_URLsUnchanged(t *testing.T) {
 	h := &Harness{
 		Agent:  agentURL,
 		Policy: "policies/readonly.yaml",
-		Skills: []string{"skills/local-skill", skillURL},
+		Skills: []SkillEntry{{Source: "skills/local-skill"}, {Source: skillURL}},
 	}
 
 	require.NoError(t, h.ResolveRelativeTo("/base/dir"))
 
 	assert.Equal(t, agentURL, h.Agent)
-	assert.Equal(t, skillURL, h.Skills[1])
+	assert.Equal(t, skillURL, h.Skills[1].Source)
 	assert.Equal(t, "/base/dir/policies/readonly.yaml", h.Policy)
-	assert.Equal(t, "/base/dir/skills/local-skill", h.Skills[0])
+	assert.Equal(t, "/base/dir/skills/local-skill", h.Skills[0].Source)
+}
+
+func TestResolveRelativeTo_Profiles(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		OpenShell: &OpenShellConfig{
+			Profiles: []string{"profiles/network.yaml"},
+		},
+	}
+
+	require.NoError(t, h.ResolveRelativeTo("/base/dir"))
+
+	assert.Equal(t, "/base/dir/profiles/network.yaml", h.OpenShellProfiles()[0])
+}
+
+func TestResolveRelativeTo_ProfilesUnchanged(t *testing.T) {
+	tests := []struct {
+		name    string
+		profile string
+	}{
+		{"absolute path", "/abs/cache/profiles/network.yaml"},
+		{"URL", "https://example.com/profiles/net.yaml#sha256=abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &Harness{
+				Agent:     "agents/test.md",
+				OpenShell: &OpenShellConfig{Profiles: []string{tt.profile}},
+			}
+			require.NoError(t, h.ResolveRelativeTo("/base/dir"))
+			assert.Equal(t, tt.profile, h.OpenShellProfiles()[0])
+		})
+	}
+}
+
+func TestResolveRelativeTo_ProfileProviderTraversalRejected(t *testing.T) {
+	tests := []struct {
+		name    string
+		harness Harness
+	}{
+		{
+			"profile traversal",
+			Harness{Agent: "agents/test.md", OpenShell: &OpenShellConfig{Profiles: []string{"../escape/profiles/net.yaml"}}},
+		},
+		{
+			"provider traversal",
+			Harness{Agent: "agents/test.md", Providers: []string{"../escape/providers/evil.yaml"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.harness.ResolveRelativeTo("/base/dir")
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "resolves outside")
+		})
+	}
+}
+
+func TestResolveRelativeTo_Providers(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		Providers: []string{
+			"providers/custom.yaml",
+			"fullsend-github",
+		},
+	}
+
+	require.NoError(t, h.ResolveRelativeTo("/base/dir"))
+
+	// File path gets resolved
+	assert.Equal(t, "/base/dir/providers/custom.yaml", h.Providers[0])
+	// Bare provider name stays unchanged
+	assert.Equal(t, "fullsend-github", h.Providers[1])
 }
 
 func TestValidateFilesExist_MissingPlugin(t *testing.T) {
@@ -658,7 +1228,8 @@ func TestValidateFilesExist_MissingPlugin(t *testing.T) {
 
 	h := &Harness{
 		Agent:   agentFile,
-		Plugins: []string{"/nonexistent/plugin"},
+		Policy:  writeTestPolicy(t, dir),
+		Plugins: []PluginSpec{{Path: "/nonexistent/plugin"}},
 	}
 	err := h.ValidateFilesExist()
 	require.Error(t, err)
@@ -671,12 +1242,67 @@ func TestValidateFilesExist_SkipsOptionalPaths(t *testing.T) {
 	require.NoError(t, os.WriteFile(agentFile, []byte("agent"), 0o644))
 
 	h := &Harness{
-		Agent: agentFile,
+		Agent:  agentFile,
+		Policy: writeTestPolicy(t, dir),
 		HostFiles: []HostFile{
 			{Src: "/tmp/does-not-exist-yet.env", Dest: "/tmp/dest", Optional: true},
 		},
 	}
 	// Should not error — optional host files may not exist until runtime.
+	require.NoError(t, h.ValidateFilesExist())
+}
+
+// --- PreflightCheck tests ---
+
+func TestLoad_ValidationLoopPreflightCheck(t *testing.T) {
+	content := `
+agent: agents/test.md
+role: test
+validation_loop:
+  script: scripts/validate.sh
+  preflight_check: "python3 -c 'import jsonschema'"
+  max_iterations: 2
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := Load(path)
+	require.NoError(t, err)
+	require.NotNil(t, h.ValidationLoop)
+	assert.Equal(t, "scripts/validate.sh", h.ValidationLoop.Script)
+	assert.Equal(t, "python3 -c 'import jsonschema'", h.ValidationLoop.PreflightCheck)
+	assert.Equal(t, 2, h.ValidationLoop.MaxIterations)
+}
+
+func TestLoad_ValidationLoopWithoutPreflightCheck(t *testing.T) {
+	content := `
+agent: agents/test.md
+role: test
+validation_loop:
+  script: scripts/validate.sh
+  max_iterations: 1
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := Load(path)
+	require.NoError(t, err)
+	require.NotNil(t, h.ValidationLoop)
+	assert.Empty(t, h.ValidationLoop.PreflightCheck)
+}
+
+func TestValidateFilesExist_BareProviderNameSkipped(t *testing.T) {
+	dir := t.TempDir()
+	agentFile := filepath.Join(dir, "agent.md")
+	require.NoError(t, os.WriteFile(agentFile, []byte("agent"), 0o644))
+
+	h := &Harness{
+		Agent:     agentFile,
+		Policy:    writeTestPolicy(t, dir),
+		Providers: []string{"fullsend-github"},
+	}
 	require.NoError(t, h.ValidateFilesExist())
 }
 
@@ -686,6 +1312,7 @@ func TestHarness_AllowedRemoteResources_Parse(t *testing.T) {
 	t.Run("with allowed_remote_resources", func(t *testing.T) {
 		content := `
 agent: agents/test.md
+role: test
 allowed_remote_resources:
   - https://example.com/skills/
   - https://cdn.example.com/policies/
@@ -702,6 +1329,7 @@ allowed_remote_resources:
 	t.Run("without allowed_remote_resources", func(t *testing.T) {
 		content := `
 agent: agents/test.md
+role: test
 `
 		dir := t.TempDir()
 		path := filepath.Join(dir, "test.yaml")
@@ -881,7 +1509,7 @@ func TestValidateResourceTypes(t *testing.T) {
 		h := &Harness{
 			Agent:      "agents/test.md",
 			Policy:     "policies/readonly.yaml",
-			Skills:     []string{"skills/summarize"},
+			Skills:     []SkillEntry{{Source: "skills/summarize"}},
 			PreScript:  "scripts/pre.sh",
 			PostScript: "scripts/post.sh",
 			HostFiles:  []HostFile{{Src: "/etc/ssl/certs/ca.crt", Dest: "/tmp/ca.crt"}},
@@ -897,7 +1525,7 @@ func TestValidateResourceTypes(t *testing.T) {
 	t.Run("URL in skills without hash", func(t *testing.T) {
 		h := &Harness{
 			Agent:  "agents/test.md",
-			Skills: []string{"https://example.com/skills/summarize.md"},
+			Skills: []SkillEntry{{Source: "https://example.com/skills/summarize.md"}},
 		}
 		err := h.ValidateResourceTypes()
 		require.Error(t, err)
@@ -950,6 +1578,32 @@ func TestValidateResourceTypes(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "agent_input must be a local path")
 	})
+
+	t.Run("URL in validation_loop.schema", func(t *testing.T) {
+		h := &Harness{
+			Agent: "agents/test.md",
+			ValidationLoop: &ValidationLoop{
+				Script:        "scripts/validate.sh",
+				Schema:        "https://example.com/schemas/result.json",
+				MaxIterations: 1,
+			},
+		}
+		err := h.ValidateResourceTypes()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "validation_loop.schema must be a local path")
+	})
+
+	t.Run("local validation_loop.schema accepted", func(t *testing.T) {
+		h := &Harness{
+			Agent: "agents/test.md",
+			ValidationLoop: &ValidationLoop{
+				Script:        "scripts/validate.sh",
+				Schema:        "schemas/result.schema.json",
+				MaxIterations: 1,
+			},
+		}
+		require.NoError(t, h.ValidateResourceTypes())
+	})
 }
 
 func TestHasURLReferences(t *testing.T) {
@@ -960,7 +1614,7 @@ func TestHasURLReferences(t *testing.T) {
 	}{
 		{
 			name: "local only",
-			h:    Harness{Agent: "agents/test.md", Policy: "policies/p.yaml", Skills: []string{"skills/a"}},
+			h:    Harness{Agent: "agents/test.md", Policy: "policies/p.yaml", Skills: []SkillEntry{{Source: "skills/a"}}},
 			want: false,
 		},
 		{
@@ -980,8 +1634,54 @@ func TestHasURLReferences(t *testing.T) {
 		},
 		{
 			name: "URL skill",
-			h:    Harness{Agent: "agents/test.md", Skills: []string{"skills/a", "https://example.com/s.md#sha256=abc"}},
+			h:    Harness{Agent: "agents/test.md", Skills: []SkillEntry{{Source: "skills/a"}, {Source: "https://example.com/s.md#sha256=abc"}}},
 			want: true,
+		},
+		{
+			name: "URL profile",
+			h:    Harness{Agent: "agents/test.md", OpenShell: &OpenShellConfig{Profiles: []string{"https://example.com/p.yaml#sha256=abc"}}},
+			want: true,
+		},
+		{
+			name: "URL plugin",
+			h:    Harness{Agent: "agents/test.md", Plugins: []PluginSpec{{Path: "https://github.com/org/repo/tree/main/plugins/gopls-lsp#sha256=abc"}}},
+			want: true,
+		},
+		{
+			name: "local plugin only",
+			h:    Harness{Agent: "agents/test.md", Plugins: []PluginSpec{{Path: "gopls-lsp"}}},
+			want: false,
+		},
+		{
+			name: "URL provider",
+			h:    Harness{Agent: "agents/test.md", Providers: []string{"https://example.com/prov.yaml#sha256=abc"}},
+			want: true,
+		},
+		{
+			name: "local provider only",
+			h:    Harness{Agent: "agents/test.md", Providers: []string{"my-provider"}},
+			want: false,
+		},
+		{
+			name: "local profile only",
+			h:    Harness{Agent: "agents/test.md", OpenShell: &OpenShellConfig{Profiles: []string{"/cache/profiles/net.yaml"}}},
+			want: false,
+		},
+		{
+			name: "URL skill override value",
+			h: Harness{Agent: "agents/test.md", Skills: []SkillEntry{{
+				Source:    "skills/pr-review",
+				Overrides: map[string]*string{"sub-agents/x.md": strPtr("https://example.com/x.md#sha256=abc")},
+			}}},
+			want: true,
+		},
+		{
+			name: "local skill override value",
+			h: Harness{Agent: "agents/test.md", Skills: []SkillEntry{{
+				Source:    "skills/pr-review",
+				Overrides: map[string]*string{"sub-agents/x.md": strPtr("local/override.md")},
+			}}},
+			want: false,
 		},
 	}
 	for _, tt := range tests {
@@ -1072,4 +1772,1005 @@ func TestMatchingAllowedPrefix(t *testing.T) {
 		}
 		assert.Equal(t, "https://Example.Com/Skills/", h2.MatchingAllowedPrefix("https://example.com/skills/test.md"))
 	})
+}
+
+// --- Role and slug field tests ---
+
+func TestLoad_RoleAndSlug(t *testing.T) {
+	content := `
+agent: agents/triage.md
+role: triage
+slug: fullsend-ai-triage
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "triage.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "triage", h.Role)
+	assert.Equal(t, "fullsend-ai-triage", h.Slug)
+}
+
+func TestLoad_RoleMissing(t *testing.T) {
+	content := `
+agent: agents/test.md
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "role field is required")
+}
+
+func TestValidate_RoleValid(t *testing.T) {
+	for _, role := range []string{"triage", "code-reviewer", "bug_triage", "a"} {
+		h := &Harness{Agent: "agents/test.md", Role: role}
+		require.NoError(t, h.Validate(), "role %q should be valid", role)
+	}
+}
+
+func TestValidate_RoleInvalid(t *testing.T) {
+	for _, role := range []string{"Triage", "1role", "role!"} {
+		h := &Harness{Agent: "agents/test.md", Role: role}
+		err := h.Validate()
+		require.Error(t, err, "role %q should be invalid", role)
+		assert.Contains(t, err.Error(), "contains invalid characters")
+	}
+}
+
+func TestValidate_RoleDoubleHyphen(t *testing.T) {
+	h := &Harness{Agent: "agents/test.md", Role: "my--role"}
+	err := h.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "double hyphens")
+}
+
+func TestValidate_SlugValid(t *testing.T) {
+	for _, slug := range []string{"fullsend-ai-triage", "Custom_App", "a1"} {
+		h := &Harness{Agent: "agents/test.md", Role: "test", Slug: slug}
+		require.NoError(t, h.Validate(), "slug %q should be valid", slug)
+	}
+}
+
+func TestValidate_SlugInvalid(t *testing.T) {
+	for _, slug := range []string{"-slug", "slug!name", "my slug"} {
+		h := &Harness{Agent: "agents/test.md", Role: "test", Slug: slug}
+		err := h.Validate()
+		require.Error(t, err, "slug %q should be invalid", slug)
+		assert.Contains(t, err.Error(), "slug")
+	}
+}
+
+// --- LoadRaw tests ---
+
+func TestLoadRaw_ReturnsUnvalidatedHarness(t *testing.T) {
+	// LoadRaw should not call Validate(), so a harness missing the required
+	// 'agent' field should load without error.
+	content := `
+skills:
+  - skills/a
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := LoadRaw(path)
+	require.NoError(t, err)
+	assert.Empty(t, h.Agent)
+	assert.Equal(t, []string{"skills/a"}, SkillSources(h.Skills))
+}
+
+func TestLoadRaw_PreservesForgeMap(t *testing.T) {
+	content := `
+agent: agents/test.md
+forge:
+  github:
+    pre_script: scripts/pre-gh.sh
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := LoadRaw(path)
+	require.NoError(t, err)
+	require.NotNil(t, h.Forge)
+	require.Contains(t, h.Forge, "github")
+	assert.Equal(t, "scripts/pre-gh.sh", h.Forge["github"].PreScript)
+}
+
+func TestLoadRaw_FileNotFound(t *testing.T) {
+	_, err := LoadRaw("/nonexistent/harness.yaml")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reading harness file")
+}
+
+// --- LoadWithOpts tests ---
+
+func TestLoadWithOpts_AppliesForgeResolution(t *testing.T) {
+	content := `
+agent: agents/test.md
+role: test
+pre_script: scripts/pre-common.sh
+skills:
+  - skills/common
+forge:
+  github:
+    pre_script: scripts/pre-gh.sh
+    skills:
+      - skills/gh-specific
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := LoadWithOpts(path, LoadOpts{ForgePlatform: "github"})
+	require.NoError(t, err)
+	assert.Equal(t, "scripts/pre-gh.sh", h.PreScript)
+	assert.Equal(t, []string{"skills/common", "skills/gh-specific"}, SkillSources(h.Skills))
+	assert.Nil(t, h.Forge, "forge map should be consumed after ResolveForge")
+}
+
+func TestLoadWithOpts_NoForge_SameAsLoad(t *testing.T) {
+	content := `
+agent: agents/test.md
+role: test
+pre_script: scripts/pre.sh
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := LoadWithOpts(path, LoadOpts{})
+	require.NoError(t, err)
+	assert.Equal(t, "scripts/pre.sh", h.PreScript)
+}
+
+func TestLoadWithOpts_EmptyPlatform_PreservesForge(t *testing.T) {
+	content := `
+agent: agents/test.md
+role: test
+forge:
+  github:
+    pre_script: scripts/pre-gh.sh
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := LoadWithOpts(path, LoadOpts{ForgePlatform: ""})
+	require.NoError(t, err)
+	assert.NotNil(t, h.Forge, "forge map should be preserved when platform is empty")
+}
+
+func TestLoadWithOpts_InvalidPlatform(t *testing.T) {
+	content := `
+agent: agents/test.md
+role: test
+forge:
+  github:
+    pre_script: scripts/pre-gh.sh
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	_, err := LoadWithOpts(path, LoadOpts{ForgePlatform: "bitbucket"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not valid")
+}
+
+func TestLoadWithOpts_ValidationAfterForge(t *testing.T) {
+	// A harness with a forge override that produces valid state should pass.
+	// The validation_loop in the forge block replaces the top-level one.
+	content := `
+agent: agents/test.md
+role: test
+forge:
+  github:
+    validation_loop:
+      script: scripts/validate-gh.sh
+      max_iterations: 2
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := LoadWithOpts(path, LoadOpts{ForgePlatform: "github"})
+	require.NoError(t, err)
+	require.NotNil(t, h.ValidationLoop)
+	assert.Equal(t, "scripts/validate-gh.sh", h.ValidationLoop.Script)
+}
+
+func TestLoadWithOpts_ForgePartialValidationLoopInheritsScript(t *testing.T) {
+	content := `
+agent: agents/test.md
+role: test
+validation_loop:
+  script: scripts/validate.sh
+  max_iterations: 5
+  feedback_mode: append
+  schema: schemas/base.json
+forge:
+  github:
+    validation_loop:
+      schema: schemas/gh.json
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := LoadWithOpts(path, LoadOpts{ForgePlatform: "github"})
+	require.NoError(t, err)
+	require.NotNil(t, h.ValidationLoop)
+	assert.Equal(t, "scripts/validate.sh", h.ValidationLoop.Script)
+	assert.Equal(t, "schemas/gh.json", h.ValidationLoop.Schema)
+	assert.Equal(t, 5, h.ValidationLoop.MaxIterations)
+	assert.Equal(t, "append", h.ValidationLoop.FeedbackMode)
+}
+
+func TestLoadWithOpts_ForgePartialValidationLoopRejectsWithoutTopScript(t *testing.T) {
+	content := `
+agent: agents/test.md
+role: test
+forge:
+  github:
+    validation_loop:
+      schema: schemas/gh.json
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	_, err := LoadWithOpts(path, LoadOpts{ForgePlatform: "github"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "validation_loop.script is required")
+}
+
+func TestLoadWithOpts_OverlayPartialValidationLoopRejectsWithoutTopScript(t *testing.T) {
+	content := `
+agent: agents/test.md
+role: test
+overlays:
+- when: 'runtime.forge == "github"'
+  validation_loop:
+    schema: schemas/gh.json
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	_, err := LoadWithOpts(path, LoadOpts{ForgePlatform: "github"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "validation_loop.script is required")
+}
+
+func TestLoadWithOpts_OverlayPartialValidationLoopInheritsScript(t *testing.T) {
+	content := `
+agent: agents/test.md
+role: test
+validation_loop:
+  script: scripts/validate.sh
+  max_iterations: 5
+  feedback_mode: append
+  schema: schemas/base.json
+overlays:
+- when: 'runtime.forge == "github"'
+  validation_loop:
+    schema: schemas/gh.json
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := LoadWithOpts(path, LoadOpts{ForgePlatform: "github"})
+	require.NoError(t, err)
+	require.NotNil(t, h.ValidationLoop)
+	assert.Equal(t, "scripts/validate.sh", h.ValidationLoop.Script)
+	assert.Equal(t, "schemas/gh.json", h.ValidationLoop.Schema)
+	assert.Equal(t, 5, h.ValidationLoop.MaxIterations)
+	assert.Equal(t, "append", h.ValidationLoop.FeedbackMode)
+}
+
+func TestLoadWithOpts_PlatformNotConfigured(t *testing.T) {
+	content := `
+agent: agents/test.md
+role: test
+forge:
+  github:
+    pre_script: scripts/pre-gh.sh
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	_, err := LoadWithOpts(path, LoadOpts{ForgePlatform: "gitlab"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not configured")
+}
+
+// --- Runtime fetch field tests ---
+
+func TestValidate_AllowRuntimeFetchWithoutAllowedResources(t *testing.T) {
+	h := &Harness{
+		Agent:             "agents/code.md",
+		Role:              "test",
+		AllowRuntimeFetch: true,
+	}
+	err := h.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "allow_runtime_fetch requires at least one entry in allowed_remote_resources")
+}
+
+func TestValidate_MaxRuntimeFetchesWithoutAllowRuntimeFetch(t *testing.T) {
+	v := 5
+	h := &Harness{
+		Agent:             "agents/code.md",
+		Role:              "test",
+		MaxRuntimeFetches: &v,
+	}
+	err := h.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "max_runtime_fetches requires allow_runtime_fetch to be true")
+}
+
+func TestValidate_MaxRuntimeFetchesNegative(t *testing.T) {
+	v := -1
+	h := &Harness{
+		Agent:                  "agents/code.md",
+		Role:                   "test",
+		AllowRuntimeFetch:      true,
+		AllowedRemoteResources: []string{"https://github.com/fullsend-ai/library/"},
+		MaxRuntimeFetches:      &v,
+	}
+	err := h.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "max_runtime_fetches must be between 1 and 1000")
+}
+
+func TestValidate_MaxRuntimeFetchesExceedsUpperBound(t *testing.T) {
+	v := 1001
+	h := &Harness{
+		Agent:                  "agents/code.md",
+		Role:                   "test",
+		AllowRuntimeFetch:      true,
+		AllowedRemoteResources: []string{"https://github.com/fullsend-ai/library/"},
+		MaxRuntimeFetches:      &v,
+	}
+	err := h.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "max_runtime_fetches must be between 1 and 1000")
+}
+
+func TestValidate_AllowRuntimeFetchValid(t *testing.T) {
+	v := 5
+	h := &Harness{
+		Agent:                  "agents/code.md",
+		Role:                   "test",
+		AllowRuntimeFetch:      true,
+		MaxRuntimeFetches:      &v,
+		AllowedRemoteResources: []string{"https://github.com/fullsend-ai/library/"},
+	}
+	err := h.Validate()
+	require.NoError(t, err)
+}
+
+func TestValidate_AllowRuntimeFetchDefaultMaxFetches(t *testing.T) {
+	h := &Harness{
+		Agent:                  "agents/code.md",
+		Role:                   "test",
+		AllowRuntimeFetch:      true,
+		AllowedRemoteResources: []string{"https://github.com/fullsend-ai/library/"},
+	}
+	err := h.Validate()
+	require.NoError(t, err)
+	assert.Nil(t, h.MaxRuntimeFetches)
+	assert.Equal(t, 10, h.EffectiveMaxRuntimeFetches())
+}
+
+func TestValidate_MaxRuntimeFetchesExplicitZero(t *testing.T) {
+	v := 0
+	h := &Harness{
+		Agent:                  "agents/code.md",
+		Role:                   "test",
+		AllowRuntimeFetch:      true,
+		AllowedRemoteResources: []string{"https://github.com/fullsend-ai/library/"},
+		MaxRuntimeFetches:      &v,
+	}
+	err := h.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "max_runtime_fetches must be between 1 and 1000")
+}
+
+func TestLoad_RuntimeFetchFields(t *testing.T) {
+	content := `
+agent: agents/code.md
+role: test
+allowed_remote_resources:
+  - https://github.com/fullsend-ai/library/
+allow_runtime_fetch: true
+max_runtime_fetches: 15
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fetch.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := Load(path)
+	require.NoError(t, err)
+
+	assert.True(t, h.AllowRuntimeFetch)
+	require.NotNil(t, h.MaxRuntimeFetches)
+	assert.Equal(t, 15, *h.MaxRuntimeFetches)
+	assert.Equal(t, 15, h.EffectiveMaxRuntimeFetches())
+}
+
+func TestLoad_RuntimeFetchFieldsOmitted(t *testing.T) {
+	content := `
+agent: agents/code.md
+role: test
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "minimal.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := Load(path)
+	require.NoError(t, err)
+
+	assert.False(t, h.AllowRuntimeFetch)
+	assert.Nil(t, h.MaxRuntimeFetches)
+}
+
+func TestLoad_ReadonlyRepoField(t *testing.T) {
+	content := `
+agent: agents/review.md
+readonly_repo: true
+role: review
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := Load(path)
+	require.NoError(t, err)
+	assert.True(t, h.RepoReadonly())
+}
+
+func TestLoad_ReadonlyRepoFieldOmitted(t *testing.T) {
+	content := `
+agent: agents/code.md
+role: code
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := Load(path)
+	require.NoError(t, err)
+	assert.False(t, h.RepoReadonly())
+}
+
+// --- ValidForgePlatform tests ---
+
+func TestValidForgePlatform(t *testing.T) {
+	assert.True(t, ValidForgePlatform("github"))
+	assert.True(t, ValidForgePlatform("gitlab"))
+	assert.True(t, ValidForgePlatform("jira"))
+	assert.False(t, ValidForgePlatform("bitbucket"))
+	assert.False(t, ValidForgePlatform(""))
+}
+
+func TestEnvConfig_ParsesFromYAML(t *testing.T) {
+	yaml := `
+agent: agents/test.md
+role: test
+env:
+  runner:
+    FOO: bar
+  sandbox:
+    BAZ: qux
+`
+	h, err := parseRaw([]byte(yaml))
+	require.NoError(t, err)
+	require.NotNil(t, h.Env)
+	assert.Equal(t, map[string]string{"FOO": "bar"}, h.Env.Runner)
+	assert.Equal(t, map[string]string{"BAZ": "qux"}, h.Env.Sandbox)
+}
+
+func TestValidateResourceTypes_ProfilesRequireURL(t *testing.T) {
+	// Profiles can now be local paths (resolved from base composition) or URLs with hashes.
+	// This test verifies that local profile paths are accepted.
+	h := &Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		OpenShell: &OpenShellConfig{
+			Profiles: []string{"local-path/profile.yaml"},
+		},
+	}
+	err := h.ValidateResourceTypes()
+	require.NoError(t, err)
+}
+
+func TestValidateResourceTypes_ProfilesRequireIntegrityHash(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		OpenShell: &OpenShellConfig{
+			Profiles: []string{"https://github.com/org/repo/tree/main/profiles/claude-code.yaml"},
+		},
+	}
+	err := h.ValidateResourceTypes()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "openshell.profiles[0] URL must include #sha256=")
+}
+
+func TestValidateResourceTypes_ProfilesValidURL(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		OpenShell: &OpenShellConfig{
+			Profiles: []string{
+				"https://github.com/org/repo/tree/main/profiles/claude-code.yaml#sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			},
+		},
+	}
+	err := h.ValidateResourceTypes()
+	require.NoError(t, err)
+}
+
+func TestValidateResourceTypes_ProfilesRequireYAMLExtension(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		OpenShell: &OpenShellConfig{
+			Profiles: []string{"profiles/mycustomprofile"},
+		},
+	}
+	err := h.ValidateResourceTypes()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must have a .yaml or .yml extension")
+}
+
+func TestValidateResourceTypes_ProfilesYMLExtensionAccepted(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		OpenShell: &OpenShellConfig{
+			Profiles: []string{"profiles/mycustomprofile.yml"},
+		},
+	}
+	err := h.ValidateResourceTypes()
+	require.NoError(t, err)
+}
+
+func TestValidateResourceTypes_ProviderURLRequiresHash(t *testing.T) {
+	h := &Harness{
+		Agent:     "agents/test.md",
+		Role:      "test",
+		Providers: []string{"https://github.com/org/repo/tree/main/providers/my.yaml"},
+	}
+	err := h.ValidateResourceTypes()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "providers[0] URL must include #sha256=")
+}
+
+func TestValidateResourceTypes_ProviderLocalNamePassesThrough(t *testing.T) {
+	h := &Harness{
+		Agent:     "agents/test.md",
+		Role:      "test",
+		Providers: []string{"my-local-provider"},
+	}
+	err := h.ValidateResourceTypes()
+	require.NoError(t, err)
+}
+
+func TestValidateResourceTypes_ProviderURLWithHashValid(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		Providers: []string{
+			"https://github.com/org/repo/tree/main/providers/my.yaml#sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		},
+	}
+	err := h.ValidateResourceTypes()
+	require.NoError(t, err)
+}
+
+func TestValidateResourceTypes_OverrideURLRequiresHash(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		Skills: []SkillEntry{
+			{
+				Source: "skills/pr-review",
+				Overrides: map[string]*string{
+					"sub-agents/security.md": strPtr("https://github.com/org/repo/blob/main/overrides/security.md"),
+				},
+			},
+		},
+	}
+	err := h.ValidateResourceTypes()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "skills[0].overrides[sub-agents/security.md] URL must include #sha256=")
+}
+
+func TestValidateResourceTypes_OverrideURLWithHashValid(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		Skills: []SkillEntry{
+			{
+				Source: "skills/pr-review",
+				Overrides: map[string]*string{
+					"sub-agents/security.md": strPtr("https://github.com/org/repo/blob/main/overrides/security.md#sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+				},
+			},
+		},
+	}
+	err := h.ValidateResourceTypes()
+	require.NoError(t, err)
+}
+
+func TestValidateResourceTypes_PluginURLRequiresHash(t *testing.T) {
+	h := &Harness{
+		Agent:   "agents/test.md",
+		Role:    "test",
+		Plugins: []PluginSpec{{Path: "https://github.com/org/repo/tree/main/plugins/gopls-lsp"}},
+	}
+	err := h.ValidateResourceTypes()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "plugins[0] URL must include #sha256=")
+}
+
+func TestValidateResourceTypes_PluginLocalNamePassesThrough(t *testing.T) {
+	h := &Harness{
+		Agent:   "agents/test.md",
+		Role:    "test",
+		Plugins: []PluginSpec{{Path: "gopls-lsp"}},
+	}
+	err := h.ValidateResourceTypes()
+	require.NoError(t, err)
+}
+
+func TestValidateResourceTypes_PluginURLWithHashValid(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		Plugins: []PluginSpec{
+			{Path: "https://github.com/org/repo/tree/main/plugins/gopls-lsp#sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		},
+	}
+	err := h.ValidateResourceTypes()
+	require.NoError(t, err)
+}
+
+func TestValidateResourceTypes_PluginNonForgeURLRejected(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		Plugins: []PluginSpec{
+			{Path: "https://example.com/plugins/gopls-lsp#sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		},
+	}
+	err := h.ValidateResourceTypes()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "plugins[0] URL must be hosted on a supported forge")
+}
+
+func TestValidateResourceTypes_PluginNonGitHubForgeRejected(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		Plugins: []PluginSpec{
+			{Path: "https://gitlab.com/org/repo/-/tree/main/plugins/gopls-lsp#sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		},
+	}
+	err := h.ValidateResourceTypes()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "plugins[0] forge \"gitlab\" is recognized but fetch support has not landed yet")
+}
+
+func TestValidateResourceTypes_SkillBlobURLRejected(t *testing.T) {
+	h := &Harness{
+		Agent:  "agents/test.md",
+		Role:   "test",
+		Skills: []SkillEntry{{Source: "https://github.com/org/repo/blob/main/skills/test/SKILL.md#sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
+	}
+	err := h.ValidateResourceTypes()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "skills[0] URL must use /tree/ (directory), not /blob/ (single file)")
+}
+
+func TestValidateResourceTypes_PluginBlobURLRejected(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		Plugins: []PluginSpec{
+			{Path: "https://github.com/org/repo/blob/main/plugins/gopls-lsp/init.sh#sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		},
+	}
+	err := h.ValidateResourceTypes()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "plugins[0] URL must use /tree/ (directory), not /blob/ (single file)")
+}
+
+func TestValidateResourceTypes_SkillRepoRootURLRejected(t *testing.T) {
+	h := &Harness{
+		Agent:  "agents/test.md",
+		Role:   "test",
+		Skills: []SkillEntry{{Source: "https://github.com/org/myskills/tree/main#sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
+	}
+	err := h.ValidateResourceTypes()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "skills[0] URL must point to a directory inside the repo, not the repo root")
+}
+
+func TestValidateResourceTypes_PluginRepoRootURLRejected(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		Plugins: []PluginSpec{
+			{Path: "https://github.com/org/myplugin/tree/main#sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		},
+	}
+	err := h.ValidateResourceTypes()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "plugins[0] URL must point to a directory inside the repo, not the repo root")
+}
+
+func TestLoad_PluginURLPassesValidation(t *testing.T) {
+	content := `
+agent: agents/test.md
+role: test
+plugins:
+  - gopls-lsp
+  - "https://github.com/org/repo/tree/main/plugins/my-plugin#sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := Load(path)
+	require.NoError(t, err, "Load must not reject URL plugins via validPluginName")
+	assert.Len(t, h.Plugins, 2)
+}
+
+func TestLoad_ProviderURLPassesValidation(t *testing.T) {
+	content := `
+agent: agents/test.md
+role: test
+providers:
+  - local-only
+  - "https://github.com/org/repo/tree/main/providers/my.yaml#sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := Load(path)
+	require.NoError(t, err, "Load must not reject URL providers via validProviderName")
+	assert.Len(t, h.Providers, 2)
+}
+
+func TestHasURLDirResources(t *testing.T) {
+	tests := []struct {
+		name    string
+		skills  []SkillEntry
+		plugins []string
+		want    bool
+	}{
+		{"no URLs", []SkillEntry{{Source: "local-skill"}}, []string{"local-plugin"}, false},
+		{"URL skill", []SkillEntry{{Source: "https://github.com/org/repo/tree/main/skill#sha256=abc"}}, nil, true},
+		{"URL plugin", nil, []string{"https://github.com/org/repo/tree/main/plugin#sha256=abc"}, true},
+		{"both local", []SkillEntry{{Source: "s1"}}, []string{"p1"}, false},
+		{"empty", nil, nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plugins := make([]PluginSpec, 0, len(tt.plugins))
+			for _, p := range tt.plugins {
+				plugins = append(plugins, PluginSpec{Path: p})
+			}
+			h := &Harness{Skills: tt.skills, Plugins: plugins}
+			assert.Equal(t, tt.want, h.HasURLDirResources())
+		})
+	}
+}
+
+func TestLoadWithOpts_OverlayResolution(t *testing.T) {
+	content := `
+agent: agents/test.md
+role: fix
+overlays:
+- when: 'event.source.system == "github"'
+  pre_script: scripts/gh.sh
+- when: 'event.source.system == "jira"'
+  pre_script: scripts/jira.sh
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := LoadWithOpts(path, LoadOpts{
+		Event: map[string]any{"source": map[string]any{"system": "github"}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "scripts/gh.sh", h.PreScript)
+	assert.Nil(t, h.Overlays)
+}
+
+func TestLoadWithOpts_OverlayNoEvent(t *testing.T) {
+	content := `
+agent: agents/test.md
+role: fix
+pre_script: scripts/common.sh
+overlays:
+- when: 'runtime.forge == "github"'
+  pre_script: scripts/gh.sh
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := LoadWithOpts(path, LoadOpts{ForgePlatform: "github"})
+	require.NoError(t, err)
+	// Overlays can match on runtime.forge even when event is nil (ADR 0088).
+	assert.Equal(t, "scripts/gh.sh", h.PreScript)
+	assert.Nil(t, h.Overlays, "overlays should be consumed after resolution")
+}
+
+func TestLoadWithOpts_OverlayAndForgeReject(t *testing.T) {
+	content := `
+agent: agents/test.md
+role: fix
+forge:
+  github:
+    pre_script: scripts/gh.sh
+overlays:
+- when: 'event.source.system == "github"'
+  pre_script: scripts/gh2.sh
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	_, err := LoadWithOpts(path, LoadOpts{
+		Event: map[string]any{"source": map[string]any{"system": "github"}},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "forge and overlays cannot coexist")
+}
+
+func TestLoadWithOpts_OverlayWithRuntimeForge(t *testing.T) {
+	content := `
+agent: agents/test.md
+role: fix
+overlays:
+- when: 'runtime.forge == "github"'
+  pre_script: scripts/gh.sh
+- when: 'runtime.forge == "gitlab"'
+  pre_script: scripts/gl.sh
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := LoadWithOpts(path, LoadOpts{
+		ForgePlatform: "github",
+		Event:         map[string]any{"source": map[string]any{"system": "jira"}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "scripts/gh.sh", h.PreScript)
+}
+
+func TestLoadWithOpts_OverlayWithConfig(t *testing.T) {
+	content := `
+agent: agents/test.md
+role: fix
+overlays:
+- when: 'has(config.tracker) && has(config.tracker.jira)'
+  pre_script: scripts/jira.sh
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := LoadWithOpts(path, LoadOpts{
+		Event:  map[string]any{"source": map[string]any{"system": "jira"}},
+		Config: map[string]any{"tracker": map[string]any{"jira": map[string]any{}}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "scripts/jira.sh", h.PreScript)
+}
+
+func TestLoadWithOpts_ForgeDeprecationWarningAfterResolve(t *testing.T) {
+	// Verify that the forge deprecation warning is reachable even after
+	// ResolveForge nils out h.Forge (the hadForgeBeforeResolve flag).
+	content := `
+agent: agents/test.md
+role: fix
+forge:
+  github:
+    pre_script: scripts/gh.sh
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := LoadWithOpts(path, LoadOpts{
+		ForgePlatform: "github",
+	})
+	require.NoError(t, err)
+	// forge should have been resolved (nilled)
+	assert.Nil(t, h.Forge)
+	assert.Equal(t, "scripts/gh.sh", h.PreScript)
+
+	// Lint should still emit the deprecation warning
+	diags := h.Lint()
+	var found bool
+	for _, d := range diags {
+		if d.Field == "forge" && d.Severity == SeverityWarning {
+			found = true
+			assert.Contains(t, d.Message, "deprecated")
+		}
+	}
+	assert.True(t, found, "expected forge deprecation warning from Lint() after ResolveForge")
+}
+
+func TestLoadWithOpts_NoForgeNoDeprecationWarning(t *testing.T) {
+	content := `
+agent: agents/test.md
+role: fix
+overlays:
+- when: 'runtime.forge == "github"'
+  pre_script: scripts/gh.sh
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := LoadWithOpts(path, LoadOpts{
+		ForgePlatform: "github",
+		Event:         map[string]any{},
+	})
+	require.NoError(t, err)
+
+	diags := h.Lint()
+	for _, d := range diags {
+		assert.NotEqual(t, "forge", d.Field, "should not have forge deprecation warning for overlays-only harness")
+	}
+}
+
+func TestLoadWithOpts_OverlayNilEvent(t *testing.T) {
+	// Overlays conditioned on runtime.forge should still match when
+	// event is nil (CLI run/lock flows without event context).
+	content := `
+agent: agents/test.md
+role: fix
+overlays:
+- when: 'runtime.forge == "github"'
+  pre_script: scripts/gh.sh
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := LoadWithOpts(path, LoadOpts{
+		ForgePlatform: "github",
+		// Event is nil — simulates CLI flow without --event-file
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "scripts/gh.sh", h.PreScript)
+}
+
+func TestParseProviderDef(t *testing.T) {
+	def, err := ParseProviderDef([]byte("name: openai\ntype: fullsend-openai\ncredentials:\n  OPENAI_API_KEY: \"\"\n"))
+	require.NoError(t, err)
+	assert.Equal(t, "openai", def.Name)
+	assert.Equal(t, "fullsend-openai", def.Type)
+	_, err = ParseProviderDef([]byte("type: x\n"))
+	require.Error(t, err)
+	_, err = ParseProviderDef([]byte("name: bad name\ntype: x\n"))
+	require.Error(t, err)
 }
