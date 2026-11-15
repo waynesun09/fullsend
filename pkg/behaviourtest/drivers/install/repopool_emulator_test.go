@@ -41,6 +41,10 @@ func TestNewRepoPoolEmulator_CreatesMissingOrg(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, createdOrg)
 	assert.Equal(t, 2, d.Capacity())
+
+	cd, ok := d.(*composedDriver)
+	require.True(t, ok, "emulator pool is a composed driver, got %T", d)
+	assert.Nil(t, cd.alloc.orgLock, "the emulator's orgs are private: no e2e-lock bridge")
 }
 
 func TestNewRepoPoolEmulator_NeedsMintURL(t *testing.T) {
