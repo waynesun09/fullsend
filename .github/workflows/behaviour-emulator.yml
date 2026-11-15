@@ -6,6 +6,8 @@ name: behaviour-emulator
 
 on:
   pull_request:
+  push:
+    branches: [bt-f4-vm-host-once]
   workflow_dispatch:
     inputs:
       features:
@@ -29,8 +31,8 @@ env:
   # Staging the scale-up on the fork: the triage tier on pull_request.
   DEFAULT_FEATURES: >-
     features/triage/triage.feature features/dispatch/owners-auth.feature features/actors/actor-identities.feature features/dispatch/triage-prioritize-cel-route.feature features/platform/actor-authorization.feature features/dispatch/dispatch.feature
-  DEFAULT_WORKERS: "1"
-  DEFAULT_RUNNERS: "2"
+  DEFAULT_WORKERS: "6"
+  DEFAULT_RUNNERS: "12"
   # waynesun09/github-emulator ci-self-contained (integration head with the mint App seed).
   EMULATOR_REPO: waynesun09/github-emulator
   EMULATOR_REF: d27a3b7af73599747684fbcf656c168ac38b4c7e
@@ -70,6 +72,7 @@ jobs:
           EMULATOR_DIR: ${{ github.workspace }}/.emulator
           EMULATOR_PY: ${{ runner.temp }}/emu-venv/bin/python
           STATE_DIR: ${{ runner.temp }}/bt-emulator
+          EMULATOR_PROFILE: "1"
           # Read-only job token, only so the emulator can fetch public
           # github.com actions without the anonymous rate limit.
           UPSTREAM_TOKEN: ${{ github.token }}
