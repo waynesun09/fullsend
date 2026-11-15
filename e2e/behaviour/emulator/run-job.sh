@@ -141,7 +141,11 @@ if [ "$GATEWAY" = 1 ]; then
 fi
 
 # 3. fullsend's standalone mint, trusting the emulator's OIDC issuer and API.
-(cd "$ROOT/cmd/mint" && go build -o "$STATE/mint" .)
+# Built as the preview mint is deployed: status callers authenticate with
+# OIDC or as members of the $ORG/mint-status team (mint-status.feature).
+(cd "$ROOT/cmd/mint" && go build -tags github \
+  -ldflags "-X github.com/fullsend-ai/fullsend/internal/mintcore.StatusGitHubGroup=$ORG/mint-status" \
+  -o "$STATE/mint" .)
 hosts=""
 for i in $(seq -f %02g 1 "${BEHAVIOUR_POOL_SIZE:-1}"); do hosts="$hosts,$ORG/test-repo-$i,$ORG/test-repo-$i-mint-host"; done
 # The issuer exactly as the emulator writes it into tokens (it keeps an
@@ -244,6 +248,11 @@ TEST_ACTOR_TRIAGE_PAT=$(seed_actor fstest-triage triage)
 TEST_ACTOR_OUTSIDER_PAT=$(seed_actor fstest-outsider)
 for pat in "$TEST_ACTOR_WRITE_PAT" "$TEST_ACTOR_TRIAGE_PAT" "$TEST_ACTOR_OUTSIDER_PAT"; do echo "::add-mask::$pat"; done
 export TEST_ACTOR_WRITE_PAT TEST_ACTOR_TRIAGE_PAT TEST_ACTOR_OUTSIDER_PAT
+# The write actor is the only member of the mint's status team.
+code=$(api -X POST "$EMU/api/v3/orgs/$ORG/teams" -d '{"name":"mint-status","privacy":"closed"}')
+case "$code" in 201|422) ;; *) echo "::error::creating team $ORG/mint-status: HTTP $code $(head -c 300 "$STATE/api-body")"; exit 1 ;; esac
+code=$(api -X PUT "$EMU/api/v3/orgs/$ORG/teams/mint-status/memberships/fstest-write" -d '{"role":"member"}')
+[ "$code" = 200 ] || { echo "::error::fstest-write in $ORG/mint-status: HTTP $code $(head -c 300 "$STATE/api-body")"; exit 1; }
 phase actors
 
 if [ -n "${prepull_pid:-}" ]; then
