@@ -78,6 +78,14 @@ stop_all() {
 }
 trap stop_all EXIT
 
+# 0. All runners share this VM, so it becomes the sandbox host once, beside
+# the stack start, and the runners inherit OPENSHELL_GATEWAY_ENDPOINT: the
+# action then skips its per-job Podman and gateway setup, whose
+# `podman system migrate` would stop the other jobs' sandboxes.
+export OPENSHELL_GATEWAY_ENDPOINT=https://127.0.0.1:17670
+"$ROOT/e2e/behaviour/emulator/sandbox-host.sh" >"$STATE/sandbox-host.log" 2>&1 &
+sandbox_host_pid=$!
+
 # 1. Emulator + one real actions/runner over TLS on ghemu.localhost:443.
 sudo sysctl -qw net.ipv4.ip_unprivileged_port_start=80
 (
@@ -94,6 +102,13 @@ sudo sysctl -qw net.ipv4.ip_unprivileged_port_start=80
 export SSL_CERT_FILE="$STATE/stack/tls/bundle.pem" GIT_SSL_CAINFO="$STATE/stack/tls/bundle.pem"
 export CURL_CA_BUNDLE="$STATE/stack/tls/ca.pem" NODE_EXTRA_CA_CERTS="$STATE/stack/tls/ca.pem"
 phase stack
+
+if ! wait "$sandbox_host_pid"; then
+  echo "::error::sandbox host setup failed: $(tail -c 1500 "$STATE/sandbox-host.log")" >&2
+  exit 1
+fi
+tail -1 "$STATE/sandbox-host.log"
+phase sandbox-host
 
 # OpenShell's egress proxy (in the sandbox supervisor) checks upstream TLS
 # against the supervisor image's CA bundle, so trust the stack CA there.
