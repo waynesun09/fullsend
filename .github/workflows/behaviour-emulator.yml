@@ -37,7 +37,7 @@ env:
   DEFAULT_RUNNERS: "12"
   # waynesun09/github-emulator ci-self-contained (integration head with the mint App seed).
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: fda0f08e8fc81f02c00f0209af3d7bf92e9bba72
+  EMULATOR_REF: 793bcdd2122d7bfc0b551a50edd1247e938c25cc
 
 jobs:
   behaviour-emulator:
