@@ -147,13 +147,15 @@ fi
   -ldflags "-X github.com/fullsend-ai/fullsend/internal/mintcore.StatusGitHubGroup=$ORG/mint-status" \
   -o "$STATE/mint" .)
 hosts=""
+# The pool's workflow hosts, as on the preview mints (mint-status checks
+# them); the mint accepts fullsend-ai/fullsend's own workflows anyway.
 for i in $(seq -f %02g 1 "${BEHAVIOUR_POOL_SIZE:-1}"); do hosts="$hosts,$ORG/test-repo-$i,$ORG/test-repo-$i-mint-host"; done
 # The issuer exactly as the emulator writes it into tokens (it keeps an
 # explicit :443), from its discovery document.
 ISSUER=$(curl -sS "$EMU/.well-known/openid-configuration" | jq -r .issuer)
 PORT=$MINT_PORT MINT_OIDC_ISSUER_URL="$ISSUER" MINT_GITHUB_API_URL="$EMU/api/v3" \
 PEM_DIR="$STATE/pem" ROLE_APP_IDS="$(cat "$STATE/role_app_ids.json")" \
-PER_REPO_WIF_REPOS='*' ALLOWED_WORKFLOW_FILES='*' WORKFLOW_HOST_REPOS="fullsend-ai/fullsend$hosts" \
+PER_REPO_WIF_REPOS='*' ALLOWED_WORKFLOW_FILES='*' WORKFLOW_HOST_REPOS="${hosts#,}" \
   nohup "$STATE/mint" >"$STATE/mint.log" 2>&1 &
 echo $! >"$STATE/mint.pid"
 for _ in $(seq 1 50); do curl -s -o /dev/null "$MINT/" && break; sleep 0.2; done
