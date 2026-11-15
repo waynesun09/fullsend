@@ -26,11 +26,13 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Staging the scale-up on the fork: the triage tier on pull_request.
+  # Staging the scale-up on the fork: stage 2 (emulator-ready set + Jira)
+  # on pull_request, at two workers to classify scenario-level failures.
   DEFAULT_FEATURES: >-
-    features/triage/triage.feature features/dispatch/owners-auth.feature features/actors/actor-identities.feature features/dispatch/triage-prioritize-cel-route.feature features/platform/actor-authorization.feature features/dispatch/dispatch.feature
-  DEFAULT_WORKERS: "6"
-  DEFAULT_RUNNERS: "12"
+    features/actors/actor-identities.feature features/triage/triage.feature features/dispatch/base-dispatch.feature features/dispatch/dispatch.feature features/dispatch/fork-bash-routing.feature features/dispatch/fork-dispatch.feature features/dispatch/hooks-loaded.feature features/dispatch/reaction-notifications.feature features/dispatch/url-dispatch.feature features/dispatch/runner-secret-overlay-guard.feature features/dispatch/fix-authorization.feature features/dispatch/owners-auth.feature features/dispatch/retro-cel-route.feature features/dispatch/review-cel-route.feature features/dispatch/triage-prioritize-cel-route.feature features/dispatch/jira-poll-dispatch.feature features/dispatch/jira-transport-bounds.feature features/platform/actor-authorization.feature
+  DEFAULT_CAPABILITIES: runner-secret-overlay-guard
+  DEFAULT_WORKERS: "2"
+  DEFAULT_RUNNERS: "4"
   # waynesun09/github-emulator ci-self-contained (integration head with the mint App seed).
   EMULATOR_REPO: waynesun09/github-emulator
   EMULATOR_REF: e2bdf8f6f940d4bd262946ab97ea1a41e1441c5a
@@ -39,7 +41,7 @@ jobs:
   behaviour-emulator:
     name: behaviour-emulator
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    timeout-minutes: 200
     steps:
       - name: Checkout fullsend
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -76,7 +78,8 @@ jobs:
           FEATURES: ${{ inputs.features || env.DEFAULT_FEATURES }}
           WORKERS: ${{ inputs.workers || env.DEFAULT_WORKERS }}
           EMULATOR_RUNNERS: ${{ inputs.runners || env.DEFAULT_RUNNERS }}
-          SUITE_TIMEOUT: 60m
+          SUITE_TIMEOUT: 170m
+          BEHAVIOUR_CAPABILITIES: ${{ env.DEFAULT_CAPABILITIES }}
           # The run falls back to fullsend-ai/agents@main on the configured forge.
           AGENTS_SEED: "1"
         run: |
