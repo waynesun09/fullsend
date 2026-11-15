@@ -97,4 +97,5 @@ jobs:
             ${{ runner.temp }}/bt-emulator/phases.tsv
             ${{ runner.temp }}/bt-emulator/emulator-profile.json
             ${{ runner.temp }}/bt-emulator/bt-artifacts/
+            !${{ runner.temp }}/bt-emulator/stack/runner-*/_work/**
           if-no-files-found: warn
