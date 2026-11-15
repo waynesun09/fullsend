@@ -37,9 +37,9 @@ env:
   SHARD_A_FEATURES: >-
     features/dispatch/owners-auth.feature features/platform/actor-authorization.feature features/platform/bot-role-lookup.feature features/platform/mint-status.feature
   SHARD_B_FEATURES: >-
-    features/triage/triage.feature features/dispatch/dispatch.feature features/dispatch/fix-authorization.feature features/dispatch/retro-cel-route.feature features/dispatch/hooks-loaded.feature features/actors/actor-identities.feature features/dispatch/jira-poll-dispatch.feature features/dispatch/jira-transport-bounds.feature
+    features/triage/triage.feature features/dispatch/dispatch.feature features/dispatch/retro-cel-route.feature features/dispatch/hooks-loaded.feature features/actors/actor-identities.feature features/dispatch/jira-poll-dispatch.feature features/dispatch/jira-transport-bounds.feature
   SHARD_C_FEATURES: >-
-    features/dispatch/fork-bash-routing.feature features/dispatch/fork-dispatch.feature features/dispatch/url-dispatch.feature:29 features/dispatch/url-dispatch.feature:64 features/dispatch/url-dispatch.feature:100 features/dispatch/runner-secret-overlay-guard.feature
+    features/dispatch/fork-bash-routing.feature features/dispatch/fix-authorization.feature features/dispatch/fork-dispatch.feature features/dispatch/url-dispatch.feature:29 features/dispatch/url-dispatch.feature:64 features/dispatch/url-dispatch.feature:100 features/dispatch/runner-secret-overlay-guard.feature
   SHARD_D_FEATURES: >-
     features/platform/bot-actor-authorization.feature features/dispatch/triage-prioritize-cel-route.feature features/dispatch/review-cel-route.feature features/dispatch/reaction-notifications.feature
   DEFAULT_CAPABILITIES: runner-secret-overlay-guard
@@ -47,7 +47,7 @@ env:
   DEFAULT_RUNNERS: "12"
   # waynesun09/github-emulator ci-self-contained (integration head with the mint App seed).
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: c10f832ce8be93ab14563820b6a097a3086aa656
+  EMULATOR_REF: 8205b205685b0f9e2dc8a86364abc2c85ab0e810
 
 jobs:
   behaviour-emulator:
