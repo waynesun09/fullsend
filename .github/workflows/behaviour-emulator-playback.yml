@@ -30,7 +30,7 @@ env:
   # OIDC claims, the *.localhost resolver and GH_HOST on the real runner.
   # Also runner job cancellation and GraphQL Bot authors (fix eligibility).
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: 2f24c77beaf97c43ac582e3cf73e32b21a8d7506
+  EMULATOR_REF: 0eb5374bc85fc307cb248706b9d970a0497d3004
 
 jobs:
   behaviour-emulator-playback:
