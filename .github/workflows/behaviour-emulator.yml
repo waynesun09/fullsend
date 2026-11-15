@@ -26,10 +26,18 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Staging the scale-up on the fork: the emulator-ready set + Jira on
-  # pull_request, at six workers.
-  DEFAULT_FEATURES: >-
-    features/actors/actor-identities.feature features/triage/triage.feature features/dispatch/base-dispatch.feature features/dispatch/dispatch.feature features/dispatch/fork-bash-routing.feature features/dispatch/fork-dispatch.feature features/dispatch/hooks-loaded.feature features/dispatch/reaction-notifications.feature features/dispatch/url-dispatch.feature features/dispatch/runner-secret-overlay-guard.feature features/dispatch/fix-authorization.feature features/dispatch/owners-auth.feature features/dispatch/retro-cel-route.feature features/dispatch/review-cel-route.feature features/dispatch/triage-prioritize-cel-route.feature features/dispatch/jira-poll-dispatch.feature features/dispatch/jira-transport-bounds.feature features/platform/actor-authorization.feature
+  # The emulator-ready set (43 scenarios) in two shards, each on its own
+  # VM at six workers. Shard a holds the agent-heavy CEL, URL, overlay and
+  # fix scenarios; shard b the authorization, dispatch and Jira ones.
+  #
+  # Live only, not here: base-dispatch.feature (both scenarios) and
+  # url-dispatch.feature:7. They fetch a harness from raw.githubusercontent.com,
+  # which the emulator answers on a private VM address, and fullsend's fetch
+  # guard refuses private addresses by design.
+  SHARD_A_FEATURES: >-
+    features/dispatch/retro-cel-route.feature features/dispatch/triage-prioritize-cel-route.feature features/dispatch/review-cel-route.feature features/dispatch/url-dispatch.feature:29 features/dispatch/url-dispatch.feature:64 features/dispatch/url-dispatch.feature:100 features/dispatch/runner-secret-overlay-guard.feature features/dispatch/fix-authorization.feature features/dispatch/fork-dispatch.feature
+  SHARD_B_FEATURES: >-
+    features/dispatch/owners-auth.feature features/dispatch/dispatch.feature features/platform/actor-authorization.feature features/actors/actor-identities.feature features/triage/triage.feature features/dispatch/fork-bash-routing.feature features/dispatch/hooks-loaded.feature features/dispatch/reaction-notifications.feature features/dispatch/jira-poll-dispatch.feature features/dispatch/jira-transport-bounds.feature
   DEFAULT_CAPABILITIES: runner-secret-overlay-guard
   DEFAULT_WORKERS: "6"
   DEFAULT_RUNNERS: "12"
@@ -39,9 +47,14 @@ env:
 
 jobs:
   behaviour-emulator:
-    name: behaviour-emulator
+    name: behaviour-emulator (${{ matrix.shard }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        # A dispatch with explicit features runs them as one "custom" shard.
+        shard: ${{ fromJSON(inputs.features && '["custom"]' || '["a","b"]') }}
     steps:
       - name: Checkout fullsend
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -75,10 +88,10 @@ jobs:
           # Read-only job token, only so the emulator can fetch public
           # github.com actions without the anonymous rate limit.
           UPSTREAM_TOKEN: ${{ github.token }}
-          FEATURES: ${{ inputs.features || env.DEFAULT_FEATURES }}
+          FEATURES: ${{ inputs.features || (matrix.shard == 'a' && env.SHARD_A_FEATURES) || env.SHARD_B_FEATURES }}
           WORKERS: ${{ inputs.workers || env.DEFAULT_WORKERS }}
           EMULATOR_RUNNERS: ${{ inputs.runners || env.DEFAULT_RUNNERS }}
-          SUITE_TIMEOUT: 105m
+          SUITE_TIMEOUT: 40m
           BEHAVIOUR_CAPABILITIES: ${{ env.DEFAULT_CAPABILITIES }}
           # The run falls back to fullsend-ai/agents@main on the configured forge.
           AGENTS_SEED: "1"
@@ -91,7 +104,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: behaviour-emulator-logs
+          name: behaviour-emulator-logs-${{ matrix.shard }}
           path: |
             ${{ runner.temp }}/bt-emulator/**/*.log
             ${{ runner.temp }}/bt-emulator/phases.tsv
