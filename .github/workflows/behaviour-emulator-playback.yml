@@ -15,7 +15,7 @@ on:
     inputs:
       agents_prs:
         description: fullsend-ai/agents pull requests merged into the seeded agents (space-separated)
-        default: "1871 1873"
+        default: "1871 1873 2034"
 
 permissions:
   contents: read
@@ -78,8 +78,9 @@ jobs:
           # emulator runners the second waited for a runner, the first
           # finished, and both reviews ran (the second served the fix entry).
           EMULATOR_RUNNERS: "4"
-          # The host-aware agents ops scripts, until they merge.
-          AGENTS_PRS: ${{ inputs.agents_prs || '1871 1873' }}
+          # The host-aware agents ops scripts and the pre-review clone host
+          # (agents#2034), until they merge.
+          AGENTS_PRS: ${{ inputs.agents_prs || '1871 1873 2034' }}
         run: e2e/behaviour/emulator/run-job.sh
 
       - name: Upload logs
