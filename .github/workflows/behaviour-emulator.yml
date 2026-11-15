@@ -51,7 +51,11 @@ env:
   DEFAULT_RUNNERS: "12"
   # waynesun09/github-emulator ci-self-contained (integration head with the mint App seed).
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: 8205b205685b0f9e2dc8a86364abc2c85ab0e810
+  EMULATOR_REF: 667698a62f6305bcfba8f7cd14ca3b13a07fe699
+  # spike-postgres: ci-stack keeps the emulator's data in the runner's
+  # preinstalled PostgreSQL 16 instead of SQLite. run-job.sh's ci-stack start
+  # inherits it from the step environment.
+  CI_STACK_POSTGRES: "1"
 
 jobs:
   behaviour-emulator:
