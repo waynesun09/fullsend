@@ -24,10 +24,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The emulator-ready set (43 scenarios) in three shards, each on its own
-  # VM at six workers, balanced on measured scenario time (about 6000-6500
-  # worker-seconds each, so about 17 minutes of suite per shard). A 4-vCPU
-  # VM averages 60-66% CPU at six workers, so shards scale out, not up.
+  # The emulator-ready set (43 scenarios plus the 16 bot identity ones) in
+  # four shards, each on its own VM at six workers, balanced on measured
+  # scenario time (about 5600-6100 worker-seconds each, so about 17
+  # minutes of suite per shard). A 4-vCPU VM averages 60-66% CPU at six
+  # workers, so shards scale out, not up.
   #
   # Live only, not here: base-dispatch.feature (both scenarios) and
   # url-dispatch.feature:7. They fetch a harness from raw.githubusercontent.com,
@@ -36,15 +37,17 @@ env:
   SHARD_A_FEATURES: >-
     features/dispatch/owners-auth.feature features/platform/actor-authorization.feature features/platform/bot-role-lookup.feature features/platform/mint-status.feature
   SHARD_B_FEATURES: >-
-    features/triage/triage.feature features/dispatch/dispatch.feature features/dispatch/fix-authorization.feature features/dispatch/retro-cel-route.feature features/dispatch/hooks-loaded.feature features/dispatch/reaction-notifications.feature features/actors/actor-identities.feature features/dispatch/jira-poll-dispatch.feature features/dispatch/jira-transport-bounds.feature
+    features/triage/triage.feature features/dispatch/dispatch.feature features/dispatch/fix-authorization.feature features/dispatch/retro-cel-route.feature features/dispatch/hooks-loaded.feature features/actors/actor-identities.feature features/dispatch/jira-poll-dispatch.feature features/dispatch/jira-transport-bounds.feature
   SHARD_C_FEATURES: >-
-    features/dispatch/fork-bash-routing.feature features/dispatch/fork-dispatch.feature features/dispatch/url-dispatch.feature:29 features/dispatch/url-dispatch.feature:64 features/dispatch/url-dispatch.feature:100 features/dispatch/triage-prioritize-cel-route.feature features/dispatch/runner-secret-overlay-guard.feature features/dispatch/review-cel-route.feature
+    features/dispatch/fork-bash-routing.feature features/dispatch/fork-dispatch.feature features/dispatch/url-dispatch.feature:29 features/dispatch/url-dispatch.feature:64 features/dispatch/url-dispatch.feature:100 features/dispatch/runner-secret-overlay-guard.feature
+  SHARD_D_FEATURES: >-
+    features/platform/bot-actor-authorization.feature features/dispatch/triage-prioritize-cel-route.feature features/dispatch/review-cel-route.feature features/dispatch/reaction-notifications.feature
   DEFAULT_CAPABILITIES: runner-secret-overlay-guard
   DEFAULT_WORKERS: "6"
   DEFAULT_RUNNERS: "12"
   # waynesun09/github-emulator ci-self-contained (integration head with the mint App seed).
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: 36d585e930f5b32f183245c469253e6790937691
+  EMULATOR_REF: c10f832ce8be93ab14563820b6a097a3086aa656
 
 jobs:
   behaviour-emulator:
@@ -55,7 +58,7 @@ jobs:
       fail-fast: false
       matrix:
         # A dispatch with explicit features runs them as one "custom" shard.
-        shard: ${{ fromJSON(inputs.features && '["custom"]' || '["a","b","c"]') }}
+        shard: ${{ fromJSON(inputs.features && '["custom"]' || '["a","b","c","d"]') }}
     steps:
       - name: Checkout fullsend
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -89,7 +92,7 @@ jobs:
           # Read-only job token, only so the emulator can fetch public
           # github.com actions without the anonymous rate limit.
           UPSTREAM_TOKEN: ${{ github.token }}
-          FEATURES: ${{ inputs.features || (matrix.shard == 'a' && env.SHARD_A_FEATURES) || (matrix.shard == 'b' && env.SHARD_B_FEATURES) || env.SHARD_C_FEATURES }}
+          FEATURES: ${{ inputs.features || (matrix.shard == 'a' && env.SHARD_A_FEATURES) || (matrix.shard == 'b' && env.SHARD_B_FEATURES) || (matrix.shard == 'c' && env.SHARD_C_FEATURES) || env.SHARD_D_FEATURES }}
           WORKERS: ${{ inputs.workers || env.DEFAULT_WORKERS }}
           EMULATOR_RUNNERS: ${{ inputs.runners || env.DEFAULT_RUNNERS }}
           SUITE_TIMEOUT: 30m
