@@ -76,6 +76,10 @@ stop_all() {
     kill -9 "$sampler_pid" 2>/dev/null || true
     echo "VM peak: $(cat "$STATE/vm-peak.log" 2>/dev/null)"
   fi
+  if [ -n "${oslogs_pid:-}" ]; then
+    kill "$oslogs_pid" 2>/dev/null || true
+    keep_openshell_logs
+  fi
   if [ -f "$STATE/mint.pid" ]; then kill "$(cat "$STATE/mint.pid")" 2>/dev/null || true; fi
   if [ "$GATEWAY" = 1 ]; then GW_HOST=$GW_HOST GW_IP=$GW_IP "$ROOT/e2e/behaviour/emulator/gateway-stub.sh" stop "$STATE/gateway" || true; fi
   (cd "$EMULATOR_DIR" && CI_STACK_DIR="$STATE/stack" scripts/ci-stack.sh stop) >/dev/null 2>&1 || true
@@ -273,6 +277,21 @@ fi
 # (vm-samples.log, vm-peak.log), to check the concurrency fits the VM.
 "$ROOT/e2e/behaviour/emulator/sample-vm.sh" "$STATE" "$STATE/stack/emulator.pid" &
 sampler_pid=$!
+
+# The fullsend action collects each run's OpenShell logs into the agent job's
+# workspace (output/<run>/logs), which the next job on that repository wipes
+# and the upload leaves out. Copy them out every few seconds so a sandbox
+# failure can be classed from the artifact.
+keep_openshell_logs() {
+  local d
+  for d in "$STATE"/stack/runner-*/_work/*/*/output/*/logs; do
+    [ -d "$d" ] || continue
+    mkdir -p "$STATE/openshell-logs/$(basename "$(dirname "$d")")"
+    cp -Rn "$d/." "$STATE/openshell-logs/$(basename "$(dirname "$d")")/" 2>/dev/null || true
+  done
+}
+while :; do keep_openshell_logs; sleep 5; done &
+oslogs_pid=$!
 
 # 5. The suite, emulator mode.
 status=0
