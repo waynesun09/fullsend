@@ -21,9 +21,10 @@ const emulatorOrgSetupTimeout = time.Minute
 // addition: the emulator starts empty, so the pool's orgs are created
 // first when they do not exist, owned by the token's user.
 //
-// Everything else is the live code path. Slot creation, Actions-readiness
-// polling, slot GC and the rate-limit gate run unchanged; on a fresh
-// emulator the GC finds nothing and the gate never sees a limit.
+// The emulator's orgs belong to this suite alone, so the shared e2e-lock
+// bridge to legacy runners is left out (PoolConfig.PrivateOrgs).
+// Everything else is the live code path: slot creation, Actions-readiness
+// polling, slot GC and the rate-limit gate run unchanged.
 func NewRepoPoolEmulator(pool PoolConfig) (Driver, error) {
 	if err := pool.validate(); err != nil {
 		return nil, fmt.Errorf("emulator factory: %w", err)
@@ -52,6 +53,7 @@ func NewRepoPoolEmulator(pool PoolConfig) (Driver, error) {
 	opts := common.DefaultGitHubSetupOpts()
 	opts.ConfigPreset = envConfigPreset()
 	opts.AppSet = envAppSet()
+	pool.PrivateOrgs = true
 	return buildPoolDriver(pool, nil, newMint, opts, traceStart{})
 }
 
