@@ -11,8 +11,13 @@
 #   EMULATOR_PY    python with its requirements.txt installed       [required]
 #   STATE_DIR      logs and state (default $RUNNER_TEMP/bt-emulator)
 #   UPSTREAM_TOKEN optional token the emulator uses to fetch github.com actions
-#   BT_SUITE       behaviour (default; runs the features given) or playback
-#                  (the @playback suite, -tags playback)
+#   BT_SUITE       behaviour (default; runs the features given), playback
+#                  (the @playback suite, -tags playback) or agents (the
+#                  agents repository's own suite, `make behaviour-test` in
+#                  AGENTS_DIR against this checkout)
+#   AGENTS_DIR     agents checkout for BT_SUITE=agents; its HEAD is pushed
+#                  as fullsend-ai/agents main, so the agents under test are
+#                  the ones every slot falls back to
 #   AGENTS_SEED    1 to mirror github.com/fullsend-ai/agents into the
 #                  emulator as fullsend-ai/agents; the shipped agents (which
 #                  playback runs) resolve from it. Default 1 for playback.
@@ -34,7 +39,11 @@ SUITE="${BT_SUITE:-behaviour}"
 case "$SUITE" in
   behaviour) AGENTS_SEED="${AGENTS_SEED:-0}" ;;
   playback) AGENTS_SEED="${AGENTS_SEED:-1}" ;;
-  *) echo "BT_SUITE must be behaviour or playback, got $SUITE" >&2; exit 2 ;;
+  agents)
+    AGENTS_SEED=1
+    [ -d "${AGENTS_DIR:-}/behaviour" ] || { echo "BT_SUITE=agents needs AGENTS_DIR, an agents checkout" >&2; exit 2; }
+    ;;
+  *) echo "BT_SUITE must be behaviour, playback or agents, got $SUITE" >&2; exit 2 ;;
 esac
 EMU_HOST=ghemu.localhost
 EMU="https://$EMU_HOST"
@@ -200,8 +209,13 @@ phase upstream-push
 if [ "$AGENTS_SEED" = 1 ]; then
   agents="$STATE/agents.git"
   rm -rf "$agents"
-  git clone -q --no-checkout "https://github.com/fullsend-ai/agents.git" "$agents"
-  git -C "$agents" checkout -q --detach "${AGENTS_REF:-main}"
+  if [ "$SUITE" = agents ]; then
+    git clone -q --no-checkout "$AGENTS_DIR" "$agents"
+    git -C "$agents" checkout -q --detach "$(git -C "$AGENTS_DIR" rev-parse HEAD)"
+  else
+    git clone -q --no-checkout "https://github.com/fullsend-ai/agents.git" "$agents"
+    git -C "$agents" checkout -q --detach "${AGENTS_REF:-main}"
+  fi
   for pr in ${AGENTS_PRS:-}; do
     git -C "$agents" fetch -q origin "pull/$pr/head"
     git -C "$agents" -c user.name=bt-emulator -c user.email=bt-emulator@localhost \
@@ -280,6 +294,21 @@ status=0
     BEHAVIOUR_NEGATIVE_SETTLE="${BEHAVIOUR_NEGATIVE_SETTLE:-20s}"
   if [ "$SUITE" = playback ]; then
     go test -tags playback -count=1 -timeout "${SUITE_TIMEOUT:-40m}" -v ./e2e/behaviour/ -run TestPlaybackSuite
+  elif [ "$SUITE" = agents ]; then
+    # As the agents repo's live job runs it, with this checkout in place
+    # of its pinned fullsend module. No config preset: the agents come
+    # from fullsend-ai/agents on the emulator, which is AGENTS_DIR.
+    modfile="$STATE/agents.mod"
+    cp "$AGENTS_DIR/go.mod" "$modfile"
+    : >"$STATE/agents.sum"
+    (
+      cd "$AGENTS_DIR"
+      go mod edit -modfile="$modfile" -replace="github.com/fullsend-ai/fullsend=$ROOT" \
+        -replace="github.com/fullsend-ai/fullsend/internal/mintcore=$ROOT/internal/mintcore"
+      go mod tidy -modfile="$modfile"
+      FULLSEND_CHECKOUT="$ROOT" BEHAVIOUR_GOFLAGS="-modfile=$modfile" \
+        make behaviour-test BEHAVIOUR_CAPABILITIES="$CAPABILITIES"
+    )
   else
     BEHAVIOUR_FEATURES="${FEATURES[*]}" \
       go test -tags behaviour -count=1 -timeout "${SUITE_TIMEOUT:-40m}" -v ./e2e/behaviour/ -run TestBehaviourSuite
