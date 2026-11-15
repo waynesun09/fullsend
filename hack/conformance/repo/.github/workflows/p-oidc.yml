@@ -1,0 +1,30 @@
+name: p-oidc
+# OIDC token claims, default and custom audience. Prints the decoded header
+# and claims only; the token itself is never printed.
+on: workflow_dispatch
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  oidc:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          set -euo pipefail
+          decode() {
+            python3 -c 'import base64,json,sys
+          t=sys.stdin.read().strip().split(".")
+          pad=lambda s: s+"="*(-len(s)%4)
+          h=json.loads(base64.urlsafe_b64decode(pad(t[0])))
+          c=json.loads(base64.urlsafe_b64decode(pad(t[1])))
+          print("CONF header "+json.dumps({k:h[k] for k in sorted(h) if k!="x5t"}, sort_keys=True))
+          print("CONF claims "+json.dumps(c, sort_keys=True))
+          print("CONF types "+json.dumps({k:type(v).__name__ for k,v in c.items()}, sort_keys=True))'
+          }
+          for aud in "" "conformance"; do
+            url="$ACTIONS_ID_TOKEN_REQUEST_URL"
+            [ -n "$aud" ] && url="$url&audience=$aud"
+            echo "CONF audience-param '${aud}'"
+            curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$url" | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])' | decode
+          done
+          echo "CONF request-url-host $(python3 -c 'import os,urllib.parse; u=urllib.parse.urlparse(os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]); print(u.scheme+"://"+u.netloc+u.path)')"

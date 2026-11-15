@@ -1,0 +1,101 @@
+name: emulator-conformance
+
+# Throwaway: run the conformance probe workflows on the GitHub emulator at the
+# integration ref and save what its REST API reports. Not for merge.
+
+on:
+  push:
+    branches: [bt-f3-conformance]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: emulator-conformance-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  EMULATOR_REPO: waynesun09/github-emulator
+  EMULATOR_REF: e2bdf8f6f940d4bd262946ab97ea1a41e1441c5a
+
+jobs:
+  conformance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout github-emulator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.EMULATOR_REPO }}
+          ref: ${{ env.EMULATOR_REF }}
+          path: .emulator
+          persist-credentials: false
+
+      - name: Install emulator dependencies
+        run: |
+          python3 -m venv "$RUNNER_TEMP/emu-venv"
+          "$RUNNER_TEMP/emu-venv/bin/pip" install -q -r .emulator/requirements.txt
+
+      - name: Start the emulator with two real runners
+        env:
+          UPSTREAM_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sudo sysctl -qw net.ipv4.ip_unprivileged_port_start=80
+          ADMIN="ghp_run$(openssl rand -hex 16)"
+          echo "::add-mask::$ADMIN"
+          echo "ADMIN=$ADMIN" >> "$GITHUB_ENV"
+          cd .emulator
+          CI_STACK_DIR="$RUNNER_TEMP/stack" CI_STACK_PYTHON="$RUNNER_TEMP/emu-venv/bin/python" \
+          CI_STACK_RUNNER_KIND=upstream CI_STACK_RUNNERS=2 \
+          CI_STACK_TLS=1 CI_STACK_HOST=ghemu.localhost CI_STACK_PORT=443 CI_STACK_SYSTEM_TRUST=1 \
+          CI_STACK_LOCALHOST_DNS=1 CI_STACK_BIND=0.0.0.0 \
+          GITHUB_EMULATOR_DEFAULT_ADMIN_TOKEN="$ADMIN" \
+          GITHUB_EMULATOR_ACTIONS_UPSTREAM_TOKEN="$UPSTREAM_TOKEN" \
+            scripts/ci-stack.sh start
+
+      - name: Create the probe repository and push the probes
+        run: |
+          set -euo pipefail
+          export CURL_CA_BUNDLE="$RUNNER_TEMP/stack/tls/ca.pem" GIT_SSL_CAINFO="$RUNNER_TEMP/stack/tls/bundle.pem"
+          EMU=https://ghemu.localhost
+          curl -fsS -o /dev/null -H "Authorization: token $ADMIN" -H 'Content-Type: application/json' \
+            -X POST "$EMU/api/v3/admin/organizations" -d '{"login":"conf","admin":"admin"}'
+          curl -fsS -o /dev/null -H "Authorization: token $ADMIN" -H 'Content-Type: application/json' \
+            -X POST "$EMU/api/v3/orgs/conf/repos" -d '{"name":"tmp-emu-conformance","private":false}'
+          work="$RUNNER_TEMP/probe-repo"
+          cp -R hack/conformance/repo "$work"
+          sed -i 's#OWNER_REPO#conf/tmp-emu-conformance#' "$work/.github/workflows/p-reusable.yml"
+          git -C "$work" init -q -b main
+          git -C "$work" add -A
+          git -C "$work" -c user.name=conf -c user.email=conf@localhost commit -q -m "conformance probe workflows"
+          git -C "$work" -c credential.helper= -c http.extraheader= push -q \
+            "https://admin:$ADMIN@ghemu.localhost/conf/tmp-emu-conformance.git" main
+          sleep 5
+          curl -fsS -H "Authorization: token $ADMIN" "$EMU/api/v3/repos/conf/tmp-emu-conformance/actions/workflows" \
+            | jq -r '.workflows[] | "indexed: \(.path) \(.state)"'
+
+      - name: Run the probes on the emulator
+        run: |
+          export CURL_CA_BUNDLE="$RUNNER_TEMP/stack/tls/ca.pem"
+          API=https://ghemu.localhost/api/v3 TOKEN="$ADMIN" REPO=conf/tmp-emu-conformance \
+          OUT="$RUNNER_TEMP/out-emu" bash hack/conformance/collect.sh
+
+      - name: Stop the emulator
+        if: always()
+        run: (cd .emulator && CI_STACK_DIR="$RUNNER_TEMP/stack" scripts/ci-stack.sh stop) || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: emulator-conformance
+          path: |
+            ${{ runner.temp }}/out-emu/
+            ${{ runner.temp }}/stack/**/*.log
+          if-no-files-found: warn

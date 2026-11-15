@@ -1,0 +1,13 @@
+name: p-runconc
+# Workflow-level concurrency with cancel-in-progress; dispatched twice.
+on: workflow_dispatch
+permissions:
+  contents: read
+concurrency:
+  group: conf-run
+  cancel-in-progress: true
+jobs:
+  slow:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 90

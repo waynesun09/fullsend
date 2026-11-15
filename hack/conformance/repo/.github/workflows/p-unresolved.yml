@@ -1,0 +1,12 @@
+name: p-unresolved
+# A reusable call whose file doesn't exist.
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  ok:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+  missing:
+    uses: ./.github/workflows/does-not-exist.yml

@@ -1,0 +1,19 @@
+name: p-jobconc
+# Job-level concurrency with cancel-in-progress (the shape fullsend's review
+# job uses); dispatched twice.
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  route:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo route
+  slow:
+    needs: route
+    runs-on: ubuntu-latest
+    concurrency:
+      group: conf-job
+      cancel-in-progress: true
+    steps:
+      - run: sleep 90

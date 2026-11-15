@@ -1,0 +1,27 @@
+name: p-context
+# Context values and default variables a harness reads.
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  ctx:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          C_ACTOR: ${{ github.actor }}
+          C_ACTOR_ID: ${{ github.actor_id }}
+          C_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          C_SERVER_URL: ${{ github.server_url }}
+          C_API_URL: ${{ github.api_url }}
+          C_GRAPHQL_URL: ${{ github.graphql_url }}
+          C_EVENT_NAME: ${{ github.event_name }}
+          C_REPOSITORY: ${{ github.repository }}
+          C_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          C_REPOSITORY_ID: ${{ github.repository_id }}
+          C_REPOSITORY_OWNER_ID: ${{ github.repository_owner_id }}
+          C_REF: ${{ github.ref }}
+          C_RUN_ATTEMPT: ${{ github.run_attempt }}
+          C_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          env | grep -E '^C_' | sort | sed 's/^/CONF ctx /'
+          env | grep -E '^GITHUB_(SERVER_URL|API_URL|GRAPHQL_URL|ACTOR|ACTOR_ID|TRIGGERING_ACTOR|EVENT_NAME|REPOSITORY|REPOSITORY_OWNER|REPOSITORY_ID|REPOSITORY_OWNER_ID|REF|RUN_ATTEMPT|WORKFLOW_REF)=' | sort | sed 's/^/CONF env /'

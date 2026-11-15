@@ -1,0 +1,19 @@
+name: p-skipped
+# Every job is skipped: two plain jobs and one reusable caller, all `if: false`.
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  a:
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo never
+  b:
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo never
+  caller:
+    if: false
+    uses: ./.github/workflows/callee.yml

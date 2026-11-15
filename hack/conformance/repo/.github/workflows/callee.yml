@@ -1,0 +1,17 @@
+name: callee
+on:
+  workflow_call:
+    outputs:
+      x:
+        description: value from the callee job
+        value: ${{ jobs.inner.outputs.x }}
+permissions:
+  contents: read
+jobs:
+  inner:
+    runs-on: ubuntu-latest
+    outputs:
+      x: ${{ steps.s.outputs.x }}
+    steps:
+      - id: s
+        run: echo "x=from-callee" >> "$GITHUB_OUTPUT"

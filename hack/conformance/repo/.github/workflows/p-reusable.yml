@@ -1,0 +1,19 @@
+name: p-reusable
+# needs on a reusable caller, its outputs and result; the same callee called
+# by its full owner/repo path.
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  caller:
+    uses: ./.github/workflows/callee.yml
+  full-path:
+    uses: OWNER_REPO/.github/workflows/callee.yml@main
+  after:
+    needs: [caller, full-path]
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "CONF caller.outputs.x=${{ needs.caller.outputs.x }}"
+          echo "CONF caller.result=${{ needs.caller.result }}"
+          echo "CONF full-path.outputs.x=${{ needs.full-path.outputs.x }}"

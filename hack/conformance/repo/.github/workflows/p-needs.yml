@@ -1,0 +1,20 @@
+name: p-needs
+# b and c wait on needs while a sleeps; the collector lists jobs mid-run.
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 75
+  b:
+    needs: a
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo b
+  c:
+    needs: b
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo c
