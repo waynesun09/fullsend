@@ -6,6 +6,8 @@ name: behaviour-emulator
 
 on:
   pull_request:
+  push:
+    branches: [bt-f4-notice-run]
   workflow_dispatch:
     inputs:
       features:
@@ -29,13 +31,13 @@ env:
   # Staging the scale-up on the fork: stage 2 (emulator-ready set + Jira)
   # on pull_request, at two workers to classify scenario-level failures.
   DEFAULT_FEATURES: >-
-    features/actors/actor-identities.feature features/triage/triage.feature features/dispatch/base-dispatch.feature features/dispatch/dispatch.feature features/dispatch/fork-bash-routing.feature features/dispatch/fork-dispatch.feature features/dispatch/hooks-loaded.feature features/dispatch/reaction-notifications.feature features/dispatch/url-dispatch.feature features/dispatch/runner-secret-overlay-guard.feature features/dispatch/fix-authorization.feature features/dispatch/owners-auth.feature features/dispatch/retro-cel-route.feature features/dispatch/review-cel-route.feature features/dispatch/triage-prioritize-cel-route.feature features/dispatch/jira-poll-dispatch.feature features/dispatch/jira-transport-bounds.feature features/platform/actor-authorization.feature
+    features/dispatch/owners-auth.feature
   DEFAULT_CAPABILITIES: runner-secret-overlay-guard
-  DEFAULT_WORKERS: "2"
-  DEFAULT_RUNNERS: "4"
+  DEFAULT_WORKERS: "6"
+  DEFAULT_RUNNERS: "12"
   # waynesun09/github-emulator ci-self-contained (integration head with the mint App seed).
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: e2bdf8f6f940d4bd262946ab97ea1a41e1441c5a
+  EMULATOR_REF: 64108f245e60dc2efd2a830afc7ef1b99f0fabc2
 
 jobs:
   behaviour-emulator:
