@@ -34,7 +34,7 @@ env:
   # which the emulator answers on a private VM address, and fullsend's fetch
   # guard refuses private addresses by design.
   SHARD_A_FEATURES: >-
-    features/dispatch/owners-auth.feature features/platform/actor-authorization.feature
+    features/dispatch/owners-auth.feature features/platform/actor-authorization.feature features/platform/bot-role-lookup.feature features/platform/mint-status.feature
   SHARD_B_FEATURES: >-
     features/triage/triage.feature features/dispatch/dispatch.feature features/dispatch/fix-authorization.feature features/dispatch/retro-cel-route.feature features/dispatch/hooks-loaded.feature features/dispatch/reaction-notifications.feature features/actors/actor-identities.feature features/dispatch/jira-poll-dispatch.feature features/dispatch/jira-transport-bounds.feature
   SHARD_C_FEATURES: >-
@@ -44,7 +44,7 @@ env:
   DEFAULT_RUNNERS: "12"
   # waynesun09/github-emulator ci-self-contained (integration head with the mint App seed).
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: 668ea20a239e2f1514ab13d0c6d54a6cf9262a3e
+  EMULATOR_REF: 36d585e930f5b32f183245c469253e6790937691
 
 jobs:
   behaviour-emulator:
