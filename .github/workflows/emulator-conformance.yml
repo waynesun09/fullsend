@@ -16,7 +16,7 @@ concurrency:
 
 env:
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: 9122eafd8f1499fde6ceaf266f316cbea9032f79
+  EMULATOR_REF: 5965fbbae089a36d0c2f8c9ca378c9965282d219
 
 jobs:
   conformance:
