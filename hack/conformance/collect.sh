@@ -11,7 +11,8 @@ set -uo pipefail
 mkdir -p "$OUT"
 LOG="$OUT/collect.log"
 : >"$LOG"
-note() { echo "$(date -u +%H:%M:%S) $*" | tee -a "$LOG"; }
+# Progress goes to stderr and the log only: functions return values on stdout.
+note() { echo "$(date -u +%H:%M:%S) $*" | tee -a "$LOG" >&2; }
 
 # api METHOD PATH [JSON] -> body in $OUT/.body, prints the HTTP code.
 api() {
