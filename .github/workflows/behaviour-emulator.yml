@@ -115,3 +115,65 @@ jobs:
             ${{ runner.temp }}/bt-emulator/bt-artifacts/
             !${{ runner.temp }}/bt-emulator/stack/runner-*/_work/**
           if-no-files-found: warn
+
+  # The playback suite (-tags playback) on its own VM and stack, in parallel
+  # with the shards, so it adds no wall time. A dispatch with explicit
+  # features skips it.
+  behaviour-emulator-playback:
+    name: behaviour-emulator (playback)
+    if: ${{ !inputs.features }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout fullsend
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout github-emulator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.EMULATOR_REPO }}
+          ref: ${{ env.EMULATOR_REF }}
+          path: .emulator
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install emulator dependencies
+        run: |
+          python3 -m venv "$RUNNER_TEMP/emu-venv"
+          "$RUNNER_TEMP/emu-venv/bin/pip" install -q -r .emulator/requirements.txt
+
+      - name: Run the playback suite
+        env:
+          EMULATOR_DIR: ${{ github.workspace }}/.emulator
+          EMULATOR_PY: ${{ runner.temp }}/emu-venv/bin/python
+          STATE_DIR: ${{ runner.temp }}/bt-emulator
+          # Read-only job token, only so the emulator can fetch public
+          # github.com actions without the anonymous rate limit.
+          UPSTREAM_TOKEN: ${{ github.token }}
+          BT_SUITE: playback
+          # The code stage opens its pull request and then labels it
+          # ready-for-review: two review dispatches, of which the review
+          # job's cancel-in-progress group keeps one only if they overlap,
+          # as they do on GitHub-hosted runners. Four runners make them
+          # overlap here too.
+          EMULATOR_RUNNERS: "4"
+        run: e2e/behaviour/emulator/run-job.sh
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: behaviour-emulator-logs-playback
+          path: |
+            ${{ runner.temp }}/bt-emulator/**/*.log
+            ${{ runner.temp }}/bt-emulator/phases.tsv
+            ${{ runner.temp }}/bt-emulator/bt-artifacts/
+            !${{ runner.temp }}/bt-emulator/stack/runner-*/_work/**
+          if-no-files-found: warn
