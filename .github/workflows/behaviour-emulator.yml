@@ -31,13 +31,13 @@ env:
   # Staging the scale-up on the fork: stage 2 (emulator-ready set + Jira)
   # on pull_request, at two workers to classify scenario-level failures.
   DEFAULT_FEATURES: >-
-    features/dispatch/owners-auth.feature
+    features/triage/triage.feature features/dispatch/owners-auth.feature features/actors/actor-identities.feature features/dispatch/triage-prioritize-cel-route.feature features/platform/actor-authorization.feature features/dispatch/dispatch.feature
   DEFAULT_CAPABILITIES: runner-secret-overlay-guard
   DEFAULT_WORKERS: "6"
   DEFAULT_RUNNERS: "12"
   # waynesun09/github-emulator ci-self-contained (integration head with the mint App seed).
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: 64108f245e60dc2efd2a830afc7ef1b99f0fabc2
+  EMULATOR_REF: 02d3789d892dbbfd0c8c242f0846d2757838553d
 
 jobs:
   behaviour-emulator:
