@@ -29,8 +29,8 @@ env:
   # Staging the scale-up on the fork: the triage tier on pull_request.
   DEFAULT_FEATURES: >-
     features/triage/triage.feature features/dispatch/owners-auth.feature features/actors/actor-identities.feature features/dispatch/triage-prioritize-cel-route.feature features/platform/actor-authorization.feature features/dispatch/dispatch.feature
-  DEFAULT_WORKERS: "3"
-  DEFAULT_RUNNERS: "4"
+  DEFAULT_WORKERS: "6"
+  DEFAULT_RUNNERS: "12"
   # waynesun09/github-emulator ci-self-contained (integration head with the mint App seed).
   EMULATOR_REPO: waynesun09/github-emulator
   EMULATOR_REF: e2bdf8f6f940d4bd262946ab97ea1a41e1441c5a
