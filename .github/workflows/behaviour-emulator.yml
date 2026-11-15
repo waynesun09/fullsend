@@ -26,18 +26,21 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The emulator-ready set (43 scenarios) in two shards, each on its own
-  # VM at six workers. Shard a holds the agent-heavy CEL, URL, overlay and
-  # fix scenarios; shard b the authorization, dispatch and Jira ones.
+  # The emulator-ready set (43 scenarios) in three shards, each on its own
+  # VM at six workers, balanced on measured scenario time (about 6000-6500
+  # worker-seconds each, so about 17 minutes of suite per shard). A 4-vCPU
+  # VM averages 60-66% CPU at six workers, so shards scale out, not up.
   #
   # Live only, not here: base-dispatch.feature (both scenarios) and
   # url-dispatch.feature:7. They fetch a harness from raw.githubusercontent.com,
   # which the emulator answers on a private VM address, and fullsend's fetch
   # guard refuses private addresses by design.
   SHARD_A_FEATURES: >-
-    features/dispatch/retro-cel-route.feature features/dispatch/triage-prioritize-cel-route.feature features/dispatch/review-cel-route.feature features/dispatch/url-dispatch.feature:29 features/dispatch/url-dispatch.feature:64 features/dispatch/url-dispatch.feature:100 features/dispatch/runner-secret-overlay-guard.feature features/dispatch/fix-authorization.feature features/dispatch/fork-dispatch.feature
+    features/dispatch/owners-auth.feature features/platform/actor-authorization.feature features/dispatch/fork-bash-routing.feature features/triage/triage.feature
   SHARD_B_FEATURES: >-
-    features/dispatch/owners-auth.feature features/dispatch/dispatch.feature features/platform/actor-authorization.feature features/actors/actor-identities.feature features/triage/triage.feature features/dispatch/fork-bash-routing.feature features/dispatch/hooks-loaded.feature features/dispatch/reaction-notifications.feature features/dispatch/jira-poll-dispatch.feature features/dispatch/jira-transport-bounds.feature
+    features/dispatch/dispatch.feature features/dispatch/fix-authorization.feature features/dispatch/retro-cel-route.feature features/dispatch/hooks-loaded.feature features/dispatch/reaction-notifications.feature features/actors/actor-identities.feature features/dispatch/jira-poll-dispatch.feature features/dispatch/jira-transport-bounds.feature
+  SHARD_C_FEATURES: >-
+    features/dispatch/fork-dispatch.feature features/dispatch/url-dispatch.feature:29 features/dispatch/url-dispatch.feature:64 features/dispatch/url-dispatch.feature:100 features/dispatch/triage-prioritize-cel-route.feature features/dispatch/runner-secret-overlay-guard.feature features/dispatch/review-cel-route.feature
   DEFAULT_CAPABILITIES: runner-secret-overlay-guard
   DEFAULT_WORKERS: "6"
   DEFAULT_RUNNERS: "12"
@@ -49,12 +52,12 @@ jobs:
   behaviour-emulator:
     name: behaviour-emulator (${{ matrix.shard }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 55
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         # A dispatch with explicit features runs them as one "custom" shard.
-        shard: ${{ fromJSON(inputs.features && '["custom"]' || '["a","b"]') }}
+        shard: ${{ fromJSON(inputs.features && '["custom"]' || '["a","b","c"]') }}
     steps:
       - name: Checkout fullsend
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -88,10 +91,10 @@ jobs:
           # Read-only job token, only so the emulator can fetch public
           # github.com actions without the anonymous rate limit.
           UPSTREAM_TOKEN: ${{ github.token }}
-          FEATURES: ${{ inputs.features || (matrix.shard == 'a' && env.SHARD_A_FEATURES) || env.SHARD_B_FEATURES }}
+          FEATURES: ${{ inputs.features || (matrix.shard == 'a' && env.SHARD_A_FEATURES) || (matrix.shard == 'b' && env.SHARD_B_FEATURES) || env.SHARD_C_FEATURES }}
           WORKERS: ${{ inputs.workers || env.DEFAULT_WORKERS }}
           EMULATOR_RUNNERS: ${{ inputs.runners || env.DEFAULT_RUNNERS }}
-          SUITE_TIMEOUT: 40m
+          SUITE_TIMEOUT: 30m
           BEHAVIOUR_CAPABILITIES: ${{ env.DEFAULT_CAPABILITIES }}
           # The run falls back to fullsend-ai/agents@main on the configured forge.
           AGENTS_SEED: "1"
