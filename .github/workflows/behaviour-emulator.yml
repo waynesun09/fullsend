@@ -30,12 +30,12 @@ env:
   # minutes of suite per shard). A 4-vCPU VM averages 60-66% CPU at six
   # workers, so shards scale out, not up.
   #
-  # Shard e: mint-scope.feature (18 outline rows, about 10 minutes of suite).
-  #
-  # Live only, not here: base-dispatch.feature (both scenarios) and
-  # url-dispatch.feature:7. They fetch a harness from raw.githubusercontent.com,
-  # which the emulator answers on a private VM address, and fullsend's fetch
-  # guard refuses private addresses by design.
+  # Shard e: mint-scope.feature (18 outline rows, about 10 minutes of suite)
+  # and the raw-host and capability-gated scenarios. base-dispatch,
+  # url-dispatch.feature:7 and skill-overrides fetch from
+  # raw.githubusercontent.com, which run-job.sh points at a public address on
+  # the VM's lo where the emulator answers, so they pass the same fetch guard
+  # production runs.
   SHARD_A_FEATURES: >-
     features/dispatch/owners-auth.feature features/platform/actor-authorization.feature features/platform/bot-role-lookup.feature features/platform/mint-status.feature
   SHARD_B_FEATURES: >-
@@ -45,13 +45,15 @@ env:
   SHARD_D_FEATURES: >-
     features/platform/bot-actor-authorization.feature features/dispatch/triage-prioritize-cel-route.feature features/dispatch/review-cel-route.feature features/dispatch/reaction-notifications.feature
   SHARD_E_FEATURES: >-
-    features/platform/mint-scope.feature
-  DEFAULT_CAPABILITIES: runner-secret-overlay-guard
+    features/platform/mint-scope.feature features/dispatch/base-dispatch.feature features/dispatch/url-dispatch.feature:7 features/runtime/skill-overrides.feature features/code/branch-namespace.feature features/dispatch/fetch-allowlist-gate.feature features/runtime/agent-settings.feature:13
+  # applier-branch-namespace: the seeded fullsend-ai/agents main enforces it.
+  # fetch-allowlist-gate: the job runs this checkout's fullsend, which has the gate.
+  DEFAULT_CAPABILITIES: runner-secret-overlay-guard,applier-branch-namespace,fetch-allowlist-gate
   DEFAULT_WORKERS: "6"
   DEFAULT_RUNNERS: "12"
   # waynesun09/github-emulator ci-self-contained (integration head with the mint App seed).
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: 8205b205685b0f9e2dc8a86364abc2c85ab0e810
+  EMULATOR_REF: d7b140b2c56c3ffbfaf6373524142f0a7b2240c5
 
 jobs:
   behaviour-emulator:

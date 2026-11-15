@@ -50,6 +50,13 @@ GATEWAY=0
 case ",$CAPABILITIES," in *,inference-gateway,*) GATEWAY=1 ;; esac
 GW_HOST="gw.$EMU_HOST"
 GW_IP=10.254.0.1
+# raw.githubusercontent.com resolves, on this VM only, to this address on lo,
+# where the emulator answers. fullsend's fetch guard refuses private and
+# reserved addresses, so it must be public: an unused address in GitHub's
+# raw-content /22 that no GitHub name resolves to, so nothing else in the job
+# dials it. (raw's own four A records are shared with the release and object
+# hosts, so they would pull downloads into the emulator.)
+RAW_ADDR=185.199.108.200
 
 phase_start=$(date +%s)
 phase() { # phase NAME: close the previous phase and record its wall time
@@ -101,7 +108,7 @@ sudo sysctl -qw net.ipv4.ip_unprivileged_port_start=80
   CI_STACK_RUNNER_KIND=upstream CI_STACK_RUNNERS="${EMULATOR_RUNNERS:-2}" \
   CI_STACK_TLS=1 CI_STACK_HOST="$EMU_HOST" CI_STACK_PORT=443 CI_STACK_SYSTEM_TRUST=1 \
   CI_STACK_LOCALHOST_DNS=1 CI_STACK_BIND=0.0.0.0 \
-  CI_STACK_RAW_HOST=1 \
+  CI_STACK_RAW_HOST=1 CI_STACK_RAW_ADDR="$RAW_ADDR" \
   CI_STACK_DNS_EXTRA="$([ "$GATEWAY" = 1 ] && echo "$GW_HOST=$GW_IP")" \
   GITHUB_EMULATOR_DEFAULT_ADMIN_TOKEN="$ADMIN" \
   GITHUB_EMULATOR_RATE_LIMIT=1000000 \
