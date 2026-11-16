@@ -89,6 +89,20 @@ stop_all() {
 }
 trap stop_all EXIT
 
+# The mint binary and the suite's test build, compiled in the background
+# from the start so neither waits on the stack: the suite's go test then
+# finds its packages in the build cache.
+build_mint() {
+  (cd "$ROOT/cmd/mint" && go build -tags github \
+    -ldflags "-X github.com/fullsend-ai/fullsend/internal/mintcore.StatusGitHubGroup=$ORG/mint-status" \
+    -o "$STATE/mint" .)
+}
+(
+  build_mint
+  cd "$ROOT" && go test -c -tags "$SUITE" -o "$STATE/suite-warm.test" ./e2e/behaviour/ && rm -f "$STATE/suite-warm.test"
+) >"$STATE/go-warm.log" 2>&1 &
+go_warm_pid=$!
+
 # 0. All runners share this VM, so it becomes the sandbox host once, before
 # the stack start, and the runners inherit OPENSHELL_GATEWAY_ENDPOINT: the
 # action then skips its per-job Podman and gateway setup, whose
@@ -97,12 +111,75 @@ trap stop_all EXIT
 # and once the emulator answers raw.githubusercontent.com the OpenShell
 # installer download would reach the emulator instead of github.com.
 export OPENSHELL_GATEWAY_ENDPOINT=https://127.0.0.1:17670
+# The actions/runner release the stack starts, downloaded and unpacked in the
+# background while the sandbox host is set up. ci-stack.sh uses an unpacked
+# copy it finds in its directory, so only the digest check is done here.
+runner_version=$(sed -nE 's/^UPSTREAM_VERSION="\$\{CI_STACK_UPSTREAM_RUNNER_VERSION:-([0-9.]+)\}"$/\1/p' "$EMULATOR_DIR/scripts/ci-stack.sh")
+runner_sha=$(sed -nE 's/^UPSTREAM_SHA256="\$\{CI_STACK_UPSTREAM_RUNNER_SHA256:-([0-9a-f]{64})\}"$/\1/p' "$EMULATOR_DIR/scripts/ci-stack.sh")
+if [ -n "$runner_version" ] && [ -n "$runner_sha" ]; then
+  (
+    set -e
+    mkdir -p "$STATE/stack"
+    t="$STATE/stack/actions-runner-$runner_version.tar.gz"
+    curl -fsSL -o "$t.partial" "https://github.com/actions/runner/releases/download/v$runner_version/actions-runner-linux-x64-$runner_version.tar.gz"
+    echo "$runner_sha  $t.partial" | sha256sum -c --quiet -
+    mv "$t.partial" "$t"
+    d="$STATE/stack/actions-runner-$runner_version"
+    mkdir -p "$d.partial"
+    tar -xzf "$t" -C "$d.partial"
+    mv "$d.partial" "$d"
+  ) >"$STATE/runner-prefetch.log" 2>&1 &
+  runner_prefetch_pid=$!
+fi
 if ! "$ROOT/e2e/behaviour/emulator/sandbox-host.sh" >"$STATE/sandbox-host.log" 2>&1; then
   echo "::error::sandbox host setup failed: $(tail -c 1500 "$STATE/sandbox-host.log")" >&2
   exit 1
 fi
 tail -1 "$STATE/sandbox-host.log"
 phase sandbox-host
+
+# 0b. The shipped agents, fetched from github.com before the stack starts so
+# the sandbox image pre-pull overlaps the stack start instead of following
+# it. They are pushed into the emulator as fullsend-ai/agents in step 4b.
+if [ "$AGENTS_SEED" = 1 ]; then
+  agents="$STATE/agents.git"
+  rm -rf "$agents"
+  git clone -q --no-checkout "https://github.com/fullsend-ai/agents.git" "$agents"
+  git -C "$agents" checkout -q --detach "${AGENTS_REF:-main}"
+  for pr in ${AGENTS_PRS:-}; do
+    git -C "$agents" fetch -q origin "pull/$pr/head"
+    git -C "$agents" -c user.name=bt-emulator -c user.email=bt-emulator@localhost \
+      merge -q --no-edit -m "bt-emulator: merge agents#$pr" FETCH_HEAD
+  done
+  # Pre-pull the sandbox images the agents pin (by digest) into the
+  # runner user's rootless store once, in the background, so no agent job
+  # pays the pull. The suite waits for it below.
+  mapfile -t sandbox_images < <(git -C "$agents" grep -hoE 'image: *[^ ]+@sha256:[0-9a-f]+' HEAD -- harness | sed 's/image: *//' | sort -u)
+  if [ "${#sandbox_images[@]}" -gt 0 ]; then
+    ( for img in "${sandbox_images[@]}"; do podman pull -q "$img" >/dev/null; done ) >"$STATE/prepull.log" 2>&1 &
+    prepull_pid=$!
+  fi
+  # The emulator's runners share this VM's $HOME, and the agents' post
+  # scripts install gitleaks in place into $HOME/.local/bin. Two runs
+  # installing at once can run each other's half-written binary. Install it
+  # once here with the agents' own installer; each later call then finds the
+  # pinned version and skips the download.
+  gitleaks_lib="$agents/scripts/lib/gitleaks-install.lib.sh"
+  if [ -f "$gitleaks_lib" ]; then
+    # shellcheck source=/dev/null
+    ( . "$gitleaks_lib" && install_gitleaks ) >"$STATE/gitleaks-install.log" 2>&1 \
+      || echo "::warning::gitleaks pre-install failed; agent jobs install it themselves ($(tail -c 300 "$STATE/gitleaks-install.log"))"
+  fi
+  phase agents-fetch
+fi
+
+if [ -n "${runner_prefetch_pid:-}" ]; then
+  if ! wait "$runner_prefetch_pid"; then
+    echo "::warning::runner prefetch failed; the stack downloads it ($(tail -c 300 "$STATE/runner-prefetch.log"))"
+    rm -rf "$STATE/stack/actions-runner-"*
+  fi
+  phase runner-prefetch
+fi
 
 # 1. Emulator + one real actions/runner over TLS on ghemu.localhost:443.
 sudo sysctl -qw net.ipv4.ip_unprivileged_port_start=80
@@ -125,8 +202,10 @@ phase stack
 
 # OpenShell's egress proxy (in the sandbox supervisor) checks upstream TLS
 # against the supervisor image's CA bundle, so trust the stack CA there.
-"$ROOT/e2e/behaviour/emulator/supervisor-ca-image.sh" "$STATE/stack/tls/ca.pem"
-phase supervisor-ca
+# Built in the background while the emulator is seeded; no sandbox starts
+# before the suite, which waits for it below.
+"$ROOT/e2e/behaviour/emulator/supervisor-ca-image.sh" "$STATE/stack/tls/ca.pem" >"$STATE/supervisor-ca.log" 2>&1 &
+supervisor_ca_pid=$!
 
 # 2. One App per mint role plus the harness's e2e App, keys made by the emulator.
 mkdir -p "$STATE/pem"
@@ -154,9 +233,10 @@ fi
 # 3. fullsend's standalone mint, trusting the emulator's OIDC issuer and API.
 # Built as the preview mint is deployed: status callers authenticate with
 # OIDC or as members of the $ORG/mint-status team (mint-status.feature).
-(cd "$ROOT/cmd/mint" && go build -tags github \
-  -ldflags "-X github.com/fullsend-ai/fullsend/internal/mintcore.StatusGitHubGroup=$ORG/mint-status" \
-  -o "$STATE/mint" .)
+if [ -n "${go_warm_pid:-}" ]; then
+  wait "$go_warm_pid" || echo "::warning::early Go build failed; building now ($(tail -c 300 "$STATE/go-warm.log"))"
+fi
+[ -x "$STATE/mint" ] || build_mint
 hosts=""
 # The pool's workflow hosts, as on the preview mints (mint-status checks
 # them); the mint accepts fullsend-ai/fullsend's own workflows anyway.
@@ -209,40 +289,11 @@ phase upstream-push
 # 4b. The shipped agents as fullsend-ai/agents: a run without its own agent
 # config falls back to fullsend-ai/agents@main on the configured forge.
 if [ "$AGENTS_SEED" = 1 ]; then
-  agents="$STATE/agents.git"
-  rm -rf "$agents"
-  git clone -q --no-checkout "https://github.com/fullsend-ai/agents.git" "$agents"
-  git -C "$agents" checkout -q --detach "${AGENTS_REF:-main}"
-  for pr in ${AGENTS_PRS:-}; do
-    git -C "$agents" fetch -q origin "pull/$pr/head"
-    git -C "$agents" -c user.name=bt-emulator -c user.email=bt-emulator@localhost \
-      merge -q --no-edit -m "bt-emulator: merge agents#$pr" FETCH_HEAD
-  done
   ensure_source_repo agents
   git -C "$agents" -c credential.helper= -c http.extraheader= push -q --force \
     "https://admin:$ADMIN@$EMU_HOST/fullsend-ai/agents.git" "HEAD:refs/heads/main"
   echo "fullsend-ai/agents main on the emulator: $(git -C "$agents" rev-parse --short HEAD) (${AGENTS_REF:-main}${AGENTS_PRS:+ + PRs $AGENTS_PRS})"
   phase agents-push
-  # Pre-pull the sandbox images the agents pin (by digest) into the
-  # runner user's rootless store once, in the background, so no agent job
-  # pays the pull. The suite waits for it below.
-  mapfile -t sandbox_images < <(git -C "$agents" grep -hoE 'image: *[^ ]+@sha256:[0-9a-f]+' HEAD -- harness | sed 's/image: *//' | sort -u)
-  if [ "${#sandbox_images[@]}" -gt 0 ]; then
-    ( for img in "${sandbox_images[@]}"; do podman pull -q "$img" >/dev/null; done ) >"$STATE/prepull.log" 2>&1 &
-    prepull_pid=$!
-  fi
-  # The emulator's runners share this VM's $HOME, and the agents' post
-  # scripts install gitleaks in place into $HOME/.local/bin. Two runs
-  # installing at once can run each other's half-written binary. Install it
-  # once here with the agents' own installer; each later call then finds the
-  # pinned version and skips the download.
-  gitleaks_lib="$agents/scripts/lib/gitleaks-install.lib.sh"
-  if [ -f "$gitleaks_lib" ]; then
-    # shellcheck source=/dev/null
-    ( . "$gitleaks_lib" && install_gitleaks ) >"$STATE/gitleaks-install.log" 2>&1 \
-      || echo "::warning::gitleaks pre-install failed; agent jobs install it themselves ($(tail -c 300 "$STATE/gitleaks-install.log"))"
-    phase gitleaks
-  fi
 fi
 
 # 4c. The human-like test actors, as hack/setup-new-e2e-org.sh grants them
@@ -284,6 +335,12 @@ if [ -n "${prepull_pid:-}" ]; then
   wait "$prepull_pid" || echo "::warning::sandbox image pre-pull failed; agent jobs pull on demand ($(tail -c 300 "$STATE/prepull.log"))"
   phase prepull-wait
 fi
+if ! wait "$supervisor_ca_pid"; then
+  echo "::error::supervisor CA image failed: $(tail -c 1500 "$STATE/supervisor-ca.log")" >&2
+  exit 1
+fi
+cat "$STATE/supervisor-ca.log"
+phase supervisor-ca-wait
 
 # CPU, memory and live sandboxes every few seconds for the suite's length
 # (vm-samples.log, vm-peak.log), to check the concurrency fits the VM.
