@@ -479,6 +479,14 @@ tracker:
   `base_url`, so the token never reaches Atlassian.
 - Every job that calls Jira needs `permissions: id-token: write`. Without it
   the run fails and names that permission. GitLab CI is not supported yet.
+  The managed Jira poll caller grants it only in oidc mode: run
+  `fullsend repos install` after switching to oidc so it re-renders the
+  caller. Install then writes no Jira secret, and refuses
+  `--jira-token`/`--jira-email`/`--jira-client-*` and any existing
+  `FULLSEND_JIRA_*` secret, by name.
+- A user-written poll caller must set `permissions: contents: read` on its
+  poll job, plus `id-token: write` for oidc: the reusable poll job inherits
+  exactly the caller's permissions.
 - `FULLSEND_JIRA_TOKEN`, `FULLSEND_JIRA_EMAIL`, `FULLSEND_JIRA_CLIENT_ID` and
   `FULLSEND_JIRA_CLIENT_SECRET` must all be unset. A leftover one fails
   `fullsend run` at start, and the error names it: remove it from the

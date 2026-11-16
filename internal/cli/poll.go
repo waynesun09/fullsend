@@ -198,7 +198,7 @@ func runJiraPoll(cmd *cobra.Command, jiraURL, jiraProject, jqlOverride, targetRe
 
 	jiraClient, err := buildJiraClient(args.jira, os.Getenv)
 	if err != nil {
-		return fmt.Errorf("create Jira client: %w", err)
+		return fmt.Errorf("create Jira client: %w", jiraPollOIDCHint(err))
 	}
 
 	matcher, err := newCELMatcher(cmd.Context(), args.fullsendDir)
@@ -477,6 +477,29 @@ func buildJiraClient(settings jiraPollSettings, getenv func(string) string, opts
 		Auth:     settings.auth,
 		Audience: settings.audience,
 	}, getenv, append([]jira.Option{jira.WithOIDCTokenHook(jiraOIDCTokenHook)}, opts...)...)
+}
+
+// errJiraPollNoOIDCEndpoint is the poll job's error when, in
+// tracker.jira.auth: oidc mode, it has no OIDC endpoint. It says how to
+// fix it in the poll workflow and unwraps to jira.ErrOIDCEndpointMissing.
+var errJiraPollNoOIDCEndpoint = fmt.Errorf("%w", jiraPollNoOIDCEndpoint{})
+
+type jiraPollNoOIDCEndpoint struct{}
+
+func (jiraPollNoOIDCEndpoint) Error() string {
+	return "the Jira poll job has no GitHub Actions OIDC token endpoint (tracker.jira.auth: oidc needs the poll job to grant `id-token: write`); " +
+		"re-render the managed poll caller with `fullsend repos install`, or add `id-token: write` to a user-written caller's poll job"
+}
+
+func (jiraPollNoOIDCEndpoint) Unwrap() error { return jira.ErrOIDCEndpointMissing }
+
+// jiraPollOIDCHint replaces the error for a poll job without an OIDC
+// endpoint with errJiraPollNoOIDCEndpoint; any other error is unchanged.
+func jiraPollOIDCHint(err error) error {
+	if !errors.Is(err, jira.ErrOIDCEndpointMissing) {
+		return err
+	}
+	return errJiraPollNoOIDCEndpoint
 }
 
 // jiraPollClient returns the poller's Jira client. With tracker.jira.auth:

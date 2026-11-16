@@ -37,7 +37,21 @@ var jiraPollOAuthSecretLines = []string{
 	"      FULLSEND_JIRA_CLIENT_SECRET: ${{ secrets.FULLSEND_JIRA_CLIENT_SECRET }}\n",
 }
 
-// RenderJiraPollCaller renders the managed GitHub Jira poll caller. Its
+// jiraPollReadPermissionLine is the poll job's contents: read grant; the
+// oidc mode adds jiraPollIDTokenLine right after it.
+const (
+	jiraPollReadPermissionLine = "    permissions:\n      contents: read\n    uses: __REUSABLE_WORKFLOW__\n"
+	jiraPollIDTokenLine        = "      id-token: write\n"
+)
+
+// RenderJiraPollCaller renders the managed GitHub Jira poll caller for the
+// FULLSEND_JIRA_* secret modes (RenderJiraPollCallerWithAuth with oidc
+// false).
+func RenderJiraPollCaller(opts RenderOptions, emailConfigured, oauthConfigured bool) ([]byte, error) {
+	return RenderJiraPollCallerWithAuth(opts, emailConfigured, oauthConfigured, false)
+}
+
+// RenderJiraPollCallerWithAuth renders the managed GitHub Jira poll caller. Its
 // reusable workflows are pinned to the upstream ref in opts; the caller
 // always references the upstream repository, so it does not depend on a
 // vendored copy of reusable-poll-jira.yml. emailConfigured controls whether
@@ -45,8 +59,11 @@ var jiraPollOAuthSecretLines = []string{
 // credentials to Jira-originated Fullsend status updates only. oauthConfigured
 // controls whether the OAuth client credentials are forwarded; a token-only
 // caller omits them so it stays valid against reusable workflows pinned to a
-// ref that predates OAuth support.
-func RenderJiraPollCaller(opts RenderOptions, emailConfigured, oauthConfigured bool) ([]byte, error) {
+// ref that predates OAuth support. The poll job always grants contents:
+// read, and id-token: write only when oidc (tracker.jira.auth: oidc) is
+// true: the reusable poll job declares no permissions of its own, so the
+// caller's grant is its only cap.
+func RenderJiraPollCallerWithAuth(opts RenderOptions, emailConfigured, oauthConfigured, oidc bool) ([]byte, error) {
 	raw, err := FullsendRepoFile(jiraPollCallerTemplate)
 	if err != nil {
 		return nil, fmt.Errorf("loading Jira poll caller template: %w", err)
@@ -65,6 +82,13 @@ func RenderJiraPollCaller(opts RenderOptions, emailConfigured, oauthConfigured b
 		if !oauthConfigured {
 			out = strings.ReplaceAll(out, line, "")
 		}
+	}
+	if strings.Count(out, jiraPollReadPermissionLine) != 1 {
+		return nil, fmt.Errorf("the Jira poll caller template must grant its poll job contents: read")
+	}
+	if oidc {
+		out = strings.Replace(out, jiraPollReadPermissionLine,
+			strings.Replace(jiraPollReadPermissionLine, "      contents: read\n", "      contents: read\n"+jiraPollIDTokenLine, 1), 1)
 	}
 	upstream := opts
 	upstream.Vendored = false

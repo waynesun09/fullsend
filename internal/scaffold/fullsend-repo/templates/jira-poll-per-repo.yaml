@@ -30,6 +30,8 @@ jobs:
     concurrency:
       group: ${{ github.workflow }}-poll
       cancel-in-progress: false
+    # The reusable poll job inherits exactly these permissions. id-token:
+    # write is rendered only for tracker.jira.auth: oidc.
     permissions:
       contents: read
     uses: __REUSABLE_WORKFLOW__

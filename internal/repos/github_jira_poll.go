@@ -49,6 +49,11 @@ func checkGitHubJiraPollWorkflow(ctx context.Context, d convergeDiscovery, cfg C
 			resolved.Owner, resolved.Repo, err)
 	}
 	if exists && !scaffold.IsManagedJiraPollCaller(caller) {
+		// In oidc mode no Jira secret moves, so a user-owned caller is its
+		// owner's to keep granting the poll job id-token: write.
+		if d.jira.jira.IsOIDC() {
+			return nil
+		}
 		// The user-owned caller is never rewritten, so an OAuth install
 		// would strand it on the token credentials it is about to remove.
 		if !jiraUsesOAuth(d.jira, cfg) {
@@ -89,6 +94,13 @@ func checkGitHubJiraPollWorkflow(ctx context.Context, d convergeDiscovery, cfg C
 		}
 		return fmt.Errorf("%s/%s: checking %s at %s %s before install: %w",
 			resolved.Owner, resolved.Repo, reusableJiraPollWorkflowPath, source, ref, err)
+	}
+	if d.jira.jira.IsOIDC() {
+		if reusablePollJobCapsIDToken(pollWorkflow) {
+			return fmt.Errorf("%s/%s: %s %s declares permissions on the poll job of %s without id-token: write, so tracker.jira.auth: oidc cannot work; upgrade fullsend_ref to a ref whose poll job inherits the caller's permissions",
+				resolved.Owner, resolved.Repo, source, ref, reusableJiraPollWorkflowPath)
+		}
+		return nil
 	}
 	if !jiraUsesOAuth(d.jira, cfg) {
 		return nil
@@ -221,7 +233,7 @@ func requireJiraOAuthSecrets(resolved ResolvedConfig, source, ref, workflowPath 
 
 // Ensure makes the managed caller present and current.
 func (githubJiraPollReconciler) Ensure(ctx context.Context, req jiraPollRequest) ([]ComponentAction, error) {
-	want, err := scaffold.RenderJiraPollCaller(req.Render, req.EmailConfigured, req.OAuthConfigured)
+	want, err := scaffold.RenderJiraPollCallerWithAuth(req.Render, req.EmailConfigured, req.OAuthConfigured, req.Jira.IsOIDC())
 	if err != nil {
 		return nil, err
 	}
@@ -306,4 +318,29 @@ func readJiraPollCaller(ctx context.Context, req jiraPollRequest) ([]byte, bool,
 		return nil, false, fmt.Errorf("reading %s: %w", scaffold.JiraPollCallerPath, err)
 	}
 	return content, true, nil
+}
+
+// reusablePollJobCapsIDToken reports whether the reusable poll workflow's
+// poll job declares its own permissions without id-token: write. Such a
+// job caps the caller's grant, so the oidc mode's poller would get no OIDC
+// token. A job without a permissions block inherits the caller's.
+func reusablePollJobCapsIDToken(workflow []byte) bool {
+	var wf struct {
+		Jobs map[string]struct {
+			Permissions any `yaml:"permissions"`
+		} `yaml:"jobs"`
+	}
+	if yaml.Unmarshal(workflow, &wf) != nil {
+		return false
+	}
+	switch p := wf.Jobs["poll"].Permissions.(type) {
+	case nil:
+		return false
+	case string:
+		return p != "write-all"
+	case map[string]any:
+		return p["id-token"] != "write"
+	default:
+		return true
+	}
 }

@@ -45,6 +45,8 @@ func TestRenderJiraPollCaller(t *testing.T) {
 			"FULLSEND_JIRA_CLIENT_SECRET": "${{ secrets.FULLSEND_JIRA_CLIENT_SECRET }}",
 		}, wf.Jobs["poll"].Secrets, "the poll job receives the Jira credential choices")
 		assert.Equal(t, "15", wf.Jobs["poll"].With["timeout_minutes"], "the caller sets the reusable poll timeout")
+		assert.Equal(t, map[string]string{"contents": "read"}, pollJobPermissions(t, out),
+			"the secret modes grant the poll job only contents: read")
 		assert.Equal(t, "${{ needs.poll.outputs.matrix }}", wf.Jobs["dispatch"].With["matrix"])
 		for _, name := range []string{"FULLSEND_JIRA_TOKEN", "FULLSEND_JIRA_EMAIL", "FULLSEND_JIRA_CLIENT_ID", "FULLSEND_JIRA_CLIENT_SECRET"} {
 			assert.Equal(t, "${{ secrets."+name+" }}", wf.Jobs["dispatch"].Secrets[name],
@@ -197,4 +199,50 @@ func TestIsManagedJiraPollCaller(t *testing.T) {
 	assert.False(t, IsManagedJiraPollCaller([]byte("run: echo '"+JiraPollCallerMarker+"'\n")),
 		"the marker must be a line of its own")
 	assert.False(t, IsManagedJiraPollCaller(nil))
+}
+
+// pollJobPermissions returns the rendered caller's poll job permissions.
+func pollJobPermissions(t *testing.T, out []byte) map[string]string {
+	t.Helper()
+	var wf struct {
+		Jobs map[string]struct {
+			Permissions map[string]string `yaml:"permissions"`
+		} `yaml:"jobs"`
+	}
+	require.NoError(t, yaml.Unmarshal(out, &wf))
+	return wf.Jobs["poll"].Permissions
+}
+
+// TestRenderJiraPollCaller_PollJobPermissionsPerAuthMode: the caller grants
+// exactly contents: read in the static-token and OAuth modes, and exactly
+// contents: read plus id-token: write in the oidc mode.
+func TestRenderJiraPollCaller_PollJobPermissionsPerAuthMode(t *testing.T) {
+	pinned := RenderOptions{UpstreamRef: "0123456789abcdef0123456789abcdef01234567", UpstreamTag: "v1.2.3"}
+	for name, tc := range map[string]struct {
+		email, oauth, oidc bool
+		want               map[string]string
+	}{
+		"static token": {email: true, want: map[string]string{"contents": "read"}},
+		"oauth":        {oauth: true, want: map[string]string{"contents": "read"}},
+		"oidc":         {oidc: true, want: map[string]string{"contents": "read", "id-token": "write"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			out, err := RenderJiraPollCallerWithAuth(pinned, tc.email, tc.oauth, tc.oidc)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, pollJobPermissions(t, out))
+		})
+	}
+}
+
+// TestReusablePollJira_PollJobDeclaresNoPermissions: the reusable poll job
+// inherits the caller's permissions exactly.
+func TestReusablePollJira_PollJobDeclaresNoPermissions(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "reusable-poll-jira.yml"))
+	require.NoError(t, err)
+	var wf struct {
+		Jobs map[string]map[string]any `yaml:"jobs"`
+	}
+	require.NoError(t, yaml.Unmarshal(content, &wf))
+	require.Contains(t, wf.Jobs, "poll")
+	assert.NotContains(t, wf.Jobs["poll"], "permissions")
 }

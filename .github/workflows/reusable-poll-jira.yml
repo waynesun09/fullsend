@@ -18,6 +18,12 @@
 #
 # Security: Jira credentials reach only the poll step. They are never
 # forwarded to agents or the runner-secret bundle.
+#
+# Permissions: the poll job declares none, so its GITHUB_TOKEN and OIDC
+# permissions are exactly the calling job's: the caller is the only cap.
+# The managed caller grants contents: read, plus id-token: write only when
+# tracker.jira.auth is oidc (the poller then authenticates to the Jira
+# gateway with the job's OIDC token).
 name: Jira poll
 
 on:
@@ -52,8 +58,8 @@ jobs:
     name: Poll Jira
     runs-on: ${{ inputs.runner_image }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
-    permissions:
-      contents: read
+    # No permissions block: the calling job's permissions apply (see the
+    # header).
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:

@@ -10,7 +10,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 
+	"github.com/fullsend-ai/fullsend/internal/config"
 	"github.com/fullsend-ai/fullsend/internal/forge"
 )
 
@@ -791,4 +793,105 @@ func TestConverge_JiraPoll_GitHubAcceptsOAuth(t *testing.T) {
 		forge.SecretJiraClientID:     testJiraClientID,
 		forge.SecretJiraClientSecret: testJiraClientSecret,
 	}, jiraSecretWrites(fc))
+}
+
+func oidcJiraTracking(t *testing.T) *config.JiraTrackingConfig {
+	t.Helper()
+	reader, err := config.ParsePerRepoConfig([]byte("tracker:\n  jira:\n    base_url: https://site.atlassian.net\n    api_url: https://jira-gw.example.com\n    auth: oidc\n    audience: aud\n    project: ABC\n    poll:\n      enabled: true\n"))
+	require.NoError(t, err)
+	return reader.IssueTracking().Jira
+}
+
+// TestValidateJiraPollInputs_OIDC: in oidc mode install needs no Jira
+// credential, refuses Jira credential flags, and names leftover secrets.
+func TestValidateJiraPollInputs_OIDC(t *testing.T) {
+	jt := oidcJiraTracking(t)
+	github := func(st jiraPollState) convergeDiscovery {
+		st.jira, st.enabled = jt, true
+		return convergeDiscovery{repo: ResolvedRepo{Owner: "acme", Repo: "api"}, resolved: ResolvedConfig{Forge: ForgeGitHub}, jira: st}
+	}
+	require.NoError(t, validateJiraPollInputs(github(jiraPollState{}), ConvergeConfig{}), "no credential is needed")
+
+	err := validateJiraPollInputs(github(jiraPollState{}), ConvergeConfig{JiraToken: testJiraToken, JiraClientID: "id"})
+	require.ErrorContains(t, err, "drop --jira-token, --jira-client-id")
+	assert.NotContains(t, err.Error(), testJiraToken)
+
+	err = validateJiraPollInputs(github(jiraPollState{tokenExists: true, clientSecretExists: true}), ConvergeConfig{})
+	require.ErrorContains(t, err, forge.SecretJiraToken+", "+forge.SecretJiraClientSecret)
+	assert.Contains(t, err.Error(), "remove them")
+
+	gl := github(jiraPollState{})
+	gl.resolved.Forge = ForgeGitLab
+	require.ErrorContains(t, validateJiraPollInputs(gl, ConvergeConfig{}), "not supported on GitLab yet")
+}
+
+// TestConvergeJiraPoll_OIDCRendersIDTokenWithoutSecrets: install in oidc
+// mode with polling enabled writes no Jira secret and renders a caller
+// whose poll job grants id-token: write.
+func TestConvergeJiraPoll_OIDCRendersIDTokenWithoutSecrets(t *testing.T) {
+	fc := forge.NewFakeClient()
+	var staged []forge.TreeFile
+	d := convergeDiscovery{
+		repo:     ResolvedRepo{Owner: "acme", Repo: "api"},
+		resolved: ResolvedConfig{Owner: "acme", Repo: "api", Forge: ForgeGitHub, ForgeConfig: ForgeConfig{Client: fc}},
+		jira:     jiraPollState{jira: oidcJiraTracking(t), enabled: true},
+	}
+	actions := convergeJiraPoll(context.Background(), d, ConvergeConfig{}, jiraPollDelivery{stage: func(f forge.TreeFile) { staged = append(staged, f) }}, func(string, string, string) {})
+	for _, a := range actions {
+		assert.NotEqual(t, "error", a.Action, a.Detail)
+	}
+	assert.Empty(t, jiraSecretWrites(fc))
+	assert.Empty(t, fc.DeletedSecrets)
+	require.Len(t, staged, 1)
+	var wf struct {
+		Jobs map[string]struct {
+			Permissions map[string]string `yaml:"permissions"`
+		} `yaml:"jobs"`
+	}
+	require.NoError(t, yaml.Unmarshal(staged[0].Content, &wf))
+	assert.Equal(t, map[string]string{"contents": "read", "id-token": "write"}, wf.Jobs["poll"].Permissions)
+}
+
+// TestCheckGitHubJiraPollWorkflow_OIDCLeavesAUserCallerAlone: in oidc mode
+// no Jira secret moves, so a user-owned caller is not checked for OAuth
+// secret forwarding.
+func TestCheckGitHubJiraPollWorkflow_OIDCLeavesAUserCallerAlone(t *testing.T) {
+	fc := forge.NewFakeClient()
+	fc.FileContents[jiraCallerKey] = []byte(userJiraCaller)
+	d := convergeDiscovery{
+		resolved: ResolvedConfig{Owner: "acme", Repo: "api", Forge: ForgeGitHub, ForgeConfig: ForgeConfig{Client: fc}},
+		jira:     jiraPollState{jira: oidcJiraTracking(t), enabled: true},
+	}
+	require.NoError(t, checkGitHubJiraPollWorkflow(context.Background(), d, ConvergeConfig{}, NewRefResolver(fc)))
+}
+
+// TestCheckGitHubJiraPollWorkflow_OIDCRefusesAPinnedRefThatCapsThePollJob:
+// in oidc mode install refuses a pinned ref whose reusable poll job
+// declares permissions without id-token: write; one that inherits the
+// caller's permissions passes.
+func TestCheckGitHubJiraPollWorkflow_OIDCRefusesAPinnedRefThatCapsThePollJob(t *testing.T) {
+	for name, tc := range map[string]struct {
+		workflow string
+		wantErr  bool
+	}{
+		"poll job inherits the caller's permissions": {workflow: "jobs:\n  poll:\n    runs-on: x\n"},
+		"poll job capped at contents: read":          {workflow: "jobs:\n  poll:\n    permissions:\n      contents: read\n", wantErr: true},
+		"poll job grants id-token: write":            {workflow: "jobs:\n  poll:\n    permissions:\n      contents: read\n      id-token: write\n"},
+		"poll job read-all":                          {workflow: "jobs:\n  poll:\n    permissions: read-all\n", wantErr: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fc := forge.NewFakeClient()
+			fc.FileContentsRef[shimOwner+"/"+shimRepo+"/"+reusableJiraPollWorkflowPath+"@main"] = []byte(tc.workflow)
+			d := convergeDiscovery{
+				resolved: ResolvedConfig{Owner: "acme", Repo: "api", Forge: ForgeGitHub, ForgeConfig: ForgeConfig{Client: fc}},
+				jira:     jiraPollState{jira: oidcJiraTracking(t), enabled: true},
+			}
+			err := checkGitHubJiraPollWorkflow(context.Background(), d, ConvergeConfig{}, NewRefResolver(fc))
+			if !tc.wantErr {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, "without id-token: write")
+		})
+	}
 }

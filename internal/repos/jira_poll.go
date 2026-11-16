@@ -3,6 +3,7 @@ package repos
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/fullsend-ai/fullsend/internal/config"
 	"github.com/fullsend-ai/fullsend/internal/forge"
@@ -207,6 +208,9 @@ func validateJiraPollInputs(d convergeDiscovery, cfg ConvergeConfig) error {
 		return nil
 	}
 	repo := d.repo.Owner + "/" + d.repo.Repo
+	if d.jira.jira.IsOIDC() {
+		return validateJiraOIDCPollInputs(repo, d, cfg)
+	}
 	tokenFlags := cfg.JiraToken != "" || cfg.JiraEmail != ""
 	oauthFlags := cfg.JiraClientID != "" || cfg.JiraClientSecret != ""
 	if tokenFlags && oauthFlags {
@@ -233,6 +237,54 @@ func validateJiraPollInputs(d convergeDiscovery, cfg ConvergeConfig) error {
 	if d.resolved.Forge == ForgeGitLab && !gitlabMaskableRe.MatchString(cfg.JiraToken) {
 		return fmt.Errorf("%s: the Jira token cannot be stored as a masked GitLab CI/CD variable (at least 8 characters from A-Z a-z 0-9 _ + = / @ : . ~ -, no whitespace); check the --jira-token value",
 			repo)
+	}
+	return nil
+}
+
+// validateJiraOIDCPollInputs checks a repository whose tracker.jira.auth
+// is oidc: the poller uses the job's OIDC token, so no Jira credential is
+// written. Jira credential flags are refused, and so are existing
+// FULLSEND_JIRA_* secrets, by name: install does not remove them in this
+// mode, and the run would refuse them next to the OIDC token. GitLab is
+// not supported yet. Values are never included in errors.
+func validateJiraOIDCPollInputs(repo string, d convergeDiscovery, cfg ConvergeConfig) error {
+	if d.resolved.Forge == ForgeGitLab {
+		return fmt.Errorf("%s: tracker.jira.auth: oidc is not supported on GitLab yet", repo)
+	}
+	var flags []string
+	for _, f := range []struct {
+		name string
+		set  bool
+	}{
+		{"--jira-token", cfg.JiraToken != ""},
+		{"--jira-email", cfg.JiraEmail != ""},
+		{"--jira-client-id", cfg.JiraClientID != ""},
+		{"--jira-client-secret", cfg.JiraClientSecret != ""},
+	} {
+		if f.set {
+			flags = append(flags, f.name)
+		}
+	}
+	if len(flags) > 0 {
+		return fmt.Errorf("%s: tracker.jira.auth is oidc, so no Jira credential is used; drop %s", repo, strings.Join(flags, ", "))
+	}
+	var leftover []string
+	for _, s := range []struct {
+		name   string
+		exists bool
+	}{
+		{forge.SecretJiraToken, d.jira.tokenExists},
+		{forge.SecretJiraEmail, d.jira.emailExists},
+		{forge.SecretJiraClientID, d.jira.clientIDExists},
+		{forge.SecretJiraClientSecret, d.jira.clientSecretExists},
+	} {
+		if s.exists {
+			leftover = append(leftover, s.name)
+		}
+	}
+	if len(leftover) > 0 {
+		return fmt.Errorf("%s: tracker.jira.auth is oidc but the repository still has %s; remove them from the repository (and organization) secrets, then rerun install",
+			repo, strings.Join(leftover, ", "))
 	}
 	return nil
 }
@@ -338,6 +390,11 @@ func convergeJiraPoll(ctx context.Context, d convergeDiscovery, cfg ConvergeConf
 	keep, stale := jiraTokenSecrets, jiraOAuthSecrets
 	if useOAuth {
 		keep, stale = jiraOAuthSecrets, jiraTokenSecrets
+	}
+	if d.jira.jira.IsOIDC() {
+		// No Jira credential secret is written or removed:
+		// validateJiraOIDCPollInputs has refused any that exist.
+		keep, stale = nil, nil
 	}
 	for _, name := range keep {
 		value, supplied := values[name]
