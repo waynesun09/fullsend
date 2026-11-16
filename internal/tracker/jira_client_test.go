@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	"github.com/fullsend-ai/fullsend/internal/config"
@@ -533,14 +534,57 @@ func TestJiraClient_FindStatusComment_LegacyFallback(t *testing.T) {
 	}
 }
 
-func TestJiraClient_UpdateStatusComment_PropertyError(t *testing.T) {
-	propertyErr := errors.New("property denied")
-	fc := &FakeJiraClient{PropertyError: propertyErr}
+func TestJiraClient_UpdateStatusComment_UpdateError(t *testing.T) {
+	updateErr := errors.New("update denied")
+	fc := &FakeJiraClient{UpdateError: updateErr}
 	c := newTestJiraClient(t, fc, "https://acme.atlassian.net")
 
 	err := c.UpdateStatusComment(context.Background(), "PROJ", 42, "1", "finished", "marker", true)
-	if !errors.Is(err, propertyErr) {
-		t.Errorf("UpdateStatusComment error = %v, want wrapped property error", err)
+	if !errors.Is(err, updateErr) {
+		t.Errorf("UpdateStatusComment error = %v, want wrapped update error", err)
+	}
+}
+
+// TestJiraClient_UpdateStatusComment_OneUpdateKeepsOtherProperties: the
+// status property travels in the same update as the body, and every other
+// property FindStatusComment read is resent with it.
+func TestJiraClient_UpdateStatusComment_OneUpdateKeepsOtherProperties(t *testing.T) {
+	ctx := context.Background()
+	marker := "<!-- fullsend:agent-status:run-1 -->"
+	fc := &FakeJiraClient{}
+	c := newTestJiraClient(t, fc, "https://acme.atlassian.net")
+	created, err := c.CreateStatusComment(ctx, "PROJ", 42, "started", marker, false)
+	if err != nil {
+		t.Fatalf("CreateStatusComment: %v", err)
+	}
+	fc.CommentProperties["PROJ-42/"+created.ID]["other.app"] = json.RawMessage(`{"keep":true}`)
+
+	// A fresh client, as reconcile-status uses, reads the properties first.
+	c = newTestJiraClient(t, fc, "https://acme.atlassian.net")
+	found, _, err := c.FindStatusComment(ctx, "PROJ", 42, marker)
+	if err != nil || found == nil {
+		t.Fatalf("FindStatusComment = %v, %v", found, err)
+	}
+	updates := fc.Updates
+	if err := c.UpdateStatusComment(ctx, "PROJ", 42, found.ID, "finished", marker, true); err != nil {
+		t.Fatalf("UpdateStatusComment: %v", err)
+	}
+	if fc.Updates != updates+1 {
+		t.Fatalf("updates = %d, want one request for body and property", fc.Updates-updates)
+	}
+	got := map[string]string{}
+	for _, p := range fc.UpdatedProperties {
+		got[p.Key] = string(p.Value)
+	}
+	if got["other.app"] != `{"keep":true}` {
+		t.Errorf("other property not resent: %v", got)
+	}
+	var stored statusCommentProperty
+	if err := json.Unmarshal([]byte(got[statusPropertyKey]), &stored); err != nil || stored.Marker != marker || !stored.Terminal {
+		t.Errorf("status property = %s, want marker %q terminal", got[statusPropertyKey], marker)
+	}
+	if fc.UpdatedBody != "finished" {
+		t.Errorf("UpdatedBody = %q", fc.UpdatedBody)
 	}
 }
 
@@ -761,8 +805,8 @@ func TestJiraClient_MigrateAndUpdateComment(t *testing.T) {
 	if fc.UpdatedBody != "migrated content" {
 		t.Errorf("UpdatedBody = %q, want %q", fc.UpdatedBody, "migrated content")
 	}
-	if fc.PropertyWrites != 1 {
-		t.Errorf("PropertyWrites = %d, want 1 for a legacy migration", fc.PropertyWrites)
+	if fc.Updates != 1 {
+		t.Errorf("Updates = %d, want 1: body and property in one request", fc.Updates)
 	}
 
 	// Verify property was set.
@@ -780,10 +824,9 @@ func TestJiraClient_MigrateAndUpdateComment(t *testing.T) {
 	}
 }
 
-// A comment already carrying an exactly matching marker property is
-// updated without any property write, so a Jira rejection of property
-// writes cannot block the body update.
-func TestJiraClient_MigrateAndUpdateComment_ExactPropertySkipsPropertyWrite(t *testing.T) {
+// A comment that already carries the marker property, and others, gets
+// them all back in the one update that replaces its body.
+func TestJiraClient_MigrateAndUpdateComment_ResendsExistingProperties(t *testing.T) {
 	fc := &FakeJiraClient{}
 	c := newTestJiraClient(t, fc, "https://acme.atlassian.net")
 	ctx := context.Background()
@@ -793,13 +836,20 @@ func TestJiraClient_MigrateAndUpdateComment_ExactPropertySkipsPropertyWrite(t *t
 	if err != nil {
 		t.Fatalf("CreateCommentWithMarker: %v", err)
 	}
-	fc.PropertyError = errors.New("403 forbidden")
+	fc.CommentProperties["PROJ-42/"+created.ID]["other.app"] = json.RawMessage(`"x"`)
 
 	if err := c.MigrateAndUpdateComment(ctx, "PROJ", 42, listedComment(t, c, created.ID), "second run", marker); err != nil {
 		t.Fatalf("MigrateAndUpdateComment: %v", err)
 	}
-	if fc.PropertyWrites != 0 {
-		t.Errorf("PropertyWrites = %d, want 0 for an exact property match", fc.PropertyWrites)
+	if fc.Updates != 1 {
+		t.Errorf("Updates = %d, want 1", fc.Updates)
+	}
+	keys := map[string]bool{}
+	for _, p := range fc.UpdatedProperties {
+		keys[p.Key] = true
+	}
+	if !keys[stickyPropertyKey] || !keys["other.app"] || len(keys) != 2 {
+		t.Errorf("UpdatedProperties keys = %v, want the marker and other.app", keys)
 	}
 	if fc.UpdatedCommentID != created.ID || fc.UpdatedBody != "second run" {
 		t.Errorf("UpdateComment(%q, %q), want (%q, %q)", fc.UpdatedCommentID, fc.UpdatedBody, created.ID, "second run")
@@ -838,8 +888,8 @@ func TestJiraClient_MigrateAndUpdateComment_InexactPropertyIsWritten(t *testing.
 			if err := c.MigrateAndUpdateComment(ctx, "PROJ", 42, comment, "updated", marker); err != nil {
 				t.Fatalf("MigrateAndUpdateComment: %v", err)
 			}
-			if fc.PropertyWrites != 1 {
-				t.Errorf("PropertyWrites = %d, want 1", fc.PropertyWrites)
+			if fc.Updates != 1 {
+				t.Errorf("Updates = %d, want 1", fc.Updates)
 			}
 			if !hasStickyMarkerProperty(listedComment(t, c, "1"), marker) {
 				t.Error("property should hold the requested marker after the update")
@@ -848,7 +898,7 @@ func TestJiraClient_MigrateAndUpdateComment_InexactPropertyIsWritten(t *testing.
 	}
 }
 
-func TestJiraClient_MigrateAndUpdateComment_SetPropertyError(t *testing.T) {
+func TestJiraClient_MigrateAndUpdateComment_UpdateErrorKeepsLegacyMarker(t *testing.T) {
 	fc := &FakeJiraClient{}
 	c := newTestJiraClient(t, fc, "https://acme.atlassian.net")
 	ctx := context.Background()
@@ -859,66 +909,20 @@ func TestJiraClient_MigrateAndUpdateComment_SetPropertyError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateComment: %v", err)
 	}
-
-	// Simulate a property write failure.
-	fc.PropertyError = errors.New("403 forbidden")
+	fc.UpdateError = errors.New("403 forbidden")
 
 	err = c.MigrateAndUpdateComment(ctx, "PROJ", 42, listedComment(t, c, "1"), "updated", marker)
-	if err == nil {
-		t.Fatal("expected error from MigrateAndUpdateComment when SetCommentProperty fails")
+	if !errors.Is(err, fc.UpdateError) {
+		t.Fatalf("error = %v, want the update error", err)
 	}
-	if !errors.Is(err, fc.PropertyError) {
-		t.Errorf("error should wrap PropertyError, got: %v", err)
-	}
-
-	// The body must be untouched, so the legacy marker still identifies
-	// the comment on the next run.
-	if fc.UpdatedCommentID != "" {
-		t.Errorf("UpdateComment called for comment %q after the property write failed", fc.UpdatedCommentID)
-	}
+	// Body and property are one request: a refused update leaves the
+	// legacy marker in the body, so the next run still finds the comment.
 	comments, err := c.ListJiraComments(ctx, "PROJ", 42)
 	if err != nil {
 		t.Fatalf("ListJiraComments: %v", err)
 	}
 	if found := c.FindCommentByMarkerProperty(comments, marker); found == nil || found.ID != "1" {
 		t.Errorf("FindCommentByMarkerProperty = %+v, want legacy comment 1", found)
-	}
-}
-
-func TestJiraClient_MigrateAndUpdateComment_UpdateCommentError(t *testing.T) {
-	fc := &FakeJiraClient{}
-	c := newTestJiraClient(t, fc, "https://acme.atlassian.net")
-	ctx := context.Background()
-	marker := "<!-- fullsend:triage-agent -->"
-
-	// Create a legacy comment to migrate.
-	_, err := fc.CreateComment(ctx, "PROJ-42", marker+"\nlegacy content")
-	if err != nil {
-		t.Fatalf("CreateComment: %v", err)
-	}
-
-	// Simulate an update failure (property write succeeds, body update fails).
-	fc.UpdateError = forge.ErrNotFound
-
-	err = c.MigrateAndUpdateComment(ctx, "PROJ", 42, listedComment(t, c, "1"), "updated", marker)
-	if err == nil {
-		t.Fatal("expected error from MigrateAndUpdateComment when UpdateComment fails")
-	}
-	if !errors.Is(err, forge.ErrNotFound) {
-		t.Errorf("error should wrap forge.ErrNotFound, got: %v", err)
-	}
-
-	// The migrated property keeps the comment discoverable for a retry.
-	comments, err := c.ListJiraComments(ctx, "PROJ", 42)
-	if err != nil {
-		t.Fatalf("ListJiraComments: %v", err)
-	}
-	found := c.FindCommentByMarkerProperty(comments, marker)
-	if found == nil || found.ID != "1" {
-		t.Fatalf("FindCommentByMarkerProperty = %+v, want comment 1", found)
-	}
-	if !hasStickyMarkerProperty(*found, marker) {
-		t.Error("comment should be found via its migrated property")
 	}
 }
 
@@ -1128,5 +1132,32 @@ func TestJiraClient_AddIssueLabel(t *testing.T) {
 	}
 	if err := client.AddIssueLabel(context.Background(), "PROJ", 999, "ai-coding-agent"); err == nil {
 		t.Fatal("expected missing issue error")
+	}
+}
+
+// TestCommentUpdateProperties_OwnKeyLastOthersResent: an update carries
+// core's own key (replacing an old value) after every other known key,
+// and the resend of the other keys is one isolated step.
+func TestCommentUpdateProperties_OwnKeyLastOthersResent(t *testing.T) {
+	known := []jira.CommentProperty{
+		{Key: "other.a", Value: json.RawMessage(`1`)},
+		{Key: "fullsend.own", Value: json.RawMessage(`"old"`)},
+		{Key: "other.b", Value: json.RawMessage(`2`)},
+	}
+	got := commentUpdateProperties(known, "fullsend.own", json.RawMessage(`"new"`))
+	want := []jira.CommentProperty{
+		{Key: "other.a", Value: json.RawMessage(`1`)},
+		{Key: "other.b", Value: json.RawMessage(`2`)},
+		{Key: "fullsend.own", Value: json.RawMessage(`"new"`)},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("commentUpdateProperties = %v, want %v", got, want)
+	}
+	others := resendOtherProperties(known, "fullsend.own")
+	if len(others) != 2 || others[0].Key != "other.a" || others[1].Key != "other.b" {
+		t.Errorf("resendOtherProperties = %v, want other.a and other.b", others)
+	}
+	if got := commentUpdateProperties(nil, "fullsend.own", json.RawMessage(`"x"`)); len(got) != 1 {
+		t.Errorf("with nothing known, only the own key is sent: %v", got)
 	}
 }

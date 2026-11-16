@@ -401,88 +401,43 @@ func TestSetEntityProperty(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GetCommentProperty — found and not-found
+// UpdateCommentWithProperties — body and properties in one PUT
 // ---------------------------------------------------------------------------
 
-func TestGetCommentProperty_Found(t *testing.T) {
-	t.Parallel()
+func TestUpdateCommentWithProperties_OneRequest(t *testing.T) {
 	client, mux := setupTest(t)
 	ctx := context.Background()
 
-	mux.HandleFunc("/rest/api/3/comment/10001/properties/fullsend.sticky-marker", func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, http.MethodGet, r.Method)
-		writeJSON(t, w, http.StatusOK, map[string]any{
-			"key":   "fullsend.sticky-marker",
-			"value": "<!-- fullsend:triage-agent -->",
-		})
+	var paths []string
+	var got struct {
+		Body       map[string]any    `json:"body"`
+		Properties []CommentProperty `json:"properties"`
+	}
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.Method+" "+r.URL.Path)
+		if r.Method == http.MethodPut && r.URL.Path == "/rest/api/3/issue/PROJ-1/comment/10001" {
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
 	})
 
-	val, err := client.GetCommentProperty(ctx, "PROJ-1", "10001", "fullsend.sticky-marker")
-	require.NoError(t, err)
+	props := []CommentProperty{
+		{Key: "other.app", Value: json.RawMessage(`{"keep":true}`)},
+		{Key: "fullsend.sticky-marker", Value: json.RawMessage(`{"marker":"m"}`)},
+	}
+	require.NoError(t, client.UpdateCommentWithProperties(ctx, "PROJ-1", "10001", "updated body", props))
+	assert.Equal(t, []string{"PUT /rest/api/3/issue/PROJ-1/comment/10001"}, paths, "one request, never /comment/{id}/properties")
+	assert.Equal(t, "doc", got.Body["type"], "the body is ADF")
+	assert.Equal(t, props, got.Properties, "every property travels with the body")
 
-	var stored string
-	require.NoError(t, json.Unmarshal(val, &stored))
-	assert.Equal(t, "<!-- fullsend:triage-agent -->", stored)
-}
-
-func TestGetCommentProperty_NotFound(t *testing.T) {
-	t.Parallel()
-	client, mux := setupTest(t)
-	ctx := context.Background()
-
-	handlerCalled := false
-	mux.HandleFunc("/rest/api/3/comment/10001/properties/missing", func(w http.ResponseWriter, r *http.Request) {
-		handlerCalled = true
-		assert.Equal(t, http.MethodGet, r.Method)
-		writeJSON(t, w, http.StatusNotFound, map[string]any{
-			"errorMessages": []string{"Property 'missing' not found"},
-		})
-	})
-
-	_, err := client.GetCommentProperty(ctx, "PROJ-1", "10001", "missing")
-	require.Error(t, err)
-	assert.True(t, errors.Is(err, forge.ErrNotFound), "expected forge.ErrNotFound, got: %v", err)
-	assert.True(t, handlerCalled, "handler was not called — URL path mismatch")
-}
-
-// ---------------------------------------------------------------------------
-// SetCommentProperty
-// ---------------------------------------------------------------------------
-
-func TestSetCommentProperty(t *testing.T) {
-	t.Parallel()
-	client, mux := setupTest(t)
-	ctx := context.Background()
-
-	mux.HandleFunc("/rest/api/3/comment/10001/properties/fullsend.sticky-marker", func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, http.MethodPut, r.Method)
-		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
-
-		var body string
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
-		assert.Equal(t, "<!-- fullsend:triage-agent -->", body)
-
-		w.WriteHeader(http.StatusOK)
-	})
-
-	err := client.SetCommentProperty(ctx, "PROJ-1", "10001", "fullsend.sticky-marker", "<!-- fullsend:triage-agent -->")
-	require.NoError(t, err)
-}
-
-func TestSetCommentProperty_Error(t *testing.T) {
-	t.Parallel()
-	client, mux := setupTest(t)
-	ctx := context.Background()
-
-	mux.HandleFunc("/rest/api/3/comment/10001/properties/fullsend.sticky-marker", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(t, w, http.StatusForbidden, map[string]any{
-			"errorMessages": []string{"Forbidden"},
-		})
-	})
-
-	err := client.SetCommentProperty(ctx, "PROJ-1", "10001", "fullsend.sticky-marker", "marker-value")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "set comment property")
+	// A body-only update sends no properties field.
+	paths = nil
+	got.Properties = nil
+	require.NoError(t, client.UpdateComment(ctx, "PROJ-1", "10001", "again"))
+	assert.Len(t, paths, 1)
+	assert.Nil(t, got.Properties)
 }
 
 // ---------------------------------------------------------------------------

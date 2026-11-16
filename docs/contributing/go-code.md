@@ -296,7 +296,7 @@ This applies to every handler registration in httptest-based tests — not just 
 
 ### Why this matters
 
-The coincidental-pass bug class is well-understood in Go httptest usage. A real instance occurred in this repo: `TestGetCommentProperty_NotFound` registered its handler at `/rest/api/3/issue/PROJ-1/comment/10001/properties/missing`, but the production code constructed the path `/rest/api/3/comment/10001/properties/missing` (no issue prefix). The handler was never invoked, yet the test passed because the default 404 matched the expected `forge.ErrNotFound`. The fix was a one-line `handlerCalled` assertion — see [`internal/forge/jira/client_test.go`](../../internal/forge/jira/client_test.go) for the canonical example.
+The coincidental-pass bug class is well-understood in Go httptest usage. A real instance occurred in this repo: a since-removed test, `TestGetCommentProperty_NotFound`, registered its handler at `/rest/api/3/issue/PROJ-1/comment/10001/properties/missing`, but the production code constructed the path `/rest/api/3/comment/10001/properties/missing` (no issue prefix). The handler was never invoked, yet the test passed because the default 404 matched the expected `forge.ErrNotFound`. The fix was a one-line `handlerCalled` assertion — see [`internal/forge/jira/client_test.go`](../../internal/forge/jira/client_test.go) for the canonical example.
 
 ## Context-aware blocking
 

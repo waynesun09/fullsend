@@ -1261,10 +1261,9 @@ func TestRunIssuesPostComment_JiraNeutralizesStoredMarkersInHistory(t *testing.T
 	assert.Contains(t, body, `\&lt;!-- fullsend:review-agent -->`)
 }
 
-func TestRunIssuesPostComment_JiraPropertyMarkedSkipsPropertyWrite(t *testing.T) {
-	// An existing comment whose marker property already matches is
-	// updated without rewriting the property, so a Jira rejection of
-	// property writes (e.g. 403) does not block the body update.
+func TestRunIssuesPostComment_JiraPropertyMarkedOneUpdate(t *testing.T) {
+	// An existing comment is updated with its body and marker property
+	// in one request.
 	tc, fc, err := tracker.NewFakeJiraClientWithFake("https://acme.atlassian.net")
 	require.NoError(t, err)
 	ctx := context.Background()
@@ -1282,13 +1281,13 @@ func TestRunIssuesPostComment_JiraPropertyMarkedSkipsPropertyWrite(t *testing.T)
 		testBody:    "first run",
 	}
 	require.NoError(t, runIssuesPostComment(ctx, cfg))
-	assert.Zero(t, fc.PropertyWrites, "creation sets the property inline, not via a separate write")
-
-	fc.PropertyError = fmt.Errorf("set comment property: %w", forge.ErrForbidden)
+	assert.Zero(t, fc.Updates, "creation sets the property inline")
 
 	cfg.testBody = "second run"
 	require.NoError(t, runIssuesPostComment(ctx, cfg))
-	assert.Zero(t, fc.PropertyWrites, "an exact property match must not rewrite the property")
+	assert.Equal(t, 1, fc.Updates, "body and marker property in one update")
+	require.Len(t, fc.UpdatedProperties, 1)
+	assert.Contains(t, string(fc.UpdatedProperties[0].Value), "fullsend:triage-agent")
 
 	comments, err := tc.ListComments(ctx, "PROJ", 42)
 	require.NoError(t, err)
@@ -1297,9 +1296,9 @@ func TestRunIssuesPostComment_JiraPropertyMarkedSkipsPropertyWrite(t *testing.T)
 }
 
 func TestRunIssuesPostComment_JiraLegacyPropertyPermissionFailure(t *testing.T) {
-	// When the Jira API rejects the property write that migrates a
-	// legacy comment, the update fails with an actionable error and the
-	// body keeps its legacy marker rather than losing it.
+	// When the Jira API rejects the update that migrates a legacy
+	// comment, it fails with an actionable error and the body keeps its
+	// legacy marker rather than losing it.
 	tc, fc, err := tracker.NewFakeJiraClientWithFake("https://acme.atlassian.net")
 	require.NoError(t, err)
 	ctx := context.Background()
@@ -1308,7 +1307,7 @@ func TestRunIssuesPostComment_JiraLegacyPropertyPermissionFailure(t *testing.T) 
 	_, err = fc.CreateComment(ctx, "PROJ-42", marker+"\nlegacy content")
 	require.NoError(t, err)
 
-	fc.PropertyError = fmt.Errorf("set comment property: %w", forge.ErrForbidden)
+	fc.UpdateError = fmt.Errorf("update comment: %w", forge.ErrForbidden)
 
 	cfg := &issuesPostCommentConfig{
 		trackerName: trackerJira,
@@ -1321,8 +1320,8 @@ func TestRunIssuesPostComment_JiraLegacyPropertyPermissionFailure(t *testing.T) 
 	}
 	err = runIssuesPostComment(ctx, cfg)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "sticky marker property")
-	assert.Equal(t, 1, fc.PropertyWrites)
+	assert.Contains(t, err.Error(), "updating comment")
+	assert.Equal(t, 1, fc.Updates)
 
 	comments, err := tc.ListComments(ctx, "PROJ", 42)
 	require.NoError(t, err)

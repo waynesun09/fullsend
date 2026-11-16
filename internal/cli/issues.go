@@ -553,8 +553,9 @@ func runIssuesPostComment(ctx context.Context, cfg *issuesPostCommentConfig) err
 // On create, the marker is stored as a comment property via the Jira
 // comment-create API's properties array. On lookup, comments are fetched
 // with ?expand=properties and matched by property value. On update, the
-// property is set only for a legacy comment matched by its body-embedded
-// marker, migrating it; a comment matched by property is left as is.
+// body and the marker property go in one request that also resends the
+// comment's other properties; a legacy comment matched by its
+// body-embedded marker is migrated that way.
 func postJiraStickyComment(ctx context.Context, jc *tracker.JiraClient, project string, number int, body string, cfg sticky.Config, onlyIfExists bool, printer *ui.Printer) (string, error) {
 	if strings.TrimSpace(body) == "" {
 		return "", fmt.Errorf("comment body is empty")

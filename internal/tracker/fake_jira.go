@@ -41,16 +41,17 @@ type FakeJiraClient struct {
 	CreatedIssues    []jira.CreateIssueInput
 	CreateIssueError error
 
-	// PropertyError, when non-nil, is returned by SetCommentProperty
-	// to simulate permission failures.
-	PropertyError error
+	// UpdatedProperties are the properties the last successful
+	// UpdateCommentWithProperties sent with the body (nil for a
+	// body-only update).
+	UpdatedProperties []jira.CommentProperty
 
-	// PropertyWrites counts SetCommentProperty calls, including ones
-	// that fail with PropertyError.
-	PropertyWrites int
+	// Updates counts UpdateComment and UpdateCommentWithProperties calls,
+	// including ones that fail with UpdateError.
+	Updates int
 
-	// UpdateError, when non-nil, is returned by UpdateComment to
-	// simulate update failures.
+	// UpdateError, when non-nil, is returned by UpdateComment and
+	// UpdateCommentWithProperties to simulate update failures.
 	UpdateError error
 
 	// Myself is the account GetMyself returns and new comments are
@@ -204,13 +205,22 @@ func (f *FakeJiraClient) CreateCommentWithProperties(_ context.Context, issueIDO
 	return &comment, nil
 }
 
-func (f *FakeJiraClient) UpdateComment(_ context.Context, issueIDOrKey, commentID, body string) error {
+func (f *FakeJiraClient) UpdateComment(ctx context.Context, issueIDOrKey, commentID, body string) error {
+	return f.UpdateCommentWithProperties(ctx, issueIDOrKey, commentID, body, nil)
+}
+
+// UpdateCommentWithProperties records the update like UpdateComment and,
+// when properties is non-empty, records them in UpdatedProperties and
+// stores each key, merging per key as the property store does.
+func (f *FakeJiraClient) UpdateCommentWithProperties(_ context.Context, issueIDOrKey, commentID, body string, properties []jira.CommentProperty) error {
+	f.Updates++
 	if f.UpdateError != nil {
 		return f.UpdateError
 	}
 	f.UpdatedIssueKey = issueIDOrKey
 	f.UpdatedCommentID = commentID
 	f.UpdatedBody = body
+	f.UpdatedProperties = append([]jira.CommentProperty(nil), properties...)
 	adf, err := jira.MarkdownToADF(body) // mirrors Jira echoing back the ADF it stored
 	if err != nil {
 		return err
@@ -221,13 +231,8 @@ func (f *FakeJiraClient) UpdateComment(_ context.Context, issueIDOrKey, commentI
 			break
 		}
 	}
-	return nil
-}
-
-func (f *FakeJiraClient) SetCommentProperty(_ context.Context, issueIDOrKey, commentID, propertyKey string, value any) error {
-	f.PropertyWrites++
-	if f.PropertyError != nil {
-		return f.PropertyError
+	if len(properties) == 0 {
+		return nil
 	}
 	if f.CommentProperties == nil {
 		f.CommentProperties = make(map[string]map[string]json.RawMessage)
@@ -236,11 +241,9 @@ func (f *FakeJiraClient) SetCommentProperty(_ context.Context, issueIDOrKey, com
 	if f.CommentProperties[propKey] == nil {
 		f.CommentProperties[propKey] = make(map[string]json.RawMessage)
 	}
-	raw, err := json.Marshal(value)
-	if err != nil {
-		return err
+	for _, p := range properties {
+		f.CommentProperties[propKey][p.Key] = p.Value
 	}
-	f.CommentProperties[propKey][propertyKey] = raw
 	return nil
 }
 
@@ -276,7 +279,7 @@ func NewFakeJiraClient(baseURL string) (*JiraClient, error) {
 
 // NewFakeJiraClientWithFake returns both the tracker.Client and the
 // underlying FakeJiraClient, giving tests access to the fake's control
-// fields (e.g. PropertyError for permission failure simulation).
+// fields (e.g. UpdateError for update failure simulation).
 func NewFakeJiraClientWithFake(baseURL string) (*JiraClient, *FakeJiraClient, error) {
 	fc := &FakeJiraClient{}
 	tc, err := NewJiraClient(fc, baseURL)

@@ -894,46 +894,28 @@ func (c *LiveClient) CreateCommentWithProperties(ctx context.Context, issueIDOrK
 // markdown; it's converted to ADF before being sent, for the same reason
 // as CreateComment.
 func (c *LiveClient) UpdateComment(ctx context.Context, issueIDOrKey, commentID, body string) error {
+	return c.UpdateCommentWithProperties(ctx, issueIDOrKey, commentID, body, nil)
+}
+
+// UpdateCommentWithProperties replaces the body of an existing comment
+// and, when properties is non-empty, sends them in the same
+// PUT /issue/{key}/comment/{id} request (the comment schema's properties
+// field), so the body and the properties are written together. Whether
+// Jira merges the properties per key or replaces the comment's other
+// properties is not documented, so callers pass every property the
+// comment should keep. body is markdown, converted to ADF.
+func (c *LiveClient) UpdateCommentWithProperties(ctx context.Context, issueIDOrKey, commentID, body string, properties []CommentProperty) error {
 	adf, err := MarkdownToADF(body)
 	if err != nil {
 		return fmt.Errorf("convert comment body to ADF: %w", err)
 	}
-	reqBody, err := json.Marshal(commentRequest{Body: adf})
+	reqBody, err := json.Marshal(commentRequest{Body: adf, Properties: properties})
 	if err != nil {
 		return fmt.Errorf("marshal update comment request: %w", err)
 	}
 	path := "/issue/" + url.PathEscape(issueIDOrKey) + "/comment/" + url.PathEscape(commentID)
 	if err := c.do(ctx, http.MethodPut, path, bytes.NewReader(reqBody), nil); err != nil {
 		return fmt.Errorf("update comment %s on %s: %w", commentID, issueIDOrKey, err)
-	}
-	return nil
-}
-
-// GetCommentProperty retrieves the value of an entity property on a
-// comment. Returns forge.ErrNotFound (wrapped) if the property does not
-// exist.
-func (c *LiveClient) GetCommentProperty(ctx context.Context, issueIDOrKey, commentID, propertyKey string) (json.RawMessage, error) {
-	path := fmt.Sprintf("/comment/%s/properties/%s",
-		url.PathEscape(commentID), url.PathEscape(propertyKey))
-	var prop EntityPropertyValue
-	if err := c.do(ctx, http.MethodGet, path, nil, &prop); err != nil {
-		return nil, fmt.Errorf("get comment property %s on comment %s of %s: %w", propertyKey, commentID, issueIDOrKey, err)
-	}
-	return prop.Value, nil
-}
-
-// SetCommentProperty sets (creates or updates) an entity property on a
-// comment. Used to store sticky-comment markers in a location invisible
-// to Jira users.
-func (c *LiveClient) SetCommentProperty(ctx context.Context, issueIDOrKey, commentID, propertyKey string, value any) error {
-	path := fmt.Sprintf("/comment/%s/properties/%s",
-		url.PathEscape(commentID), url.PathEscape(propertyKey))
-	body, err := json.Marshal(value)
-	if err != nil {
-		return fmt.Errorf("marshal comment property value: %w", err)
-	}
-	if err := c.do(ctx, http.MethodPut, path, bytes.NewReader(body), nil); err != nil {
-		return fmt.Errorf("set comment property %s on comment %s of %s: %w", propertyKey, commentID, issueIDOrKey, err)
 	}
 	return nil
 }

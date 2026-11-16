@@ -7,6 +7,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -65,7 +66,7 @@ type jiraClient interface {
 	CreateComment(ctx context.Context, issueIDOrKey, body string) (*jira.Comment, error)
 	CreateCommentWithProperties(ctx context.Context, issueIDOrKey, body string, properties []jira.CommentProperty) (*jira.Comment, error)
 	UpdateComment(ctx context.Context, issueIDOrKey, commentID, body string) error
-	SetCommentProperty(ctx context.Context, issueIDOrKey, commentID, propertyKey string, value any) error
+	UpdateCommentWithProperties(ctx context.Context, issueIDOrKey, commentID, body string, properties []jira.CommentProperty) error
 	DeleteComment(ctx context.Context, issueIDOrKey, commentID string) error
 	GetMyself(ctx context.Context) (*jira.User, error)
 	LinkIssues(ctx context.Context, inwardIssueKey, outwardIssueKey, linkTypeName string) error
@@ -79,6 +80,54 @@ var _ jiraClient = (*jira.LiveClient)(nil)
 type JiraClient struct {
 	jira    jiraClient
 	baseURL string // for browse URLs: {baseURL}/browse/{key}
+
+	// propsMu guards props: the comment properties this client last read
+	// (ListComments with expand=properties) or wrote, keyed by
+	// "issueKey/commentID". An update resends them with its own property,
+	// so it keeps every other key whether Jira merges or replaces the
+	// properties of an updated comment.
+	propsMu sync.Mutex
+	props   map[string][]jira.CommentProperty
+}
+
+// rememberProperties records the properties known for a comment.
+func (c *JiraClient) rememberProperties(key, commentID string, props []jira.CommentProperty) {
+	c.propsMu.Lock()
+	defer c.propsMu.Unlock()
+	if c.props == nil {
+		c.props = make(map[string][]jira.CommentProperty)
+	}
+	c.props[key+"/"+commentID] = append([]jira.CommentProperty(nil), props...)
+}
+
+// knownProperties returns the properties recorded for a comment, or nil
+// when this client has neither read nor written it.
+func (c *JiraClient) knownProperties(key, commentID string) []jira.CommentProperty {
+	c.propsMu.Lock()
+	defer c.propsMu.Unlock()
+	return append([]jira.CommentProperty(nil), c.props[key+"/"+commentID]...)
+}
+
+// commentUpdateProperties builds the properties sent with a comment
+// update: the properties resendOtherProperties keeps from known, then
+// core's own key set to value.
+func commentUpdateProperties(known []jira.CommentProperty, key string, value json.RawMessage) []jira.CommentProperty {
+	return append(resendOtherProperties(known, key), jira.CommentProperty{Key: key, Value: value})
+}
+
+// resendOtherProperties returns the known properties other than core's own
+// key, in order, so an update keeps them whether Jira merges or replaces
+// the properties of an updated comment. If Jira turns out to merge them
+// per key, this step can return nil, and core then sends only its own
+// key and never writes a property it does not own.
+func resendOtherProperties(known []jira.CommentProperty, ownKey string) []jira.CommentProperty {
+	out := make([]jira.CommentProperty, 0, len(known)+1)
+	for _, p := range known {
+		if p.Key != ownKey {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // NewJiraClient returns a tracker.Client backed by jc. baseURL is the
@@ -254,25 +303,33 @@ func (c *JiraClient) CreateStatusComment(ctx context.Context, project string, nu
 	// statusCommentProperty contains only a string and bool, so marshaling
 	// cannot fail.
 	value, _ := json.Marshal(statusCommentProperty{Marker: marker, Terminal: terminal})
-	comment, err := c.jira.CreateCommentWithProperties(ctx, key, string(body), []jira.CommentProperty{{
-		Key: statusPropertyKey, Value: value,
-	}})
+	props := []jira.CommentProperty{{Key: statusPropertyKey, Value: value}}
+	comment, err := c.jira.CreateCommentWithProperties(ctx, key, string(body), props)
 	if err != nil {
 		return nil, wrapNotFound(err)
 	}
+	c.rememberProperties(key, comment.ID, props)
 	result := fromJiraComment(*comment)
 	return &result, nil
 }
 
-// UpdateStatusComment implements StatusCommentClient. Writing the property
-// first preserves discoverability if the subsequent body update fails.
+// UpdateStatusComment implements StatusCommentClient. The body and the
+// status property travel in one update, so the comment never holds a new
+// body without its marker. The update resends every other property this
+// client read or wrote for the comment (CreateStatusComment,
+// FindStatusComment); for a comment it has neither read nor written, only
+// the status property is sent.
 func (c *JiraClient) UpdateStatusComment(ctx context.Context, project string, number int, commentID string, body Body, marker string, terminal bool) error {
 	key := issueKey(project, number)
-	property := statusCommentProperty{Marker: marker, Terminal: terminal}
-	if err := c.jira.SetCommentProperty(ctx, key, commentID, statusPropertyKey, property); err != nil {
-		return fmt.Errorf("setting status property on comment %s of %s: %w", commentID, key, err)
+	// statusCommentProperty contains only a string and bool, so marshaling
+	// cannot fail.
+	value, _ := json.Marshal(statusCommentProperty{Marker: marker, Terminal: terminal})
+	props := commentUpdateProperties(c.knownProperties(key, commentID), statusPropertyKey, value)
+	if err := c.jira.UpdateCommentWithProperties(ctx, key, commentID, string(body), props); err != nil {
+		return wrapNotFound(err)
 	}
-	return wrapNotFound(c.jira.UpdateComment(ctx, key, commentID, string(body)))
+	c.rememberProperties(key, commentID, props)
+	return nil
 }
 
 // FindStatusComment implements StatusCommentClient. Property lookup is the
@@ -292,6 +349,7 @@ func (c *JiraClient) FindStatusComment(ctx context.Context, project string, numb
 			}
 			var stored statusCommentProperty
 			if json.Unmarshal(prop.Value, &stored) == nil && stored.Marker == marker {
+				c.rememberProperties(key, comments[i].ID, comments[i].Properties)
 				result := fromJiraComment(comments[i])
 				return &result, stored.Terminal, nil
 			}
@@ -299,6 +357,7 @@ func (c *JiraClient) FindStatusComment(ctx context.Context, project string, numb
 	}
 	for i := range comments {
 		if body, ok := legacyMarkdown(comments[i]); ok && hasLegacyMarker(body, marker) {
+			c.rememberProperties(key, comments[i].ID, comments[i].Properties)
 			result := fromJiraComment(comments[i])
 			return &result, strings.Contains(body, "fullsend:status:terminal"), nil
 		}
@@ -425,32 +484,26 @@ func hasLegacyMarker(md, marker string) bool {
 }
 
 // MigrateAndUpdateComment updates the body of comment, the sticky
-// comment FindCommentByMarkerProperty matched, and ensures the sticky
-// marker is stored as a comment entity property.
+// comment FindCommentByMarkerProperty matched, and stores the sticky
+// marker as a comment entity property in the same update, so the body and
+// the marker are never written apart. A comment found via the legacy
+// body-text path is thereby migrated to the property-based scheme.
 //
-// A comment that already carries a property exactly matching marker is
-// updated without rewriting the property: the write would be redundant,
-// and a Jira rejection of it would otherwise block the body update. A
-// comment found via the legacy body-text path has the property set
-// first, transparently migrating it to the property-based scheme.
+// The update resends comment.Properties (read with expand=properties),
+// with the sticky marker set, so every other property key survives
+// whether Jira merges or replaces the properties of an updated comment.
 //
 // The body written to Jira has the marker stripped (unlike
 // GitHub/GitLab where the marker is an invisible HTML comment). The
 // caller should pass the body without the marker prefix.
 func (c *JiraClient) MigrateAndUpdateComment(ctx context.Context, project string, number int, comment jira.Comment, body Body, marker string) error {
 	key := issueKey(project, number)
-	if !hasStickyMarkerProperty(comment, marker) {
-		// Property-before-body ordering is intentional: if the property
-		// write succeeds but the body update fails, the next run will
-		// still find the comment via its property and can retry. The
-		// reverse order risks losing the marker from both the body
-		// (which was just stripped) and the property (which was never
-		// set).
-		if err := c.jira.SetCommentProperty(ctx, key, comment.ID, stickyPropertyKey, stickyMarkerProperty{Marker: marker}); err != nil {
-			return fmt.Errorf("setting sticky marker property on comment %s of %s: %w", comment.ID, key, err)
-		}
+	value, err := json.Marshal(stickyMarkerProperty{Marker: marker})
+	if err != nil {
+		return fmt.Errorf("marshal sticky marker: %w", err)
 	}
-	if err := c.jira.UpdateComment(ctx, key, comment.ID, string(body)); err != nil {
+	props := commentUpdateProperties(comment.Properties, stickyPropertyKey, value)
+	if err := c.jira.UpdateCommentWithProperties(ctx, key, comment.ID, string(body), props); err != nil {
 		return wrapNotFound(err)
 	}
 	return nil
