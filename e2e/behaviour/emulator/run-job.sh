@@ -76,6 +76,7 @@ stop_all() {
     kill -9 "$sampler_pid" 2>/dev/null || true
     echo "VM peak: $(cat "$STATE/vm-peak.log" 2>/dev/null)"
   fi
+  if [ -n "${dnsprobe_pid:-}" ]; then kill "$dnsprobe_pid" 2>/dev/null || true; fi
   if [ -n "${oslogs_pid:-}" ]; then
     kill "$oslogs_pid" 2>/dev/null || true
     keep_openshell_logs
@@ -310,6 +311,21 @@ keep_openshell_logs() {
 }
 while :; do keep_openshell_logs; sleep 5; done &
 oslogs_pid=$!
+
+# Diagnostic: name lookup and one contents API call every 20 s through the
+# suite (dns-probe.log), timed the way fullsend's fetch makes them.
+(cd "$ROOT" && go build -o "$STATE/dnsprobe" ./e2e/behaviour/emulator/dnsprobe)
+probe_url="$EMU/api/v3/repos/fullsend-ai/fullsend/contents/go.mod"
+(
+  while :; do
+    "$STATE/dnsprobe" "$EMU_HOST" "$probe_url" "$ADMIN" 2>&1
+    curl -sS -o /dev/null -H "Authorization: token $ADMIN" \
+      -w "  curl lookup=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} total=%{time_total} http=%{http_code}\n" \
+      "$probe_url" 2>&1
+    sleep 20
+  done
+) >"$STATE/dns-probe.log" 2>&1 &
+dnsprobe_pid=$!
 
 # 5. The suite, emulator mode.
 status=0
