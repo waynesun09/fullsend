@@ -85,10 +85,17 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc # v6.4.3
+        with:
+          enable-cache: false
+
+      # The emulator's locked dependencies, installed with hashes, as its
+      # own smoke workflow does.
       - name: Install emulator dependencies
         run: |
           python3 -m venv "$RUNNER_TEMP/emu-venv"
-          "$RUNNER_TEMP/emu-venv/bin/pip" install -q -r .emulator/requirements.txt
+          uv export -q --frozen --no-dev --no-emit-project --format requirements-txt --project .emulator -o "$RUNNER_TEMP/emu-requirements.txt"
+          "$RUNNER_TEMP/emu-venv/bin/pip" install -q --require-hashes -r "$RUNNER_TEMP/emu-requirements.txt"
 
       - name: Run behaviour features
         env:
@@ -152,10 +159,17 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc # v6.4.3
+        with:
+          enable-cache: false
+
+      # The emulator's locked dependencies, installed with hashes, as its
+      # own smoke workflow does.
       - name: Install emulator dependencies
         run: |
           python3 -m venv "$RUNNER_TEMP/emu-venv"
-          "$RUNNER_TEMP/emu-venv/bin/pip" install -q -r .emulator/requirements.txt
+          uv export -q --frozen --no-dev --no-emit-project --format requirements-txt --project .emulator -o "$RUNNER_TEMP/emu-requirements.txt"
+          "$RUNNER_TEMP/emu-venv/bin/pip" install -q --require-hashes -r "$RUNNER_TEMP/emu-requirements.txt"
 
       - name: Run the playback suite
         env:
