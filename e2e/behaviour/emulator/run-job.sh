@@ -90,6 +90,20 @@ stop_all() {
 }
 trap stop_all EXIT
 
+# The mint binary and the suite's test build, compiled in the background
+# from the start so neither waits on the stack: the suite's go test then
+# finds its packages in the build cache.
+build_mint() {
+  (cd "$ROOT/cmd/mint" && go build -tags github \
+    -ldflags "-X github.com/fullsend-ai/fullsend/internal/mintcore.StatusGitHubGroup=$ORG/mint-status" \
+    -o "$STATE/mint" .)
+}
+(
+  build_mint
+  cd "$ROOT" && go test -c -tags "$SUITE" -o "$STATE/suite-warm.test" ./e2e/behaviour/ && rm -f "$STATE/suite-warm.test"
+) >"$STATE/go-warm.log" 2>&1 &
+go_warm_pid=$!
+
 # 0. All runners share this VM, so it becomes the sandbox host once, before
 # the stack start, and the runners inherit OPENSHELL_GATEWAY_ENDPOINT: the
 # action then skips its per-job Podman and gateway setup, whose
@@ -218,9 +232,10 @@ fi
 # 3. fullsend's standalone mint, trusting the emulator's OIDC issuer and API.
 # Built as the preview mint is deployed: status callers authenticate with
 # OIDC or as members of the $ORG/mint-status team (mint-status.feature).
-(cd "$ROOT/cmd/mint" && go build -tags github \
-  -ldflags "-X github.com/fullsend-ai/fullsend/internal/mintcore.StatusGitHubGroup=$ORG/mint-status" \
-  -o "$STATE/mint" .)
+if [ -n "${go_warm_pid:-}" ]; then
+  wait "$go_warm_pid" || echo "::warning::early Go build failed; building now ($(tail -c 300 "$STATE/go-warm.log"))"
+fi
+[ -x "$STATE/mint" ] || build_mint
 hosts=""
 # The pool's workflow hosts, as on the preview mints (mint-status checks
 # them); the mint accepts fullsend-ai/fullsend's own workflows anyway.
