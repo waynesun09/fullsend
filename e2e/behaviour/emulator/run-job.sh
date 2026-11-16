@@ -231,6 +231,18 @@ if [ "$AGENTS_SEED" = 1 ]; then
     ( for img in "${sandbox_images[@]}"; do podman pull -q "$img" >/dev/null; done ) >"$STATE/prepull.log" 2>&1 &
     prepull_pid=$!
   fi
+  # The emulator's runners share this VM's $HOME, and the agents' post
+  # scripts install gitleaks in place into $HOME/.local/bin. Two runs
+  # installing at once can run each other's half-written binary. Install it
+  # once here with the agents' own installer; each later call then finds the
+  # pinned version and skips the download.
+  gitleaks_lib="$agents/scripts/lib/gitleaks-install.lib.sh"
+  if [ -f "$gitleaks_lib" ]; then
+    # shellcheck source=/dev/null
+    ( . "$gitleaks_lib" && install_gitleaks ) >"$STATE/gitleaks-install.log" 2>&1 \
+      || echo "::warning::gitleaks pre-install failed; agent jobs install it themselves ($(tail -c 300 "$STATE/gitleaks-install.log"))"
+    phase gitleaks
+  fi
 fi
 
 # 4c. The human-like test actors, as hack/setup-new-e2e-org.sh grants them
