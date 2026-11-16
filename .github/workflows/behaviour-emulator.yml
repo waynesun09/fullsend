@@ -24,33 +24,21 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The emulator-ready set (43 scenarios plus the 16 bot identity ones) in
-  # four shards, each on its own VM at six workers, balanced on measured
-  # scenario time (about 5600-6100 worker-seconds each, so about 17
-  # minutes of suite per shard). A 4-vCPU VM averages 60-66% CPU at six
-  # workers, so shards scale out, not up.
+  # The 85 behaviour scenarios in eleven shards (e2e/behaviour/emulator/shards.txt),
+  # one VM each, balanced on measured scenario time: a shard takes about as
+  # long as its longest scenario chain, so wider shards cut wall time until
+  # each holds one long chain. Fewer scenarios per VM also need fewer
+  # runners, and the stack registers them one after another.
   #
-  # Shard e: mint-scope.feature (18 outline rows, about 10 minutes of suite)
-  # and the raw-host and capability-gated scenarios. base-dispatch,
-  # url-dispatch.feature:7 and skill-overrides fetch from
+  # base-dispatch, url-dispatch.feature:7 and skill-overrides fetch from
   # raw.githubusercontent.com, which run-job.sh points at a public address on
   # the VM's lo where the emulator answers, so they pass the same fetch guard
   # production runs.
-  SHARD_A_FEATURES: >-
-    features/dispatch/owners-auth.feature features/platform/actor-authorization.feature features/platform/bot-role-lookup.feature features/platform/mint-status.feature
-  SHARD_B_FEATURES: >-
-    features/triage/triage.feature features/dispatch/dispatch.feature features/dispatch/retro-cel-route.feature features/dispatch/hooks-loaded.feature features/actors/actor-identities.feature features/dispatch/jira-poll-dispatch.feature features/dispatch/jira-transport-bounds.feature
-  SHARD_C_FEATURES: >-
-    features/dispatch/fork-bash-routing.feature features/dispatch/fix-authorization.feature features/dispatch/fork-dispatch.feature features/dispatch/url-dispatch.feature:29 features/dispatch/url-dispatch.feature:64 features/dispatch/url-dispatch.feature:100 features/dispatch/runner-secret-overlay-guard.feature
-  SHARD_D_FEATURES: >-
-    features/platform/bot-actor-authorization.feature features/dispatch/triage-prioritize-cel-route.feature features/dispatch/review-cel-route.feature features/dispatch/reaction-notifications.feature
-  SHARD_E_FEATURES: >-
-    features/platform/mint-scope.feature features/dispatch/base-dispatch.feature features/dispatch/url-dispatch.feature:7 features/runtime/skill-overrides.feature features/code/branch-namespace.feature features/dispatch/fetch-allowlist-gate.feature features/runtime/agent-settings.feature:13
   # applier-branch-namespace: the seeded fullsend-ai/agents main enforces it.
   # fetch-allowlist-gate: the job runs this checkout's fullsend, which has the gate.
   DEFAULT_CAPABILITIES: runner-secret-overlay-guard,applier-branch-namespace,fetch-allowlist-gate
-  DEFAULT_WORKERS: "6"
-  DEFAULT_RUNNERS: "12"
+  DEFAULT_WORKERS: "4"
+  DEFAULT_RUNNERS: "6"
   # waynesun09/github-emulator ci-self-contained (integration head with the mint App seed).
   EMULATOR_REPO: waynesun09/github-emulator
   EMULATOR_REF: c90fff510d75eab779acfe4b2c46fc362bdd0930
@@ -64,7 +52,7 @@ jobs:
       fail-fast: false
       matrix:
         # A dispatch with explicit features runs them as one "custom" shard.
-        shard: ${{ fromJSON(inputs.features && '["custom"]' || '["a","b","c","d","e"]') }}
+        shard: ${{ fromJSON(inputs.features && '["custom"]' || '["a","b","c","d","e","f","g","h","i","j","k"]') }}
     steps:
       - name: Checkout fullsend
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -95,7 +83,7 @@ jobs:
         run: |
           python3 -m venv "$RUNNER_TEMP/emu-venv"
           uv export -q --frozen --no-dev --no-emit-project --format requirements-txt --project .emulator -o "$RUNNER_TEMP/emu-requirements.txt"
-          "$RUNNER_TEMP/emu-venv/bin/pip" install -q --require-hashes -r "$RUNNER_TEMP/emu-requirements.txt"
+          uv pip install -q --python "$RUNNER_TEMP/emu-venv/bin/python" --require-hashes -r "$RUNNER_TEMP/emu-requirements.txt"
 
       - name: Run behaviour features
         env:
@@ -105,7 +93,8 @@ jobs:
           # Read-only job token, only so the emulator can fetch public
           # github.com actions without the anonymous rate limit.
           UPSTREAM_TOKEN: ${{ github.token }}
-          FEATURES: ${{ inputs.features || (matrix.shard == 'a' && env.SHARD_A_FEATURES) || (matrix.shard == 'b' && env.SHARD_B_FEATURES) || (matrix.shard == 'c' && env.SHARD_C_FEATURES) || (matrix.shard == 'd' && env.SHARD_D_FEATURES) || env.SHARD_E_FEATURES }}
+          FEATURES: ${{ inputs.features }}
+          SHARD: ${{ matrix.shard }}
           WORKERS: ${{ inputs.workers || env.DEFAULT_WORKERS }}
           EMULATOR_RUNNERS: ${{ inputs.runners || env.DEFAULT_RUNNERS }}
           SUITE_TIMEOUT: 30m
@@ -113,6 +102,10 @@ jobs:
           # The run falls back to fullsend-ai/agents@main on the configured forge.
           AGENTS_SEED: "1"
         run: |
+          if [ -z "$FEATURES" ]; then
+            FEATURES=$(awk -v s="$SHARD" '$1 == s { $1 = ""; print }' e2e/behaviour/emulator/shards.txt)
+          fi
+          [ -n "$FEATURES" ] || { echo "::error::no features for shard $SHARD"; exit 1; }
           read -ra feats <<<"$FEATURES"
           export BEHAVIOUR_POOL_SIZE="$WORKERS" GODOG_CONCURRENCY="$WORKERS"
           e2e/behaviour/emulator/run-job.sh "${feats[@]}"
@@ -169,7 +162,7 @@ jobs:
         run: |
           python3 -m venv "$RUNNER_TEMP/emu-venv"
           uv export -q --frozen --no-dev --no-emit-project --format requirements-txt --project .emulator -o "$RUNNER_TEMP/emu-requirements.txt"
-          "$RUNNER_TEMP/emu-venv/bin/pip" install -q --require-hashes -r "$RUNNER_TEMP/emu-requirements.txt"
+          uv pip install -q --python "$RUNNER_TEMP/emu-venv/bin/python" --require-hashes -r "$RUNNER_TEMP/emu-requirements.txt"
 
       - name: Run the playback suite
         env:
@@ -200,3 +193,19 @@ jobs:
             ${{ runner.temp }}/bt-emulator/openshell-logs/
             !${{ runner.temp }}/bt-emulator/stack/runner-*/_work/**
           if-no-files-found: warn
+
+  # The one check to require: green only when every shard and playback passed.
+  behaviour-emulator-result:
+    name: behaviour-emulator
+    if: ${{ always() }}
+    needs: [behaviour-emulator, behaviour-emulator-playback]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: All shards passed
+        env:
+          SHARDS: ${{ needs.behaviour-emulator.result }}
+          PLAYBACK: ${{ needs.behaviour-emulator-playback.result }}
+        run: |
+          echo "shards: $SHARDS, playback: $PLAYBACK"
+          [ "$SHARDS" = success ] && { [ "$PLAYBACK" = success ] || [ "$PLAYBACK" = skipped ]; }

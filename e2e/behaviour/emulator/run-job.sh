@@ -104,6 +104,41 @@ fi
 tail -1 "$STATE/sandbox-host.log"
 phase sandbox-host
 
+# 0b. The shipped agents, fetched from github.com before the stack starts so
+# the sandbox image pre-pull overlaps the stack start instead of following
+# it. They are pushed into the emulator as fullsend-ai/agents in step 4b.
+if [ "$AGENTS_SEED" = 1 ]; then
+  agents="$STATE/agents.git"
+  rm -rf "$agents"
+  git clone -q --no-checkout "https://github.com/fullsend-ai/agents.git" "$agents"
+  git -C "$agents" checkout -q --detach "${AGENTS_REF:-main}"
+  for pr in ${AGENTS_PRS:-}; do
+    git -C "$agents" fetch -q origin "pull/$pr/head"
+    git -C "$agents" -c user.name=bt-emulator -c user.email=bt-emulator@localhost \
+      merge -q --no-edit -m "bt-emulator: merge agents#$pr" FETCH_HEAD
+  done
+  # Pre-pull the sandbox images the agents pin (by digest) into the
+  # runner user's rootless store once, in the background, so no agent job
+  # pays the pull. The suite waits for it below.
+  mapfile -t sandbox_images < <(git -C "$agents" grep -hoE 'image: *[^ ]+@sha256:[0-9a-f]+' HEAD -- harness | sed 's/image: *//' | sort -u)
+  if [ "${#sandbox_images[@]}" -gt 0 ]; then
+    ( for img in "${sandbox_images[@]}"; do podman pull -q "$img" >/dev/null; done ) >"$STATE/prepull.log" 2>&1 &
+    prepull_pid=$!
+  fi
+  # The emulator's runners share this VM's $HOME, and the agents' post
+  # scripts install gitleaks in place into $HOME/.local/bin. Two runs
+  # installing at once can run each other's half-written binary. Install it
+  # once here with the agents' own installer; each later call then finds the
+  # pinned version and skips the download.
+  gitleaks_lib="$agents/scripts/lib/gitleaks-install.lib.sh"
+  if [ -f "$gitleaks_lib" ]; then
+    # shellcheck source=/dev/null
+    ( . "$gitleaks_lib" && install_gitleaks ) >"$STATE/gitleaks-install.log" 2>&1 \
+      || echo "::warning::gitleaks pre-install failed; agent jobs install it themselves ($(tail -c 300 "$STATE/gitleaks-install.log"))"
+  fi
+  phase agents-fetch
+fi
+
 # 1. Emulator + one real actions/runner over TLS on ghemu.localhost:443.
 sudo sysctl -qw net.ipv4.ip_unprivileged_port_start=80
 (
@@ -209,40 +244,11 @@ phase upstream-push
 # 4b. The shipped agents as fullsend-ai/agents: a run without its own agent
 # config falls back to fullsend-ai/agents@main on the configured forge.
 if [ "$AGENTS_SEED" = 1 ]; then
-  agents="$STATE/agents.git"
-  rm -rf "$agents"
-  git clone -q --no-checkout "https://github.com/fullsend-ai/agents.git" "$agents"
-  git -C "$agents" checkout -q --detach "${AGENTS_REF:-main}"
-  for pr in ${AGENTS_PRS:-}; do
-    git -C "$agents" fetch -q origin "pull/$pr/head"
-    git -C "$agents" -c user.name=bt-emulator -c user.email=bt-emulator@localhost \
-      merge -q --no-edit -m "bt-emulator: merge agents#$pr" FETCH_HEAD
-  done
   ensure_source_repo agents
   git -C "$agents" -c credential.helper= -c http.extraheader= push -q --force \
     "https://admin:$ADMIN@$EMU_HOST/fullsend-ai/agents.git" "HEAD:refs/heads/main"
   echo "fullsend-ai/agents main on the emulator: $(git -C "$agents" rev-parse --short HEAD) (${AGENTS_REF:-main}${AGENTS_PRS:+ + PRs $AGENTS_PRS})"
   phase agents-push
-  # Pre-pull the sandbox images the agents pin (by digest) into the
-  # runner user's rootless store once, in the background, so no agent job
-  # pays the pull. The suite waits for it below.
-  mapfile -t sandbox_images < <(git -C "$agents" grep -hoE 'image: *[^ ]+@sha256:[0-9a-f]+' HEAD -- harness | sed 's/image: *//' | sort -u)
-  if [ "${#sandbox_images[@]}" -gt 0 ]; then
-    ( for img in "${sandbox_images[@]}"; do podman pull -q "$img" >/dev/null; done ) >"$STATE/prepull.log" 2>&1 &
-    prepull_pid=$!
-  fi
-  # The emulator's runners share this VM's $HOME, and the agents' post
-  # scripts install gitleaks in place into $HOME/.local/bin. Two runs
-  # installing at once can run each other's half-written binary. Install it
-  # once here with the agents' own installer; each later call then finds the
-  # pinned version and skips the download.
-  gitleaks_lib="$agents/scripts/lib/gitleaks-install.lib.sh"
-  if [ -f "$gitleaks_lib" ]; then
-    # shellcheck source=/dev/null
-    ( . "$gitleaks_lib" && install_gitleaks ) >"$STATE/gitleaks-install.log" 2>&1 \
-      || echo "::warning::gitleaks pre-install failed; agent jobs install it themselves ($(tail -c 300 "$STATE/gitleaks-install.log"))"
-    phase gitleaks
-  fi
 fi
 
 # 4c. The human-like test actors, as hack/setup-new-e2e-org.sh grants them
