@@ -98,6 +98,26 @@ trap stop_all EXIT
 # and once the emulator answers raw.githubusercontent.com the OpenShell
 # installer download would reach the emulator instead of github.com.
 export OPENSHELL_GATEWAY_ENDPOINT=https://127.0.0.1:17670
+# The actions/runner release the stack starts, downloaded and unpacked in the
+# background while the sandbox host is set up. ci-stack.sh uses an unpacked
+# copy it finds in its directory, so only the digest check is done here.
+runner_version=$(sed -nE 's/^UPSTREAM_VERSION="\$\{CI_STACK_UPSTREAM_RUNNER_VERSION:-([0-9.]+)\}"$/\1/p' "$EMULATOR_DIR/scripts/ci-stack.sh")
+runner_sha=$(sed -nE 's/^UPSTREAM_SHA256="\$\{CI_STACK_UPSTREAM_RUNNER_SHA256:-([0-9a-f]{64})\}"$/\1/p' "$EMULATOR_DIR/scripts/ci-stack.sh")
+if [ -n "$runner_version" ] && [ -n "$runner_sha" ]; then
+  (
+    set -e
+    mkdir -p "$STATE/stack"
+    t="$STATE/stack/actions-runner-$runner_version.tar.gz"
+    curl -fsSL -o "$t.partial" "https://github.com/actions/runner/releases/download/v$runner_version/actions-runner-linux-x64-$runner_version.tar.gz"
+    echo "$runner_sha  $t.partial" | sha256sum -c --quiet -
+    mv "$t.partial" "$t"
+    d="$STATE/stack/actions-runner-$runner_version"
+    mkdir -p "$d.partial"
+    tar -xzf "$t" -C "$d.partial"
+    mv "$d.partial" "$d"
+  ) >"$STATE/runner-prefetch.log" 2>&1 &
+  runner_prefetch_pid=$!
+fi
 if ! "$ROOT/e2e/behaviour/emulator/sandbox-host.sh" >"$STATE/sandbox-host.log" 2>&1; then
   echo "::error::sandbox host setup failed: $(tail -c 1500 "$STATE/sandbox-host.log")" >&2
   exit 1
@@ -138,6 +158,14 @@ if [ "$AGENTS_SEED" = 1 ]; then
       || echo "::warning::gitleaks pre-install failed; agent jobs install it themselves ($(tail -c 300 "$STATE/gitleaks-install.log"))"
   fi
   phase agents-fetch
+fi
+
+if [ -n "${runner_prefetch_pid:-}" ]; then
+  if ! wait "$runner_prefetch_pid"; then
+    echo "::warning::runner prefetch failed; the stack downloads it ($(tail -c 300 "$STATE/runner-prefetch.log"))"
+    rm -rf "$STATE/stack/actions-runner-"*
+  fi
+  phase runner-prefetch
 fi
 
 # 1. Emulator + one real actions/runner over TLS on ghemu.localhost:443.
