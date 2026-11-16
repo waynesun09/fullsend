@@ -1,0 +1,61 @@
+// repopool_emulator.go implements the RepoPoolEmulator driver: the
+// external-mint pool, run against a GitHub emulator (ENVIRONMENT=emulator).
+package install
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/fullsend-ai/fullsend/internal/e2etest"
+)
+
+// emulatorOrgSetupTimeout bounds creating the pool orgs on the emulator.
+const emulatorOrgSetupTimeout = time.Minute
+
+// NewRepoPoolEmulator is a Factory for a pool on a GitHub emulator. It is
+// the external-mint pool (mint at FULLSEND_MINT_URL, nothing deployed, each
+// slot installed vendored, App set from BEHAVIOUR_APP_SET) with one
+// addition: the emulator starts empty, so the pool's orgs are created
+// first when they do not exist, owned by the token's user.
+//
+// The emulator's orgs belong to this suite alone, so the shared e2e-lock
+// bridge to legacy runners is left out (PoolConfig.PrivateOrgs).
+// Everything else is the live code path: slot creation, Actions-readiness
+// polling, slot GC and the rate-limit gate run unchanged.
+func NewRepoPoolEmulator(pool PoolConfig) (Driver, error) {
+	if err := pool.validate(); err != nil {
+		return nil, fmt.Errorf("emulator factory: %w", err)
+	}
+	mintURL := os.Getenv("FULLSEND_MINT_URL")
+	if mintURL == "" {
+		return nil, fmt.Errorf("emulator factory: FULLSEND_MINT_URL is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), emulatorOrgSetupTimeout)
+	defer cancel()
+	for _, org := range pool.Layout.Orgs() {
+		token, err := pool.TokenFor(ctx, org)
+		if err != nil {
+			return nil, fmt.Errorf("emulator factory: token for %s: %w", org, err)
+		}
+		viewer := func(ctx context.Context) (string, error) { return e2etest.EmulatorViewerLogin(ctx, token) }
+		if err := e2etest.EnsureEmulatorOrg(ctx, token, org, viewer); err != nil {
+			return nil, fmt.Errorf("emulator factory: %w", err)
+		}
+	}
+	newMint := func(mintGroup, orgCredential) (mintDriver, func(), error) {
+		return &externalMintDriver{mintURL: mintURL}, func() {}, nil
+	}
+	// Setup names the App set the emulator was seeded with, as the
+	// preview mints do, so bot logins match AppSet(). playbackSetupOpts
+	// also selects the playback runtime when PLAYBACK_RUNTIME is set, so
+	// this factory backs the playback suite too (see NewPlaybackDriver).
+	opts := playbackSetupOpts()
+	opts.AppSet = envAppSet()
+	pool.PrivateOrgs = true
+	return buildPoolDriver(pool, nil, newMint, opts, traceStart{})
+}
+
+// Compile-time check: NewRepoPoolEmulator satisfies Factory.
+var _ Factory = NewRepoPoolEmulator

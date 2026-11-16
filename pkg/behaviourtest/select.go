@@ -18,11 +18,15 @@ import (
 
 // installFactoryFor selects the install driver based on ENVIRONMENT:
 //
-//	dev   → CF preview mint (ephemeral per run)
-//	stage → durable CF mint at stage-mint.fullsend.sh
+//	dev      → CF preview mint (ephemeral per run)
+//	stage    → durable CF mint at stage-mint.fullsend.sh
+//	emulator → GitHub emulator at BEHAVIOUR_GITHUB_URL, mint at FULLSEND_MINT_URL
 func installFactoryFor(environment string) install.Factory {
-	if environment == "stage" {
+	switch environment {
+	case "stage":
 		return install.NewRepoPoolCFMintStage
+	case "emulator":
+		return install.NewRepoPoolEmulator
 	}
 	return install.NewRepoPoolCFMintPreviews
 }
