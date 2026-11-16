@@ -68,6 +68,7 @@ phase() { # phase NAME: close the previous phase and record its wall time
 
 # shellcheck disable=SC2317,SC2329 # invoked by the EXIT trap
 stop_all() {
+  if [ -n "${io_sampler_pid:-}" ]; then kill "$io_sampler_pid" 2>/dev/null || true; fi
   if [ -n "${sampler_pid:-}" ]; then
     # The sampler finishes its current sample and the profile first; never
     # let it hold the job open.
@@ -346,6 +347,9 @@ phase supervisor-ca-wait
 # (vm-samples.log, vm-peak.log), to check the concurrency fits the VM.
 "$ROOT/e2e/behaviour/emulator/sample-vm.sh" "$STATE" "$STATE/stack/emulator.pid" &
 sampler_pid=$!
+# Probe: CPU split, pressure stalls and disk use every second (io-samples.log).
+"$ROOT/e2e/behaviour/emulator/sample-io.sh" "$STATE" &
+io_sampler_pid=$!
 
 # The fullsend action collects each run's OpenShell logs into the agent job's
 # workspace (output/<run>/logs), which the next job on that repository wipes
