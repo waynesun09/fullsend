@@ -24,11 +24,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The 85 behaviour scenarios in eleven shards (e2e/behaviour/emulator/shards.txt),
+  # The 85 behaviour scenarios in sixteen shards (e2e/behaviour/emulator/shards.txt),
   # one VM each, balanced on measured scenario time: a shard takes about as
   # long as its longest scenario chain, so wider shards cut wall time until
   # each holds one long chain. Fewer scenarios per VM also need fewer
-  # runners, and the stack registers them one after another.
+  # runners. A 4-vCPU VM is CPU-bound above about two scenarios at once.
   #
   # base-dispatch, url-dispatch.feature:7 and skill-overrides fetch from
   # raw.githubusercontent.com, which run-job.sh points at a public address on
@@ -37,8 +37,9 @@ env:
   # applier-branch-namespace: the seeded fullsend-ai/agents main enforces it.
   # fetch-allowlist-gate: the job runs this checkout's fullsend, which has the gate.
   DEFAULT_CAPABILITIES: runner-secret-overlay-guard,applier-branch-namespace,fetch-allowlist-gate
-  DEFAULT_WORKERS: "4"
-  DEFAULT_RUNNERS: "6"
+  # For a dispatch with explicit features; shards set their own in shards.txt.
+  DEFAULT_WORKERS: "2"
+  DEFAULT_RUNNERS: "4"
   # waynesun09/github-emulator ci-self-contained (integration head with the mint App seed).
   EMULATOR_REPO: waynesun09/github-emulator
   EMULATOR_REF: 496628390864532a8b0e57802c87fcde216dbd36
@@ -52,7 +53,7 @@ jobs:
       fail-fast: false
       matrix:
         # A dispatch with explicit features runs them as one "custom" shard.
-        shard: ${{ fromJSON(inputs.features && '["custom"]' || '["a","b","c","d","e","f","g","h","i","j","k"]') }}
+        shard: ${{ fromJSON(inputs.features && '["custom"]' || '["a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p"]') }}
     steps:
       - name: Checkout fullsend
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -95,16 +96,20 @@ jobs:
           UPSTREAM_TOKEN: ${{ github.token }}
           FEATURES: ${{ inputs.features }}
           SHARD: ${{ matrix.shard }}
-          WORKERS: ${{ inputs.workers || env.DEFAULT_WORKERS }}
-          EMULATOR_RUNNERS: ${{ inputs.runners || env.DEFAULT_RUNNERS }}
+          INPUT_WORKERS: ${{ inputs.workers }}
+          INPUT_RUNNERS: ${{ inputs.runners }}
           SUITE_TIMEOUT: 30m
           BEHAVIOUR_CAPABILITIES: ${{ env.DEFAULT_CAPABILITIES }}
           # The run falls back to fullsend-ai/agents@main on the configured forge.
           AGENTS_SEED: "1"
         run: |
+          # A shard line is: <shard> <workers> <runners> <feature[:line]>...
+          WORKERS=$DEFAULT_WORKERS EMULATOR_RUNNERS=$DEFAULT_RUNNERS
           if [ -z "$FEATURES" ]; then
-            FEATURES=$(awk -v s="$SHARD" '$1 == s { $1 = ""; print }' e2e/behaviour/emulator/shards.txt)
+            read -r _ WORKERS EMULATOR_RUNNERS FEATURES < <(awk -v s="$SHARD" '$1 == s' e2e/behaviour/emulator/shards.txt) || true
           fi
+          WORKERS=${INPUT_WORKERS:-$WORKERS} EMULATOR_RUNNERS=${INPUT_RUNNERS:-$EMULATOR_RUNNERS}
+          export EMULATOR_RUNNERS
           [ -n "$FEATURES" ] || { echo "::error::no features for shard $SHARD"; exit 1; }
           read -ra feats <<<"$FEATURES"
           export BEHAVIOUR_POOL_SIZE="$WORKERS" GODOG_CONCURRENCY="$WORKERS"
