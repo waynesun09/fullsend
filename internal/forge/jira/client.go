@@ -42,6 +42,10 @@ type LiveClient struct {
 	oidc      *oidcTokenSource
 	oidcFetch OIDCFetchFunc
 	oidcHook  func(token string)
+	// oidcRefetch and oidcPerRequest configure the host-script broker
+	// (withOIDCTokenFD).
+	oidcRefetch    OIDCFetchFunc
+	oidcPerRequest bool
 
 	// gatewayURL, when set, routes REST requests through the Atlassian
 	// API gateway (see WithAPIGateway) instead of the site URL.
@@ -159,6 +163,8 @@ func New(token string, opts ...Option) (*LiveClient, error) {
 	if c.oidc != nil {
 		c.oidc.fetch = c.oidcFetch
 		c.oidc.hook = c.oidcHook
+		c.oidc.refetch = c.oidcRefetch
+		c.oidc.perRequest = c.oidcPerRequest
 		if c.oidc.fetch == nil {
 			fetch, err := c.oidc.defaultOIDCFetch()
 			if err != nil {

@@ -73,6 +73,12 @@ type oidcTokenSource struct {
 	value     string
 	refreshAt time.Time
 	now       func() time.Time
+	// perRequest fetches on every call instead of caching (the host
+	// script broker, OIDCTokenFDEnvVar, which keeps its own cache).
+	perRequest bool
+	// refetch, when set, replaces fetch for the fetch that replaces a
+	// token the gateway refused.
+	refetch OIDCFetchFunc
 }
 
 // oidcExpirySkew is how long before exp a token with the given lifetime
@@ -94,11 +100,15 @@ func (s *oidcTokenSource) token(ctx context.Context, stale string) (string, erro
 		return "", ctx.Err()
 	}
 	defer func() { <-s.sem }()
-	if s.value != "" && s.value != stale && s.now().Before(s.refreshAt) {
+	if !s.perRequest && s.value != "" && s.value != stale && s.now().Before(s.refreshAt) {
 		return s.value, nil
 	}
 	s.value = ""
-	a, err := s.fetch(ctx)
+	fetch := s.fetch
+	if stale != "" && s.refetch != nil {
+		fetch = s.refetch
+	}
+	a, err := fetch(ctx)
 	if err != nil {
 		return "", fmt.Errorf("jira: fetching the OIDC token for the Jira gateway (audience %q): %w", s.audience, err)
 	}
@@ -146,9 +156,11 @@ func (s *oidcTokenSource) defaultOIDCFetch() (OIDCFetchFunc, error) {
 }
 
 // ErrOIDCEndpointMissing is returned for tracker.jira.auth: oidc when the
-// runner's OIDC token request variables are not set.
+// runner's OIDC token request variables are not set (and, in a host
+// script, no token broker fd either).
 var ErrOIDCEndpointMissing = fmt.Errorf("jira: tracker.jira.auth: oidc needs the GitHub Actions OIDC token endpoint (%s and %s are not set); "+
-	"give the workflow job the `id-token: write` permission", OIDCRequestURLEnvVar, OIDCRequestTokenEnvVar)
+	"give the workflow job the `id-token: write` permission, or, in a host script, opt in to %s in the harness env.runner",
+	OIDCRequestURLEnvVar, OIDCRequestTokenEnvVar, OIDCTokenFDEnvVar)
 
 // CheckOIDCGatewayURL refuses an API URL that the job's OIDC token must
 // not be sent to: one that is empty or not https, or whose host is an
@@ -207,7 +219,11 @@ func CheckNoCredentialEnv(getenv func(string) string) error {
 // (os.Getenv when nil). Without AuthOIDC they come from CredentialsFromEnv.
 // With AuthOIDC no FULLSEND_JIRA_* secret may be set (CheckNoCredentialEnv),
 // GitLab CI is refused, and the OIDC token is fetched from the runner's
-// ACTIONS_ID_TOKEN_REQUEST_URL and ACTIONS_ID_TOKEN_REQUEST_TOKEN.
+// ACTIONS_ID_TOKEN_REQUEST_URL and ACTIONS_ID_TOKEN_REQUEST_TOKEN. Without
+// those, inside a host script given the runner's token broker
+// (OIDCTokenFDEnvVar, used only when it is a number of at least 3), a
+// token is requested from the broker for every Jira request, and a fresh
+// one for the one retry after a 401.
 func NewScopedFromEnv(cfg ScopedConfig, getenv func(string) string, opts ...Option) (*LiveClient, error) {
 	if getenv == nil {
 		getenv = os.Getenv
@@ -227,5 +243,11 @@ func NewScopedFromEnv(cfg ScopedConfig, getenv func(string) string, opts ...Opti
 	}
 	cfg.OIDCRequestURL = getenv(OIDCRequestURLEnvVar)
 	cfg.OIDCRequestToken = getenv(OIDCRequestTokenEnvVar)
+	if cfg.OIDCRequestURL == "" || cfg.OIDCRequestToken == "" {
+		if fd, ok := parseOIDCTokenFD(getenv(OIDCTokenFDEnvVar)); ok {
+			// Prepended, so a caller's own WithOIDCFetch still wins.
+			opts = append([]Option{withOIDCTokenFD(fd)}, opts...)
+		}
+	}
 	return NewScoped(cfg, Credentials{}, opts...)
 }

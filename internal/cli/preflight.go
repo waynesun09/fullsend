@@ -86,6 +86,10 @@ func preflightEnv(runnerEnv map[string]string, fullsendDir string) map[string]st
 		if preflightCredentialRefused(k) {
 			continue
 		}
+		// The Jira OIDC token broker is for pre- and post-scripts only.
+		if k == jiraOIDCTokenFDEnv || isJiraTokenFDMarker(v) {
+			continue
+		}
 		switch k {
 		case "FULLSEND_DIR", "PYTHONDONTWRITEBYTECODE":
 			continue

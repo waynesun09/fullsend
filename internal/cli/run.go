@@ -1006,6 +1006,14 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	if err != nil {
 		return err
 	}
+	// tracker.jira.auth: oidc gives opted-in host scripts the Jira OIDC
+	// token broker (FULLSEND_JIRA_OIDC_TOKEN_FD).
+	disarmJiraScriptOIDC, err := armJiraScriptOIDC(issueTracking)
+	defer disarmJiraScriptOIDC()
+	if err != nil {
+		printer.StepFail("Jira OIDC gateway mode cannot start")
+		return err
+	}
 	for k, v := range jiraEnv {
 		setFlagEnv(k, v)
 	}
@@ -2440,6 +2448,15 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 			postCmd := exec.Command(h.PostScript)
 			postCmd.Dir = runDir
 			postCmd.Env = withPersonasFile(postScriptEnv(h, traceparent), runDir)
+			stopBroker, brokerErr := attachJiraTokenBroker(postCmd, h.RunnerEnv, printer)
+			if brokerErr != nil {
+				printer.StepFail("Post-script setup failed: " + brokerErr.Error())
+				if runErr == nil {
+					runErr = brokerErr
+				}
+				return
+			}
+			defer stopBroker()
 			// Override REPO_DIR from childScriptEnv: the harness value points to a fixed
 			// location, but sandbox output is now extracted to a temp dir. exec uses
 			// last-value-wins so this append takes precedence. TODO(fullsend-ai/agents#191):
@@ -3704,6 +3721,9 @@ var providerOnlyKeys = map[string]bool{
 // uses them for Jira status notifications; host-side scripts receive them
 // only when a harness declares them in env.runner.
 var inheritedScriptDenyKeys = map[string]bool{
+	// The Jira OIDC token broker's fd: a script gets the real fd number
+	// only through its env.runner (attachJiraTokenBroker).
+	jiraOIDCTokenFDEnv:      true,
 	"JIRA_TOKEN":            true,
 	"JIRA_USER_EMAIL":       true,
 	jira.TokenEnvVar:        true,
@@ -3722,6 +3742,7 @@ var inheritedScriptDenyKeys = map[string]bool{
 // dropEmptyOptionalRunnerEnv then removes the entry so scripts see the
 // variable absent rather than empty.
 var optionalHarnessEnvKeys = map[string]bool{
+	jiraOIDCTokenFDEnv:      true,
 	jira.EmailEnvVar:        true,
 	jira.ClientIDEnvVar:     true,
 	jira.ClientSecretEnvVar: true,
@@ -3736,8 +3757,10 @@ func isOptionalHarnessEnvKey(key string) bool {
 	if optionalHarnessEnvKeys[key] {
 		return true
 	}
+	// tracker.jira.auth: oidc holds no Jira secret, so a harness that
+	// declares FULLSEND_JIRA_TOKEN for the other modes still validates.
 	return key == jira.TokenEnvVar &&
-		(strings.TrimSpace(os.Getenv(jira.ClientIDEnvVar)) != "" || strings.TrimSpace(os.Getenv(jira.ClientSecretEnvVar)) != "")
+		(jiraScriptOIDCArmed() || strings.TrimSpace(os.Getenv(jira.ClientIDEnvVar)) != "" || strings.TrimSpace(os.Getenv(jira.ClientSecretEnvVar)) != "")
 }
 
 // dropEmptyOptionalRunnerEnv removes isOptionalHarnessEnvKey entries whose
@@ -3792,6 +3815,10 @@ func harnessEnvExpand(key string) string {
 	if harnessExpansionDenied(key) {
 		return ""
 	}
+	if key == jiraOIDCTokenFDEnv {
+		// The broker opt-in never reads the process environment.
+		return jiraTokenFDHarnessValue()
+	}
 	return os.Getenv(key)
 }
 
@@ -3802,6 +3829,7 @@ func harnessEnvExpand(key string) string {
 // harnessExpansionDenied because that map also gates env.runner, where a
 // harness declares them on purpose.
 var sandboxDeniedKeys = map[string]bool{
+	jiraOIDCTokenFDEnv:      true,
 	jira.TokenEnvVar:        true,
 	jira.EmailEnvVar:        true,
 	jira.ClientIDEnvVar:     true,
@@ -3844,6 +3872,9 @@ func expandRunnerEntry(key, v string, expander func(string) string) string {
 func harnessEnvLookup(key string) (string, bool) {
 	if harnessExpansionDenied(key) {
 		return "", false
+	}
+	if key == jiraOIDCTokenFDEnv {
+		return jiraTokenFDHarnessValue(), true
 	}
 	if isOptionalHarnessEnvKey(key) {
 		return os.Getenv(key), true
@@ -5900,6 +5931,12 @@ func runPreScript(h *harness.Harness, runDir, traceparent string, printer *ui.Pr
 	defer cleanup()
 	preCmd := exec.Command(h.PreScript)
 	preCmd.Env = withPersonasFile(append(childScriptEnv(h.RunnerEnv, traceparent), prescript.EnvVar+"="+outPath), runDir)
+	stopBroker, err := attachJiraTokenBroker(preCmd, h.RunnerEnv, printer)
+	if err != nil {
+		printer.StepFail("Pre-script setup failed")
+		return prescript.Result{}, err
+	}
+	defer stopBroker()
 
 	// Tee stdout and stderr so skip-reason fallback (exit 78) and
 	// hard-failure diagnostics can recover the script's own message
@@ -6106,6 +6143,11 @@ func childScriptEnv(runnerEnv map[string]string, traceparent string) []string {
 		if i := strings.IndexByte(e, '='); i > 0 && harnessExpansionDenied(e[:i]) {
 			continue
 		}
+		// An unattached Jira token broker opt-in (attachJiraTokenBroker
+		// adds the real fd number for pre- and post-scripts only).
+		if i := strings.IndexByte(e, '='); i > 0 && isJiraTokenFDMarker(e[i+1:]) {
+			continue
+		}
 		env = append(env, e)
 	}
 	if traceparent != "" {
@@ -6193,7 +6235,15 @@ func validationScriptEnv(h *harness.Harness, hostRepoDir, runDir string) []strin
 // when the harness specifies a validation_loop.schema — FULLSEND_OUTPUT_SCHEMA
 // pointing to the host-side cached schema path.
 func validationEnv(h *harness.Harness, hostRepoDir, runDir string) []string {
-	env := append(envToList(h.RunnerEnv),
+	var env []string
+	for _, e := range envToList(h.RunnerEnv) {
+		// The Jira token broker is for pre- and post-scripts only.
+		if i := strings.IndexByte(e, '='); i > 0 && isJiraTokenFDMarker(e[i+1:]) {
+			continue
+		}
+		env = append(env, e)
+	}
+	env = append(env,
 		fmt.Sprintf("TARGET_REPO_DIR=%s", hostRepoDir),
 		fmt.Sprintf("FULLSEND_RUN_DIR=%s", runDir),
 	)

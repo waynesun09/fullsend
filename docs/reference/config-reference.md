@@ -500,6 +500,18 @@ tracker:
   error names `tracker.jira.poll.query`: simplify the query to the grammar
   the gateway allows (see the
   [Jira guide](../guides/user/jira-integration.md#poll-query-with-an-oidc-gateway)).
+- Host pre- and post-scripts get no token file and no `ACTIONS_ID_TOKEN_*`
+  variables. A harness opts a script in with
+  `FULLSEND_JIRA_OIDC_TOKEN_FD: "${FULLSEND_JIRA_OIDC_TOKEN_FD}"` in
+  `env.runner`; the script then holds one end of a socket at that fd
+  number. It writes `token` and a newline (the current token), or `refresh`
+  and a newline (a fresh one, at most one fetch every few seconds), and
+  reads back one line: `ok <jwt>` or `err <code>` (`bad_request`,
+  `fetch_failed`). Send one request at a time. Anything else ends the
+  socket. `fullsend issues` run from the script uses the fd by itself, and
+  sends `refresh` for its one retry after a 401. The socket closes when the script
+  exits. Outside oidc mode the variable resolves empty and is dropped, and
+  `FULLSEND_JIRA_TOKEN` is optional in `env.runner` in oidc mode.
 - In `fullsend run`, the sandbox's `jira` provider carries the OIDC token
   instead of a Jira token. It is refreshed from the token's own `iat` and
   `exp`. Its profile allows only the gateway host, with path
