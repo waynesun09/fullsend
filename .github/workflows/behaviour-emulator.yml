@@ -53,7 +53,11 @@ env:
   DEFAULT_RUNNERS: "12"
   # waynesun09/github-emulator ci-self-contained (integration head with the mint App seed).
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: 0d2233d82f1f7a532177610f7e620381a48c5065
+  EMULATOR_REF: e12ede27ae6d7062998760850e61ac14f95f2b9c
+  # spike-postgres: ci-stack keeps the emulator's data in the runner's
+  # preinstalled PostgreSQL 16 instead of SQLite. run-job.sh's ci-stack start
+  # inherits it from the step environment; asyncpg comes from the postgres extra.
+  CI_STACK_POSTGRES: "1"
 
 jobs:
   behaviour-emulator:
@@ -94,7 +98,7 @@ jobs:
       - name: Install emulator dependencies
         run: |
           python3 -m venv "$RUNNER_TEMP/emu-venv"
-          uv export -q --frozen --no-dev --no-emit-project --format requirements-txt --project .emulator -o "$RUNNER_TEMP/emu-requirements.txt"
+          uv export -q --frozen --no-dev --no-emit-project --extra postgres --format requirements-txt --project .emulator -o "$RUNNER_TEMP/emu-requirements.txt"
           "$RUNNER_TEMP/emu-venv/bin/pip" install -q --require-hashes -r "$RUNNER_TEMP/emu-requirements.txt"
 
       - name: Run behaviour features
@@ -168,7 +172,7 @@ jobs:
       - name: Install emulator dependencies
         run: |
           python3 -m venv "$RUNNER_TEMP/emu-venv"
-          uv export -q --frozen --no-dev --no-emit-project --format requirements-txt --project .emulator -o "$RUNNER_TEMP/emu-requirements.txt"
+          uv export -q --frozen --no-dev --no-emit-project --extra postgres --format requirements-txt --project .emulator -o "$RUNNER_TEMP/emu-requirements.txt"
           "$RUNNER_TEMP/emu-venv/bin/pip" install -q --require-hashes -r "$RUNNER_TEMP/emu-requirements.txt"
 
       - name: Run the playback suite
