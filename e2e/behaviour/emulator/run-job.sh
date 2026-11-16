@@ -68,7 +68,11 @@ phase() { # phase NAME: close the previous phase and record its wall time
 
 # shellcheck disable=SC2317,SC2329 # invoked by the EXIT trap
 stop_all() {
-  if [ -n "${io_sampler_pid:-}" ]; then kill "$io_sampler_pid" 2>/dev/null || true; fi
+  if [ -n "${io_sampler_pid:-}" ]; then
+    kill "$io_sampler_pid" 2>/dev/null || true
+    # Probe: CPU time of the processes still alive (emulator, runners, hosts).
+    ps -eo cputimes=,comm=,args= --sort=-cputimes 2>/dev/null | head -60 | cut -c1-200 >"$STATE/ps-cpu-end.log"
+  fi
   if [ -n "${sampler_pid:-}" ]; then
     # The sampler finishes its current sample and the profile first; never
     # let it hold the job open.
@@ -84,6 +88,13 @@ stop_all() {
   if [ -f "$STATE/mint.pid" ]; then kill "$(cat "$STATE/mint.pid")" 2>/dev/null || true; fi
   if [ "$GATEWAY" = 1 ]; then GW_HOST=$GW_HOST GW_IP=$GW_IP "$ROOT/e2e/behaviour/emulator/gateway-stub.sh" stop "$STATE/gateway" || true; fi
   (cd "$EMULATOR_DIR" && CI_STACK_DIR="$STATE/stack" scripts/ci-stack.sh stop) >/dev/null 2>&1 || true
+  if [ "${acct_on:-0}" = 1 ]; then
+    # Probe: CPU time per command for every process that exited since the
+    # suite started, short-lived ones included (process accounting).
+    sudo accton off >/dev/null 2>&1 || true
+    # shellcheck disable=SC2024 # the log is the runner user's, not root's
+    sudo sa -a -c /var/log/account/pacct >"$STATE/sa-commands.log" 2>&1 || true
+  fi
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     { echo "| phase | seconds |"; echo "|---|---|"; awk -F'\t' '{print "| " $1 " | " $2 " |"}' "$PHASES"; } >>"$GITHUB_STEP_SUMMARY"
   fi
@@ -350,6 +361,16 @@ sampler_pid=$!
 # Probe: CPU split, pressure stalls and disk use every second (io-samples.log).
 "$ROOT/e2e/behaviour/emulator/sample-io.sh" "$STATE" &
 io_sampler_pid=$!
+# Probe: process accounting from here on, summarised per command at exit.
+acct_on=0
+if { sudo apt-get update -qq && sudo apt-get install -y -qq acct; } >"$STATE/acct-install.log" 2>&1; then
+  sudo mkdir -p /var/log/account && sudo touch /var/log/account/pacct
+  # Start from an empty file and no saved summary, so only the suite counts.
+  sudo truncate -s 0 /var/log/account/pacct
+  sudo rm -f /var/log/account/savacct /var/log/account/usracct
+  # shellcheck disable=SC2024 # the log is the runner user's, not root's
+  if sudo accton /var/log/account/pacct >>"$STATE/acct-install.log" 2>&1; then acct_on=1; fi
+fi
 
 # The fullsend action collects each run's OpenShell logs into the agent job's
 # workspace (output/<run>/logs), which the next job on that repository wipes
