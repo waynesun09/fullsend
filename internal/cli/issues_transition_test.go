@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/fullsend-ai/fullsend/internal/tracker"
@@ -137,11 +138,11 @@ func TestRunIssuesTransitionJiraProjectAuthorization(t *testing.T) {
 				require.ErrorContains(t, runIssuesTransition(context.Background(), cfg), "allowed_targets")
 			} else {
 				require.NoError(t, err)
-				want := tt.project
+				want := strings.ToUpper(tt.project)
 				if want == "" {
 					want = "PROJ"
 				}
-				assert.Equal(t, want, f.project)
+				assert.Equal(t, want, f.project, "Jira keys are upper-cased before use")
 			}
 		})
 	}

@@ -342,6 +342,7 @@ func runIssuesCreate(ctx context.Context, cfg *issuesCreateConfig) error {
 		if strings.TrimSpace(project) == "" {
 			project = settings.Project
 		}
+		project = strings.ToUpper(strings.TrimSpace(project))
 		if err := checkJiraTargetProject(settings, project); err != nil {
 			return err
 		}
@@ -357,7 +358,7 @@ func runIssuesCreate(ctx context.Context, cfg *issuesCreateConfig) error {
 
 	issue, err := tc.CreateIssue(ctx, project, cfg.title, tracker.Body(body), tracker.CreateIssueOptions{
 		IssueType: cfg.issueType,
-		Parent:    cfg.parent,
+		Parent:    jiraKeyCase(trackerName, cfg.parent),
 	})
 	if err != nil {
 		return fmt.Errorf("creating issue: %w", err)
@@ -803,8 +804,10 @@ func runIssuesLink(ctx context.Context, cfg *issuesLinkConfig) error {
 		printer = ui.New(os.Stdout)
 	}
 
-	from := strings.TrimSpace(cfg.from)
-	to := strings.TrimSpace(cfg.to)
+	// Jira keys are uppercase; a self-hosted gateway refuses a lowercase
+	// one that Jira itself would accept.
+	from := strings.ToUpper(strings.TrimSpace(cfg.from))
+	to := strings.ToUpper(strings.TrimSpace(cfg.to))
 	if from == "" {
 		return fmt.Errorf("--from must not be empty")
 	}
@@ -856,6 +859,15 @@ func runIssuesLink(ctx context.Context, cfg *issuesLinkConfig) error {
 	}
 	printer.StepDone(fmt.Sprintf("Linked %s to %s (%s)", from, to, cfg.linkType))
 	return nil
+}
+
+// jiraKeyCase upper-cases a Jira project or issue key (trimmed) for the
+// Jira tracker and returns v unchanged for any other.
+func jiraKeyCase(trackerName, v string) string {
+	if trackerName != trackerJira {
+		return v
+	}
+	return strings.ToUpper(strings.TrimSpace(v))
 }
 
 // parseIssueKey splits a Jira-style issue key ("PROJ-123") into its

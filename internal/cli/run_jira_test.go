@@ -1041,22 +1041,22 @@ func TestRejectMultipleMintedJiraProviders(t *testing.T) {
 	static := harness.ProviderDef{Name: "jira-static", Type: "Fullsend-Jira", Credentials: map[string]string{jiraCredentialKey: "${JIRA_STATIC_FOR_TEST}"}}
 	other := harness.ProviderDef{Name: "github", Type: "fullsend-github", Credentials: map[string]string{"GH_TOKEN": ""}}
 
-	require.NoError(t, rejectMultipleMintedJiraProviders([]harness.ProviderDef{minted("jira"), other}, both), "one minted provider")
-	require.NoError(t, rejectMultipleMintedJiraProviders([]harness.ProviderDef{static, static, other}, both), "nothing mints")
-	require.NoError(t, rejectMultipleMintedJiraProviders([]harness.ProviderDef{minted("jira"), minted("jira-b")}, jiraEnv(nil)), "nothing mints without client credentials")
-	err := rejectMultipleMintedJiraProviders([]harness.ProviderDef{minted("jira"), other, minted("jira-b")}, both)
+	require.NoError(t, rejectMultipleMintedJiraProviders([]harness.ProviderDef{minted("jira"), other}, false, both), "one minted provider")
+	require.NoError(t, rejectMultipleMintedJiraProviders([]harness.ProviderDef{static, static, other}, false, both), "nothing mints")
+	require.NoError(t, rejectMultipleMintedJiraProviders([]harness.ProviderDef{minted("jira"), minted("jira-b")}, false, jiraEnv(nil)), "nothing mints without client credentials")
+	err := rejectMultipleMintedJiraProviders([]harness.ProviderDef{minted("jira"), other, minted("jira-b")}, false, both)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), sandbox.SandboxJiraTokenFile)
 
 	// Any type declaring JIRA_TOKEN counts; one declaring other keys does not.
 	jiraRo := harness.ProviderDef{Name: "jira-ro", Type: "fullsend-jira-ro", Credentials: map[string]string{jiraCredentialKey: "${FULLSEND_JIRA_TOKEN}"}}
-	err = rejectMultipleMintedJiraProviders([]harness.ProviderDef{minted("jira"), jiraRo}, both)
+	err = rejectMultipleMintedJiraProviders([]harness.ProviderDef{minted("jira"), jiraRo}, false, both)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `"jira-ro"`)
-	require.NoError(t, rejectMultipleMintedJiraProviders([]harness.ProviderDef{jiraRo, static}, both), "nothing mints")
+	require.NoError(t, rejectMultipleMintedJiraProviders([]harness.ProviderDef{jiraRo, static}, false, both), "nothing mints")
 
 	// A static fullsend-jira next to a minted one shares JIRA_TOKEN too.
-	err = rejectMultipleMintedJiraProviders([]harness.ProviderDef{static, other, minted("jira")}, both)
+	err = rejectMultipleMintedJiraProviders([]harness.ProviderDef{static, other, minted("jira")}, false, both)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `"jira-static"`)
 	assert.Contains(t, err.Error(), `"jira" mints`)

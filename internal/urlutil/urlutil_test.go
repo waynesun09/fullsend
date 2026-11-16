@@ -190,3 +190,45 @@ func TestNormalizeURLPath(t *testing.T) {
 		})
 	}
 }
+
+func TestIsAtlassianHost(t *testing.T) {
+	for host, want := range map[string]bool{
+		"api.atlassian.com":        true,
+		"API.Atlassian.COM.":       true,
+		"site.atlassian.net":       true,
+		"atlassian.net":            true,
+		"auth.atlassian.com":       true,
+		"atlassian.com":            true,
+		"jira-gw.example.com":      false,
+		"atlassian.net.other.test": false,
+		"notatlassian.net":         false,
+		"":                         false,
+	} {
+		assert.Equal(t, want, IsAtlassianHost(host), host)
+	}
+}
+
+func TestIsLDHHost(t *testing.T) {
+	for host, want := range map[string]bool{
+		"jira-gw.example.com":    true,
+		"Jira-GW.Example.COM":    true,
+		"xn--bcher-kva.example":  true,
+		"api.atlassian\u3002com": false,
+		"api.atlassian\uff0ecom": false,
+		"api.atlassian\uff61com": false,
+		"api.atlassian.com.":     false,
+		"a..b":                   false,
+		"-a.b":                   false,
+		"a_b.c":                  false,
+		"":                       false,
+	} {
+		assert.Equal(t, want, IsLDHHost(host), host)
+	}
+}
+
+func TestSameHost(t *testing.T) {
+	assert.True(t, SameHost("jira\u3002example\uff0ecom", "jira.example.com"), "Unicode full stops are dots")
+	assert.True(t, SameHost("Site.Example.com.", "site.example.com"))
+	assert.False(t, SameHost("a.example.com", "b.example.com"))
+	assert.False(t, SameHost("", ""))
+}

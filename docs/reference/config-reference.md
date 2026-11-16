@@ -74,6 +74,8 @@ tracker:                             # Issue tracker. At most one provider block
   # jira:
   #   base_url: https://example.atlassian.net # Jira site URL (required with any Jira setting below)
   #   api_url: https://api.atlassian.com      # Jira API gateway URL (optional; this is the default)
+  #   auth: oidc                     # Optional: send the job's OIDC token to a self-hosted gateway at api_url
+  #   audience: my-jira-gateway      # OIDC audience (required with, and only with, auth: oidc)
   #   project: PROJ                  # This repository's Jira project key (required with base_url)
   #   allowed_targets:
   #     projects: [OTHER]            # Jira project keys for cross-project issue creation or moves
@@ -384,6 +386,11 @@ tracker:
   When `fullsend run` mints the sandbox's Jira token, leave `api_url` unset
   or set it to `https://api.atlassian.com`. Any other value makes the run
   fail before minting, because the `jira` provider allows only that gateway.
+- **`tracker.jira.auth`** — Optional. Unset keeps the `FULLSEND_JIRA_*`
+  secrets below. The only other value is `oidc`: see
+  [OIDC gateway mode](#jira-oidc-gateway-mode).
+- **`tracker.jira.audience`** — The OIDC audience the job's token is requested
+  for. Required with `auth: oidc` and rejected without it.
 - **`tracker.jira.project`** — The key of the single Jira project for this
   repository. It is not a fallback project, and it has no default.
 - **`tracker.jira.run_label`** — Optional label added to the source Jira issue
@@ -419,8 +426,8 @@ tracker:
   in the query must be balanced. For example, the query above runs as
   `project = "PROJ" AND (labels = "fullsend" AND statusCategory != Done) ORDER BY updated DESC`.
 
-`base_url` and `project` are required once `base_url`, `api_url`, `project`,
-a nonempty `run_label`, or `poll` is set. A mapping that only selects Jira (`jira: {}`) or only sets
+`base_url` and `project` are required once `base_url`, `api_url`, `auth`,
+`audience`, `project`, a nonempty `run_label`, or `poll` is set. A mapping that only selects Jira (`jira: {}`) or only sets
 `allowed_targets` stays valid. This includes a mapping migrated from the
 legacy scalar `tracker: jira`.
 
@@ -446,6 +453,49 @@ access token to the same `api_url` gateway and refreshes it before it
 expires. Other unknown keys under
 `tracker.jira`, `tracker.jira.poll`, and `tracker.jira.allowed_targets` are
 rejected too.
+
+#### Jira OIDC gateway mode
+
+With `auth: oidc` a run holds no Jira secret. Fullsend sends the job's
+GitHub Actions OIDC token, requested for `audience`, as
+`Authorization: Bearer` to a self-hosted gateway at `api_url`. The gateway
+checks the token and calls Jira with its own credential. Requests keep the
+`{api_url}/ex/jira/{cloudId}/rest/api/3/...` layout, and the cloud ID still
+comes from `{base_url}/_edge/tenant_info`.
+
+```yaml
+tracker:
+  jira:
+    base_url: https://site.atlassian.net
+    api_url: https://jira-gw.example.com
+    auth: oidc
+    audience: <your-gateway-audience>
+    project: ABC
+```
+
+- `api_url` is required and must be `https`, with an ASCII host name
+  (letters, digits and hyphens). It must not be an Atlassian host
+  (`api.atlassian.com`, `*.atlassian.net`, `*.atlassian.com`) or the host of
+  `base_url`, so the token never reaches Atlassian.
+- Every job that calls Jira needs `permissions: id-token: write`. Without it
+  the run fails and names that permission. GitLab CI is not supported yet.
+- `FULLSEND_JIRA_TOKEN`, `FULLSEND_JIRA_EMAIL`, `FULLSEND_JIRA_CLIENT_ID` and
+  `FULLSEND_JIRA_CLIENT_SECRET` must all be unset. A leftover one fails
+  `fullsend run` at start, and the error names it: remove it from the
+  repository and organization secrets.
+- When the gateway answers 401, the client fetches a fresh token once. If that
+  is refused too, the call fails.
+- A gateway error shows its own text and code, for example
+  `gateway: ... (endpoint_not_allowed)`. A 502 with code `upstream_auth`
+  (Jira refused the gateway's own credential) is not retried.
+- When the gateway refuses the poller's search with code `jql_grammar`, the
+  error names `tracker.jira.poll.query`: simplify the query to the grammar
+  the gateway allows (see the
+  [Jira guide](../guides/user/jira-integration.md#poll-query-with-an-oidc-gateway)).
+- In `fullsend run`, the sandbox's `jira` provider carries the OIDC token
+  instead of a Jira token. It is refreshed from the token's own `iat` and
+  `exp`. Its profile allows only the gateway host, with path
+  `/ex/jira/<cloudId>/**`. `api_url` must use port 443 for this.
 
 `fullsend poll --input-driver jira-poll` reads the Jira site, API gateway,
 project, and query only from the effective `tracker.jira` config, so it

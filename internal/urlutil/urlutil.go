@@ -103,3 +103,54 @@ func NormalizeURLPath(rawURL string) (string, bool) {
 	}
 	return parsed.String(), true
 }
+
+// IsAtlassianHost reports whether host is an Atlassian-operated host a
+// forge OIDC token must never be sent to: api.atlassian.com, atlassian.com
+// or atlassian.net, or any subdomain of the last two. The comparison is
+// case-insensitive and tolerates a trailing dot. host carries no port.
+func IsAtlassianHost(host string) bool {
+	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	for _, apex := range []string{"atlassian.com", "atlassian.net"} {
+		if h == apex || strings.HasSuffix(h, "."+apex) {
+			return true
+		}
+	}
+	return false
+}
+
+// unicodeFullStops are the characters IDNA maps to "." (U+3002, U+FF0E,
+// U+FF61), so a host written with one reaches the same server.
+var unicodeFullStops = strings.NewReplacer("\u3002", ".", "\uff0e", ".", "\uff61", ".")
+
+// SameHost reports whether two host names are equal, case-insensitively,
+// ignoring a trailing dot and treating the Unicode full stops IDNA maps to
+// "." as dots. Ports are not part of a host name.
+func SameHost(a, b string) bool {
+	norm := func(s string) string {
+		return strings.TrimSuffix(strings.ToLower(unicodeFullStops.Replace(strings.TrimSpace(s))), ".")
+	}
+	return norm(a) != "" && norm(a) == norm(b)
+}
+
+// IsLDHHost reports whether host is an ASCII DNS name: dot-separated
+// labels of 1-63 letters, digits and hyphens, not starting or ending with
+// a hyphen, at most 253 characters, with no empty label (so no trailing
+// dot). It refuses any non-ASCII host, which IDNA could map onto another
+// name, for example "api.atlassian\u3002com".
+func IsLDHHost(host string) bool {
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}

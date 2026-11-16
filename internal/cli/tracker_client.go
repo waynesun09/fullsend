@@ -94,6 +94,16 @@ func newJiraTrackerClientFromConfig(tracking *config.TrackingConfig) (tracker.Cl
 // gateway with Basic auth when an email is set, and Bearer auth with the
 // token or an OAuth 2.0 access token otherwise.
 func newJiraTrackerClient(settings *config.JiraTrackingConfig) (*tracker.JiraClient, error) {
+	if settings.IsOIDC() {
+		// tracker.jira.auth: oidc: the job's OIDC token goes to the
+		// self-hosted gateway; no FULLSEND_JIRA_* secret may be set.
+		opts := append([]jira.Option{jira.WithOIDCTokenHook(jiraOIDCTokenHook)}, jiraScopedTestOptions...)
+		jc, err := jira.NewScopedFromEnv(jiraScopedConfig(settings), nil, opts...)
+		if err != nil {
+			return nil, fmt.Errorf("creating Jira client: %w", err)
+		}
+		return newJiraTrackerFromLive(jc, settings)
+	}
 	creds, err := jira.CredentialsFromEnv(nil)
 	if err != nil {
 		if os.Getenv("JIRA_TOKEN") != "" && os.Getenv(jira.TokenEnvVar) == "" &&
@@ -106,13 +116,26 @@ func newJiraTrackerClient(settings *config.JiraTrackingConfig) (*tracker.JiraCli
 	maskActionsValue(creds.Token)
 	maskActionsValue(creds.ClientID)
 	maskActionsValue(creds.ClientSecret)
-	jc, err := jira.NewScoped(jira.ScopedConfig{
-		BaseURL: settings.BaseURL,
-		APIURL:  settings.EffectiveAPIURL(),
-	}, creds, jiraScopedTestOptions...)
+	jc, err := jira.NewScoped(jiraScopedConfig(settings), creds, jiraScopedTestOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("creating Jira client: %w", err)
 	}
+	return newJiraTrackerFromLive(jc, settings)
+}
+
+// jiraScopedConfig returns the jira.ScopedConfig for the validated
+// tracker.jira settings.
+func jiraScopedConfig(settings *config.JiraTrackingConfig) jira.ScopedConfig {
+	return jira.ScopedConfig{
+		BaseURL:  settings.BaseURL,
+		APIURL:   settings.EffectiveAPIURL(),
+		Auth:     settings.Auth,
+		Audience: settings.Audience,
+	}
+}
+
+// newJiraTrackerFromLive wraps a scoped Jira client as a tracker client.
+func newJiraTrackerFromLive(jc *jira.LiveClient, settings *config.JiraTrackingConfig) (*tracker.JiraClient, error) {
 	tc, err := tracker.NewJiraClient(jc, settings.BaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("creating Jira tracker client: %w", err)
@@ -167,7 +190,7 @@ func jiraTrackingSettings(tracking *config.TrackingConfig) (*config.JiraTracking
 // tracker requires it.
 func resolveIssueProject(trackerName, project, fullsendDir string, testConfigReader config.PerRepoConfigReader) (string, error) {
 	if strings.TrimSpace(project) != "" {
-		return project, nil
+		return jiraKeyCase(trackerName, project), nil
 	}
 	if trackerName != trackerJira {
 		return "", fmt.Errorf("--project must not be empty for --tracker %s", trackerName)

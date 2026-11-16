@@ -160,6 +160,6 @@ func runJiraPollGitLab(cmd *cobra.Command, f jiraPollGitLabFlags) error {
 	opts.TargetForge = jirapoll.TargetForgeGitLab
 	opts.GitLabURL = gitlabURL
 	opts.Dispatcher = jiradispatch.GitLabDispatcher{Poller: glPoller}
-	poller := jirapoll.New(jiraClient, matcher, opts)
+	poller := jirapoll.New(jiraPollClient(jiraClient, args.jira), matcher, opts)
 	return wrapGitLabAuthFailure(sel, poller.Run(cmd.Context()))
 }

@@ -10,6 +10,8 @@ import (
 	"unicode"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/fullsend-ai/fullsend/internal/urlutil"
 )
 
 // Issue-tracker provider names accepted as keys under tracker:.
@@ -101,6 +103,11 @@ const DefaultJiraAPIURL = "https://api.atlassian.com"
 // project (see JiraTrackingConfig.PollJQL).
 const DefaultJiraPollQuery = "statusCategory != Done ORDER BY updated DESC"
 
+// JiraAuthOIDC is the tracker.jira.auth value that authenticates to a
+// self-hosted Jira gateway (tracker.jira.api_url) with the job's forge
+// OIDC token instead of a Jira secret. It is the only accepted value.
+const JiraAuthOIDC = "oidc"
+
 // JiraTrackingConfig holds Jira issue-tracking settings: the Jira site and
 // project this repository is connected to, the cross-project issue
 // destinations, and the poller settings. Credentials (the Jira token and
@@ -113,6 +120,14 @@ type JiraTrackingConfig struct {
 	BaseURL string `yaml:"base_url,omitempty"`
 	// APIURL is the Jira API gateway URL; empty means DefaultJiraAPIURL.
 	APIURL string `yaml:"api_url,omitempty"`
+	// Auth selects how Fullsend authenticates to the Jira API. Empty
+	// keeps the FULLSEND_JIRA_* credential secrets; JiraAuthOIDC sends
+	// the job's forge OIDC token to the self-hosted gateway at APIURL
+	// instead, with no Jira secret.
+	Auth string `yaml:"auth,omitempty"`
+	// Audience is the OIDC audience the job's token is requested for.
+	// Required with, and only valid with, JiraAuthOIDC.
+	Audience string `yaml:"audience,omitempty"`
 	// RunLabel is added at the start of Jira-sourced runs. Empty disables it.
 	RunLabel string `yaml:"run_label,omitempty"`
 	// Project is the key of the single Jira project configured for this
@@ -136,7 +151,7 @@ type JiraPollConfig struct {
 // accepted in tracker.jira, tracker.jira.poll, and
 // tracker.jira.allowed_targets.
 var (
-	jiraTrackingKeys       = map[string]bool{"base_url": true, "api_url": true, "run_label": true, "project": true, "allowed_targets": true, "poll": true}
+	jiraTrackingKeys       = map[string]bool{"base_url": true, "api_url": true, "auth": true, "audience": true, "run_label": true, "project": true, "allowed_targets": true, "poll": true}
 	jiraPollKeys           = map[string]bool{"enabled": true, "query": true}
 	jiraAllowedTargetsKeys = map[string]bool{"projects": true}
 )
@@ -214,9 +229,16 @@ func (j *JiraTrackingConfig) PollJQL() string {
 }
 
 // HasConnectionSettings reports whether the mapping sets any setting
-// beyond allowed_targets (base_url, api_url, project, run_label, or poll).
+// beyond allowed_targets (base_url, api_url, auth, audience, project,
+// run_label, or poll).
 func (j *JiraTrackingConfig) HasConnectionSettings() bool {
-	return j != nil && (j.BaseURL != "" || j.APIURL != "" || j.Project != "" || j.RunLabel != "" || j.Poll != nil)
+	return j != nil && (j.BaseURL != "" || j.APIURL != "" || j.Auth != "" || j.Audience != "" ||
+		j.Project != "" || j.RunLabel != "" || j.Poll != nil)
+}
+
+// IsOIDC reports whether auth selects JiraAuthOIDC.
+func (j *JiraTrackingConfig) IsOIDC() bool {
+	return j != nil && j.Auth == JiraAuthOIDC
 }
 
 // jqlOrderByRe finds a trailing ORDER BY clause, case-insensitively.
@@ -441,6 +463,8 @@ func cloneTracking(src *TrackingConfig) *TrackingConfig {
 		out.Jira = &JiraTrackingConfig{
 			BaseURL:  src.Jira.BaseURL,
 			APIURL:   src.Jira.APIURL,
+			Auth:     src.Jira.Auth,
+			Audience: src.Jira.Audience,
 			RunLabel: src.Jira.RunLabel,
 			Project:  src.Jira.Project,
 			AllowedTargets: JiraAllowedTargets{
@@ -555,6 +579,9 @@ func (j *JiraTrackingConfig) ValidateConnection() error {
 			return err
 		}
 	}
+	if err := j.validateAuth(); err != nil {
+		return err
+	}
 	if j.Project == "" {
 		return fmt.Errorf("tracker.jira: project is required (the Jira project key for this repository, for example PROJ)")
 	}
@@ -563,6 +590,49 @@ func (j *JiraTrackingConfig) ValidateConnection() error {
 	}
 	if j.Poll != nil && !jqlParensBalanced(j.Poll.Query) {
 		return fmt.Errorf("tracker.jira: poll.query has unbalanced parentheses: the query is wrapped in parentheses to scope it to the project")
+	}
+	return nil
+}
+
+// validateAuth checks auth and audience. Every inconsistency is an error,
+// never a fallback to another credential: an unknown auth value; oidc
+// without an audience, or an audience without oidc; and oidc with an
+// api_url that is unset or on an Atlassian host (api.atlassian.com,
+// *.atlassian.net, *.atlassian.com) or base_url's host, so the job's OIDC
+// token can never reach Atlassian. base_url and api_url have already
+// passed validateJiraURL (https, no credentials).
+func (j *JiraTrackingConfig) validateAuth() error {
+	switch j.Auth {
+	case "":
+		if j.Audience != "" {
+			return fmt.Errorf("tracker.jira: audience is set but auth is not %q; set auth: %s or remove audience", JiraAuthOIDC, JiraAuthOIDC)
+		}
+		return nil
+	case JiraAuthOIDC:
+	default:
+		return fmt.Errorf("tracker.jira: auth %q is not supported; the only accepted value is %q", j.Auth, JiraAuthOIDC)
+	}
+	if strings.TrimSpace(j.Audience) == "" {
+		return fmt.Errorf("tracker.jira: auth: %s requires audience (the OIDC audience the Jira gateway expects)", JiraAuthOIDC)
+	}
+	if strings.ContainsFunc(j.Audience, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) {
+		return fmt.Errorf("tracker.jira: audience must not contain whitespace or control characters")
+	}
+	if j.APIURL == "" {
+		return fmt.Errorf("tracker.jira: auth: %s requires api_url, the self-hosted Jira gateway URL", JiraAuthOIDC)
+	}
+	api, err := url.Parse(j.APIURL)
+	if err != nil {
+		return fmt.Errorf("tracker.jira: api_url must be an https URL without credentials, query, or fragment")
+	}
+	if !urlutil.IsLDHHost(api.Hostname()) {
+		return fmt.Errorf("tracker.jira: auth: %s requires api_url's host to be an ASCII DNS name (letters, digits and hyphens)", JiraAuthOIDC)
+	}
+	if urlutil.IsAtlassianHost(api.Hostname()) {
+		return fmt.Errorf("tracker.jira: auth: %s sends the job's OIDC token to api_url, which must be a self-hosted gateway, not an Atlassian host (%s)", JiraAuthOIDC, api.Hostname())
+	}
+	if site, err := url.Parse(j.BaseURL); err == nil && urlutil.SameHost(site.Hostname(), api.Hostname()) {
+		return fmt.Errorf("tracker.jira: auth: %s sends the job's OIDC token to api_url, which must not be base_url's host (%s)", JiraAuthOIDC, api.Hostname())
 	}
 	return nil
 }

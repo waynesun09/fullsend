@@ -2,7 +2,9 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"regexp"
 	"strconv"
@@ -204,7 +206,7 @@ func runJiraPoll(cmd *cobra.Command, jiraURL, jiraProject, jqlOverride, targetRe
 		return fmt.Errorf("build CEL matcher: %w", err)
 	}
 
-	poller := jirapoll.New(jiraClient, matcher, jiraPollOptions(args, matcher))
+	poller := jirapoll.New(jiraPollClient(jiraClient, args.jira), matcher, jiraPollOptions(args, matcher))
 	return poller.Run(cmd.Context())
 }
 
@@ -339,11 +341,13 @@ func gitlabChildDispatchJobToken(getenv func(string) string) (string, error) {
 // jiraPollSettings are the Jira connection and poll settings the jira-poll
 // driver reads from tracker.jira in the effective config.yaml (#9077).
 type jiraPollSettings struct {
-	baseURL string // tracker.jira.base_url: the Jira site URL
-	apiURL  string // tracker.jira.api_url, or its default
-	project string // tracker.jira.project
-	jql     string // tracker.jira.poll.query (or the default) scoped to project
-	enabled bool   // tracker.jira.poll.enabled is true
+	baseURL  string // tracker.jira.base_url: the Jira site URL
+	apiURL   string // tracker.jira.api_url, or its default
+	auth     string // tracker.jira.auth ("" or oidc)
+	audience string // tracker.jira.audience
+	project  string // tracker.jira.project
+	jql      string // tracker.jira.poll.query (or the default) scoped to project
+	enabled  bool   // tracker.jira.poll.enabled is true
 }
 
 // loadJiraPollSettings reads the Jira site, API gateway, project, and poll
@@ -381,11 +385,13 @@ func loadJiraPollSettings(fullsendDir, jiraURL, jiraProject, jql string) (jiraPo
 		return jiraPollSettings{}, err
 	}
 	return jiraPollSettings{
-		baseURL: jiraCfg.BaseURL,
-		apiURL:  jiraCfg.EffectiveAPIURL(),
-		project: jiraCfg.Project,
-		jql:     jiraCfg.PollJQL(),
-		enabled: jiraCfg.PollEnabled(),
+		baseURL:  jiraCfg.BaseURL,
+		apiURL:   jiraCfg.EffectiveAPIURL(),
+		auth:     jiraCfg.Auth,
+		audience: jiraCfg.Audience,
+		project:  jiraCfg.Project,
+		jql:      jiraCfg.PollJQL(),
+		enabled:  jiraCfg.PollEnabled(),
 	}, nil
 }
 
@@ -457,12 +463,46 @@ func validateJiraPollArgs(settings jiraPollSettings, targetRepo, outputPath, ful
 // when absent, or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET
 // supply a service account's OAuth 2.0 client credentials. opts are passed
 // to jira.NewScoped; production callers pass none.
+//
+// With tracker.jira.auth: oidc no FULLSEND_JIRA_* secret may be set: the
+// client sends the job's GitHub Actions OIDC token for tracker.jira.audience
+// to the self-hosted gateway at tracker.jira.api_url
+// (jira.NewScopedFromEnv).
 func buildJiraClient(settings jiraPollSettings, getenv func(string) string, opts ...jira.Option) (*jira.LiveClient, error) {
-	creds, err := jira.CredentialsFromEnv(getenv)
-	if err != nil {
-		return nil, err
+	// Every OIDC token fetched in process is registered for redaction and
+	// the Actions mask first; opts follow, so a test may replace the hook.
+	return jira.NewScopedFromEnv(jira.ScopedConfig{
+		BaseURL:  settings.baseURL,
+		APIURL:   settings.apiURL,
+		Auth:     settings.auth,
+		Audience: settings.audience,
+	}, getenv, append([]jira.Option{jira.WithOIDCTokenHook(jiraOIDCTokenHook)}, opts...)...)
+}
+
+// jiraPollClient returns the poller's Jira client. With tracker.jira.auth:
+// oidc a search the gateway refuses with code jql_grammar is outside the
+// narrow JQL grammar it allows, so the error names tracker.jira.poll.query
+// for the operator to simplify. Core does no grammar check of its own.
+func jiraPollClient(c *jira.LiveClient, settings jiraPollSettings) jirapoll.JiraClient {
+	if settings.auth != jira.AuthOIDC {
+		return c
 	}
-	return jira.NewScoped(jira.ScopedConfig{BaseURL: settings.baseURL, APIURL: settings.apiURL}, creds, opts...)
+	return oidcPollJiraClient{c}
+}
+
+// oidcPollJiraClient is the poller's Jira client in oidc mode.
+type oidcPollJiraClient struct {
+	*jira.LiveClient
+}
+
+// SearchIssues runs the search and explains a gateway jql_grammar refusal.
+func (c oidcPollJiraClient) SearchIssues(ctx context.Context, jql string, limit int) ([]jira.Issue, error) {
+	issues, err := c.LiveClient.SearchIssues(ctx, jql, limit)
+	var apiErr *jira.APIError
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusForbidden && apiErr.GatewayCode == jira.GatewayCodeJQLGrammar {
+		return nil, fmt.Errorf("the Jira gateway refused the poll query; simplify tracker.jira.poll.query to the grammar the gateway allows: %w", err)
+	}
+	return issues, err
 }
 
 // buildRouter constructs a HarnessRouter from config-registered agents

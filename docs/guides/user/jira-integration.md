@@ -782,6 +782,10 @@ Where the value comes from depends on the deployment's credential:
     missing or invalid, if `--offline` is set, if the lookup fails, or if
     `tracker.jira.api_url` is set to anything other than
     `https://api.atlassian.com`.
+  - With `tracker.jira.auth: oidc` the provider carries the job's OIDC token
+    instead, and its profile allows only the self-hosted gateway at
+    `tracker.jira.api_url` (see
+    [Jira OIDC gateway mode](../../reference/config-reference.md#jira-oidc-gateway-mode)).
 
 A running process keeps the placeholder it started with, and OpenShell keeps
 resolving that one to the token it was issued for, which expires after 60
@@ -989,13 +993,26 @@ tracker:
 ```
 
 `base_url` and `project` are required. `api_url` defaults to
-`https://api.atlassian.com`. The poller always scopes the query as
+`https://api.atlassian.com`. To reach Jira with no Jira secret, through a
+self-hosted gateway that accepts the job's GitHub Actions OIDC token, set
+`auth: oidc` and `audience`; see
+[Jira OIDC gateway mode](../../reference/config-reference.md#jira-oidc-gateway-mode).
+The poller always scopes the query as
 `project = "<project>" AND (<query>)`, keeping a trailing `ORDER BY` at the
 end, so the example above runs as
 `project = "PROJ" AND (labels = "fullsend" AND statusCategory != Done) ORDER BY updated DESC`.
 The parentheses in `poll.query` must be balanced. When `poll.query` is
 omitted, the poller uses the default filter above. Unless `poll.enabled` is
 `true`, the poller skips the cycle without contacting Jira.
+
+#### Poll query with an OIDC gateway
+
+A self-hosted gateway may accept only a narrow JQL grammar: the default
+query, plus `project`, `status`, `statusCategory`, `issuetype`, `labels`,
+`assignee` and `updated` clauses joined by `AND`, with an optional
+`ORDER BY`. Fullsend does not check the grammar itself. When the gateway
+refuses the query (code `jql_grammar`), the poll fails with an error that
+names `tracker.jira.poll.query`; simplify the query to that grammar.
 
 The `--jira-url`, `--jira-project`, and `--jql` flags were removed and are
 rejected, and `JIRA_BASE_URL` is not read. Because the query is always

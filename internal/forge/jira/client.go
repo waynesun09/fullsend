@@ -36,6 +36,13 @@ type LiveClient struct {
 	oauth         *oauthTokenSource
 	oauthTokenURL string
 
+	// oidc, when set, supplies Bearer GitHub Actions OIDC tokens for a
+	// self-hosted gateway (AuthOIDC, see NewScoped). oidcFetch overrides
+	// its fetch (WithOIDCFetch).
+	oidc      *oidcTokenSource
+	oidcFetch OIDCFetchFunc
+	oidcHook  func(token string)
+
 	// gatewayURL, when set, routes REST requests through the Atlassian
 	// API gateway (see WithAPIGateway) instead of the site URL.
 	gatewayURL string
@@ -146,8 +153,19 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 // token.
 func New(token string, opts ...Option) (*LiveClient, error) {
 	c := newLiveClient(token, opts)
-	if c.oauth == nil && token == "" {
+	if c.oauth == nil && c.oidc == nil && token == "" {
 		return nil, fmt.Errorf("jira: token must not be empty")
+	}
+	if c.oidc != nil {
+		c.oidc.fetch = c.oidcFetch
+		c.oidc.hook = c.oidcHook
+		if c.oidc.fetch == nil {
+			fetch, err := c.oidc.defaultOIDCFetch()
+			if err != nil {
+				return nil, err
+			}
+			c.oidc.fetch = fetch
+		}
 	}
 	if c.oauth != nil {
 		c.oauth.tokenURL = DefaultOAuthTokenURL
@@ -202,7 +220,23 @@ func (c *LiveClient) validateEndpoints() error {
 type APIError struct {
 	StatusCode int
 	Message    string
+	// GatewayCode is the stable code of a self-hosted gateway's
+	// {"error": "...", "code": "..."} answer (tracker.jira.auth: oidc),
+	// for example GatewayCodeJQLGrammar; empty for any other response
+	// or a code that is not well-formed.
+	GatewayCode string
 }
+
+// Stable codes a self-hosted Jira gateway answers with
+// (tracker.jira.auth: oidc).
+const (
+	// GatewayCodeUpstreamAuth (status 502): Jira refused the gateway's own
+	// credential. A retry cannot fix it.
+	GatewayCodeUpstreamAuth = "upstream_auth"
+	// GatewayCodeJQLGrammar (status 403 on a search): the JQL is outside
+	// the grammar the gateway allows.
+	GatewayCodeJQLGrammar = "jql_grammar"
+)
 
 func (e *APIError) Error() string {
 	return fmt.Sprintf("jira api: %d %s", e.StatusCode, e.Message)
@@ -212,7 +246,12 @@ func (e *APIError) Error() string {
 // failure that may succeed on retry: server errors (500–504) and
 // rate limits (429). This method satisfies the transientReporter
 // interface used by forge.IsTransient.
+// A gateway's upstream_auth (Jira refused the gateway's own credential)
+// is not transient.
 func (e *APIError) IsTransient() bool {
+	if e.GatewayCode == GatewayCodeUpstreamAuth {
+		return false
+	}
 	return e.StatusCode == http.StatusTooManyRequests ||
 		(e.StatusCode >= 500 && e.StatusCode <= 504)
 }
@@ -325,6 +364,14 @@ func (c *LiveClient) fetchCloudID(ctx context.Context) (string, error) {
 // access token it used ("" with a token). stale is an access token the API
 // just rejected: it is replaced rather than reused.
 func (c *LiveClient) authorize(ctx context.Context, req *http.Request, stale string) (string, error) {
+	if c.oidc != nil {
+		tok, err := c.oidc.token(ctx, stale)
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+		return tok, nil
+	}
 	if c.oauth == nil {
 		c.setAuth(req)
 		return "", nil
@@ -406,6 +453,23 @@ func (c *LiveClient) do(ctx context.Context, method, path string, body io.Reader
 			stale = usedToken
 			continue
 		}
+		if c.oidc != nil && resp.StatusCode >= 500 {
+			// A gateway 502 with upstream_auth means Jira refused the
+			// gateway's own credential: retrying cannot help.
+			data, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+			_ = resp.Body.Close()
+			if apiErr := errorFromBody(resp.StatusCode, data); apiErr.GatewayCode == GatewayCodeUpstreamAuth {
+				return apiErr
+			}
+			resp.Body = io.NopCloser(bytes.NewReader(data))
+		}
+		if resp.StatusCode == http.StatusUnauthorized && c.oidc != nil {
+			// A freshly fetched token was refused too: no other credential
+			// kind is tried.
+			_ = resp.Body.Close()
+			return &APIError{StatusCode: resp.StatusCode, Message: "the Jira gateway refused the OIDC token, also after fetching a fresh one; " +
+				"check that tracker.jira.audience is the audience the gateway expects and that the gateway trusts this repository's workflow"}
+		}
 
 		if isRetryable(resp, method, path) {
 			_ = resp.Body.Close()
@@ -444,14 +508,36 @@ func (c *LiveClient) do(ctx context.Context, method, path string, body io.Reader
 	return fmt.Errorf("exhausted retries for %s %s", method, path)
 }
 
+// maxErrorBodyBytes bounds how much of an error response is read.
+const maxErrorBodyBytes = 64 << 10
+
+// gatewayErrorRe matches a gateway error text safe to quote: printable
+// ASCII on one line, at most 200 characters, so a response cannot inject
+// control sequences or long text into logs.
+var gatewayErrorRe = regexp.MustCompile(`^[\x20-\x7e]{1,200}$`)
+
+// gatewayCodeRe matches a gateway error code.
+var gatewayCodeRe = regexp.MustCompile(`^[a-z_]{1,64}$`)
+
 // parseErrorResponse reads a Jira error response and returns an APIError.
 func parseErrorResponse(resp *http.Response) error {
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+	return errorFromBody(resp.StatusCode, data)
+}
 
+// errorFromBody builds the APIError for an error response body: Jira's
+// errorMessages and errors, or a self-hosted gateway's {"error", "code"}
+// (each quoted only when it passes gatewayErrorRe or gatewayCodeRe), or
+// the status text.
+func errorFromBody(status int, data []byte) *APIError {
+	// error and code are raw so a Jira body whose code is not a string
+	// (for example {"errorMessages":["x"],"code":401}) still decodes.
 	var errResp struct {
 		ErrorMessages []string          `json:"errorMessages"`
 		Errors        map[string]string `json:"errors"`
+		Error         json.RawMessage   `json:"error"`
+		Code          json.RawMessage   `json:"code"`
 	}
 	if json.Unmarshal(data, &errResp) == nil {
 		var parts []string
@@ -460,10 +546,34 @@ func parseErrorResponse(resp *http.Response) error {
 			parts = append(parts, fmt.Sprintf("%s: %s", k, v))
 		}
 		if len(parts) > 0 {
-			return &APIError{StatusCode: resp.StatusCode, Message: strings.Join(parts, "; ")}
+			return &APIError{StatusCode: status, Message: strings.Join(parts, "; ")}
+		}
+		code, text := rawString(errResp.Code), rawString(errResp.Error)
+		if !gatewayCodeRe.MatchString(code) {
+			code = ""
+		}
+		if !gatewayErrorRe.MatchString(text) {
+			text = ""
+		}
+		switch {
+		case text != "" && code != "":
+			return &APIError{StatusCode: status, Message: "gateway: " + text + " (" + code + ")", GatewayCode: code}
+		case text != "":
+			return &APIError{StatusCode: status, Message: text}
+		case code != "":
+			return &APIError{StatusCode: status, Message: http.StatusText(status) + " (gateway code " + code + ")", GatewayCode: code}
 		}
 	}
-	return &APIError{StatusCode: resp.StatusCode, Message: http.StatusText(resp.StatusCode)}
+	return &APIError{StatusCode: status, Message: http.StatusText(status)}
+}
+
+// rawString returns raw as a string when it is a JSON string, else "".
+func rawString(raw json.RawMessage) string {
+	var s string
+	if len(raw) == 0 || json.Unmarshal(raw, &s) != nil {
+		return ""
+	}
+	return s
 }
 
 func isRetryable(resp *http.Response, method, path string) bool {

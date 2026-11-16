@@ -2,9 +2,11 @@ package jira
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 )
 
 // Environment variables carrying the credentials for Fullsend-managed Jira
@@ -112,8 +114,20 @@ type ScopedConfig struct {
 	// discover the cloud ID and for issue browse links.
 	BaseURL string
 	// APIURL is the API gateway URL (tracker.jira.api_url); empty means
-	// DefaultAPIURL.
+	// DefaultAPIURL. With AuthOIDC it is required and must be a
+	// self-hosted gateway (CheckOIDCGatewayURL).
 	APIURL string
+	// Auth is "" (credentials from Credentials) or AuthOIDC
+	// (tracker.jira.auth).
+	Auth string
+	// Audience is the OIDC audience requested with AuthOIDC
+	// (tracker.jira.audience).
+	Audience string
+	// OIDCRequestURL and OIDCRequestToken are the runner's
+	// ACTIONS_ID_TOKEN_REQUEST_URL and ACTIONS_ID_TOKEN_REQUEST_TOKEN, used
+	// with AuthOIDC unless WithOIDCFetch supplies the token.
+	OIDCRequestURL   string
+	OIDCRequestToken string
 }
 
 // NewScoped is the shared constructor for Fullsend-managed Jira API calls
@@ -124,9 +138,19 @@ type ScopedConfig struct {
 // Bearer token otherwise (service account). With client credentials, auth
 // is a Bearer access token obtained from the Atlassian token endpoint
 // (DefaultOAuthTokenURL, or WithOAuthTokenURL) and refreshed before it
-// expires or when the gateway rejects it. opts are applied after the
-// connection settings, for example WithHTTPClient.
+// expires or when the gateway rejects it. With cfg.Auth AuthOIDC, creds
+// must be empty and auth is a Bearer GitHub Actions OIDC token for
+// cfg.Audience, sent only to a self-hosted gateway at cfg.APIURL and
+// refetched before it expires or once when the gateway rejects it. opts
+// are applied after the connection settings, for example WithHTTPClient.
 func NewScoped(cfg ScopedConfig, creds Credentials, opts ...Option) (*LiveClient, error) {
+	switch cfg.Auth {
+	case "":
+	case AuthOIDC:
+		return newScopedOIDC(cfg, creds, opts)
+	default:
+		return nil, fmt.Errorf("jira: auth %q is not supported; the only accepted value is %q", cfg.Auth, AuthOIDC)
+	}
 	if err := creds.validate(); err != nil {
 		return nil, err
 	}
@@ -144,6 +168,35 @@ func NewScoped(cfg ScopedConfig, creds Credentials, opts ...Option) (*LiveClient
 	}
 	all = append(all, WithEmail(creds.Email))
 	return New(creds.Token, append(all, opts...)...)
+}
+
+// newScopedOIDC is NewScoped for AuthOIDC.
+func newScopedOIDC(cfg ScopedConfig, creds Credentials, opts []Option) (*LiveClient, error) {
+	if creds != (Credentials{}) {
+		return nil, fmt.Errorf("jira: tracker.jira.auth is %q, so no Jira credential (%s, %s, %s, %s) may be used", AuthOIDC,
+			TokenEnvVar, EmailEnvVar, ClientIDEnvVar, ClientSecretEnvVar)
+	}
+	audience := strings.TrimSpace(cfg.Audience)
+	if audience == "" {
+		return nil, errors.New("jira: tracker.jira.auth: oidc requires tracker.jira.audience")
+	}
+	if err := CheckOIDCGatewayURL(cfg.APIURL, cfg.BaseURL); err != nil {
+		return nil, err
+	}
+	all := []Option{
+		WithBaseURL(cfg.BaseURL),
+		WithAPIGateway(cfg.APIURL),
+		func(c *LiveClient) {
+			c.oidc = &oidcTokenSource{
+				audience:     audience,
+				requestURL:   cfg.OIDCRequestURL,
+				requestToken: cfg.OIDCRequestToken,
+				sem:          make(chan struct{}, 1),
+				now:          time.Now,
+			}
+		},
+	}
+	return New("", append(all, opts...)...)
 }
 
 // GatewayBaseURL returns the per-site API gateway base URL

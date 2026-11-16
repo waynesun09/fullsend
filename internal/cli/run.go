@@ -996,6 +996,12 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	if orgCfg != nil {
 		issueTracking = orgCfg.IssueTracking()
 	}
+	// tracker.jira.auth: oidc fails at start, before any stage, when a
+	// FULLSEND_JIRA_* secret is still set or on GitLab CI.
+	if err := checkJiraOIDCRunStart(issueTracking, os.Getenv); err != nil {
+		printer.StepFail("Jira OIDC gateway mode cannot start")
+		return err
+	}
 	jiraEnv, err := resolveJiraRunEnv(ctx, sOpts.trackerSource, issueTracking, rFlags.offline, discoverJiraGatewayURL)
 	if err != nil {
 		return err
@@ -1818,7 +1824,11 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		// a listed fullsend-jira copy is refused, before anything is minted,
 		// when this run mints. With a static token it is warned about and
 		// kept like any other reserved copy.
-		if jiraRunMints(allDefs, os.Getenv) {
+		// tracker.jira.auth: oidc gives the run-scoped Jira provider the
+		// job's OIDC token for the self-hosted gateway instead of a Jira
+		// secret.
+		jiraOIDC := issueTracking != nil && issueTracking.Jira.IsOIDC()
+		if jiraRunMints(allDefs, jiraOIDC, os.Getenv) {
 			if err := rejectReservedProfileID(jiraProviderType, result.Profiles); err != nil {
 				printer.StepFail("Reserved fullsend-jira profile copy next to a minted Jira token")
 				return err
@@ -1837,7 +1847,7 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		// never overwrite each other's token, and it is deleted when the
 		// run ends — even under --keep-sandbox, because a live-token
 		// provider must not outlive the run (#6689).
-		if err := rejectMultipleMintedJiraProviders(allDefs, os.Getenv); err != nil {
+		if err := rejectMultipleMintedJiraProviders(allDefs, jiraOIDC, os.Getenv); err != nil {
 			printer.StepFail("Another JIRA_TOKEN provider next to the minted Jira provider")
 			return err
 		}
@@ -1848,12 +1858,33 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		for _, pd := range allDefs {
 			if strings.EqualFold(pd.Type, jiraProviderType) {
 				pd.Type = jiraProviderType
-				jiraCreds, mint, err := jiraMintCredentials(pd, os.Getenv)
+				if jiraOIDC {
+					// The fail-closed rules first, so a leftover Jira secret
+					// is named as such.
+					if err := jiraOIDCRunPreflight(os.Getenv); err != nil {
+						printer.StepFail("Jira OIDC gateway mode cannot start")
+						return err
+					}
+				}
+				jiraCreds, mint, err := jiraProviderMints(pd, jiraOIDC, os.Getenv)
 				if err != nil {
 					printer.StepFail("Jira credentials incomplete for provider " + pd.Name)
 					return err
 				}
 				if mint {
+					src := jiraProviderHandle{creds: jiraCreds, egressHost: jiraAPIHost}
+					var gw *jiraOIDCGateway
+					if jiraOIDC {
+						g, err := parseJiraOIDCGateway(issueTracking.Jira.APIURL)
+						if err != nil {
+							printer.StepFail("Jira OIDC gateway URL unusable in the sandbox profile")
+							return err
+						}
+						gw = &g
+						reqURL, reqToken := jiraOIDCEndpoint()
+						src = jiraProviderHandle{audience: strings.TrimSpace(issueTracking.Jira.Audience), egressHost: g.host,
+							oidcRequestURL: reqURL, oidcRequestToken: reqToken}
+					}
 					// The run-scoped provider reaches only this run's site
 					// through the gateway: its profile is the embedded one
 					// rendered with that site's path (#9492).
@@ -1862,12 +1893,12 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 						printer.StepFail("Cannot limit the minted Jira token to the run's own site")
 						return err
 					}
-					profileID, err := ensureJiraSiteProfile(ctx, cloudID, printer)
+					profileID, err := ensureJiraSiteProfileFor(ctx, cloudID, gw, printer)
 					if err != nil {
 						printer.StepFail("Cannot render the per-site Jira profile")
 						return err
 					}
-					handle, err := ensureJiraProvider(ctx, pd, profileID, sandboxName, jiraCreds, printer)
+					handle, err := ensureJiraProviderFrom(ctx, pd, profileID, sandboxName, src, printer)
 					if err != nil {
 						return err
 					}
@@ -2289,8 +2320,8 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	// inspected route, and the running agent only follows a refresh
 	// through the token file, so check the route and seed the file before
 	// the agent starts.
-	if len(jiraHandles) > 0 {
-		if err := checkJiraEgressInspected(ctx, sandboxName); err != nil {
+	for _, jh := range jiraHandles {
+		if err := checkJiraEgressInspected(ctx, sandboxName, jh.egressHost); err != nil {
 			printer.StepFail("Sandbox policy cannot deliver the Jira access token")
 			discardSandbox(sandboxName, runDir, keepSandbox, printer)
 			return err

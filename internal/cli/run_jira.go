@@ -22,7 +22,6 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/config"
 	"github.com/fullsend-ai/fullsend/internal/forge/jira"
 	"github.com/fullsend-ai/fullsend/internal/harness"
-	"github.com/fullsend-ai/fullsend/internal/randutil"
 	"github.com/fullsend-ai/fullsend/internal/resolve"
 	"github.com/fullsend-ai/fullsend/internal/runtime"
 	"github.com/fullsend-ai/fullsend/internal/sandbox"
@@ -142,12 +141,12 @@ func jiraMintCredentials(pd harness.ProviderDef, getenv func(string) string) (ji
 // jiraRunMints reports whether any fullsend-jira definition in defs mints
 // its token. An incomplete client pair counts as not minting; the provider
 // loop reports it.
-func jiraRunMints(defs []harness.ProviderDef, getenv func(string) string) bool {
+func jiraRunMints(defs []harness.ProviderDef, oidc bool, getenv func(string) string) bool {
 	for _, pd := range defs {
 		if !strings.EqualFold(pd.Type, jiraProviderType) {
 			continue
 		}
-		if _, mint, err := jiraMintCredentials(pd, getenv); err == nil && mint {
+		if _, mint, err := jiraProviderMints(pd, oidc, getenv); err == nil && mint {
 			return true
 		}
 	}
@@ -159,7 +158,7 @@ func jiraRunMints(defs []harness.ProviderDef, getenv func(string) string) bool {
 // JIRA_TOKEN credential, whatever its type (for example the agents repo's
 // fullsend-jira-ro): every attached provider exports JIRA_TOKEN into the
 // sandbox, and a second minted one would also rewrite the one token file.
-func rejectMultipleMintedJiraProviders(defs []harness.ProviderDef, getenv func(string) string) error {
+func rejectMultipleMintedJiraProviders(defs []harness.ProviderDef, oidc bool, getenv func(string) string) error {
 	var all, minted []string
 	for _, pd := range defs {
 		if _, declared := pd.Credentials[jiraCredentialKey]; !declared {
@@ -170,7 +169,7 @@ func rejectMultipleMintedJiraProviders(defs []harness.ProviderDef, getenv func(s
 			continue
 		}
 		// An incomplete pair is reported by the provider loop.
-		if _, mint, err := jiraMintCredentials(pd, getenv); err == nil && mint {
+		if _, mint, err := jiraProviderMints(pd, oidc, getenv); err == nil && mint {
 			minted = append(minted, pd.Name)
 		}
 	}
@@ -221,11 +220,18 @@ func validateJiraCloudID(cloudID string) error {
 // renderJiraSiteProfile renders the embedded fullsend-jira profile for the
 // site cloudID and returns its bytes and per-site id.
 func renderJiraSiteProfile(cloudID string) ([]byte, string, error) {
+	return renderJiraSiteProfileFor(cloudID, nil)
+}
+
+// renderJiraSiteProfileFor is renderJiraSiteProfile for the gateway gw:
+// nil is the Atlassian API gateway, anything else the self-hosted gateway
+// of tracker.jira.auth: oidc (renderJiraSiteProfileTo).
+func renderJiraSiteProfileFor(cloudID string, gw *jiraOIDCGateway) ([]byte, string, error) {
 	tmpl, err := scaffold.FullsendRepoFile("profiles/" + jiraProviderType + ".yaml")
 	if err != nil {
 		return nil, "", fmt.Errorf("provider profile %q is not shipped by this fullsend build: %w", jiraProviderType, err)
 	}
-	return renderJiraSiteProfileFrom(tmpl, cloudID)
+	return renderJiraSiteProfileTo(tmpl, cloudID, gw)
 }
 
 // renderJiraSiteProfileFrom renders tmpl, a fullsend-jira profile, for the
@@ -235,6 +241,17 @@ func renderJiraSiteProfile(cloudID string) ([]byte, string, error) {
 // that host, with no path of its own, and no wildcard endpoint that would
 // also admit it.
 func renderJiraSiteProfileFrom(tmpl []byte, cloudID string) ([]byte, string, error) {
+	return renderJiraSiteProfileTo(tmpl, cloudID, nil)
+}
+
+// renderJiraSiteProfileTo is renderJiraSiteProfileFrom for the gateway gw.
+// With a self-hosted gateway (tracker.jira.auth: oidc) the one
+// api.atlassian.com endpoint is moved to gw's host, with path
+// <gw prefix>/ex/jira/<cloudId>/**, and every other endpoint (the
+// *.atlassian.net site URLs) is dropped, so OpenShell injects the job's
+// OIDC token only on the gateway and never on an Atlassian host. The id
+// also hashes gw (jiraGatewaySiteProfileID).
+func renderJiraSiteProfileTo(tmpl []byte, cloudID string, gw *jiraOIDCGateway) ([]byte, string, error) {
 	if err := validateJiraCloudID(cloudID); err != nil {
 		return nil, "", err
 	}
@@ -294,11 +311,24 @@ func renderJiraSiteProfileFrom(tmpl []byte, cloudID string) ([]byte, string, err
 		return nil, "", invalid("the " + jiraAPIHost + " endpoint already sets a path")
 	}
 	id := jiraSiteProfileID(cloudID)
+	pathPrefix := ""
+	if gw != nil {
+		id = jiraGatewaySiteProfileID(cloudID, *gw)
+		pathPrefix = gw.prefix
+		hostNode := yamlMappingValue(gateway, "host")
+		hostNode.Value = gw.host
+		hostNode.Style = yaml.DoubleQuotedStyle
+		endpoints.Content = []*yaml.Node{gateway}
+		gateway.HeadComment = "Self-hosted Jira gateway (tracker.jira.auth: oidc), limited to this run's site.\nThe provider carries the job's OIDC token, which reaches only this host."
+		for _, n := range gateway.Content {
+			n.HeadComment = ""
+		}
+	}
 	idNode.Value = id
 	idNode.Style = 0
 	gateway.Content = append(gateway.Content,
 		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "path"},
-		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "/ex/jira/" + cloudID + "/**", Style: yaml.DoubleQuotedStyle},
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: pathPrefix + "/ex/jira/" + cloudID + "/**", Style: yaml.DoubleQuotedStyle},
 	)
 	var out bytes.Buffer
 	enc := yaml.NewEncoder(&out)
@@ -316,7 +346,13 @@ func renderJiraSiteProfileFrom(tmpl []byte, cloudID string) ([]byte, string, err
 // cloudID and imports it (importProfileBytes). It returns the profile id
 // the run-scoped provider must use as its type.
 func ensureJiraSiteProfile(ctx context.Context, cloudID string, printer *ui.Printer) (string, error) {
-	data, id, err := renderJiraSiteProfile(cloudID)
+	return ensureJiraSiteProfileFor(ctx, cloudID, nil, printer)
+}
+
+// ensureJiraSiteProfileFor is ensureJiraSiteProfile for the gateway gw
+// (renderJiraSiteProfileFor).
+func ensureJiraSiteProfileFor(ctx context.Context, cloudID string, gw *jiraOIDCGateway, printer *ui.Printer) (string, error) {
+	data, id, err := renderJiraSiteProfileFor(cloudID, gw)
 	if err != nil {
 		return "", err
 	}
@@ -333,12 +369,22 @@ func ensureJiraSiteProfile(ctx context.Context, cloudID string, printer *ui.Prin
 // the gateway URL up from tracker.jira.base_url with discover. It is
 // called only when the run mints. Errors never include a raw URL.
 func resolveJiraMintCloudID(ctx context.Context, apiURL string, tracking *config.TrackingConfig, offline bool, discover jiraGatewayDiscoverer) (string, error) {
-	const what = "minting the Jira access token"
+	what := "minting the Jira access token"
+	if tracking != nil && tracking.Jira.IsOIDC() {
+		what = "fetching the OIDC token for the Jira gateway"
+	}
 	if tracking == nil || tracking.Jira == nil || tracking.Jira.BaseURL == "" {
 		return "", fmt.Errorf("%s: tracker.jira.base_url is not configured, so the Jira gateway cannot be limited to the run's own site", what)
 	}
-	// The profile host is fixed to api.atlassian.com.
-	if strings.TrimRight(tracking.Jira.EffectiveAPIURL(), "/") != jira.DefaultAPIURL {
+	// The profile host is api.atlassian.com, or the self-hosted gateway
+	// with tracker.jira.auth: oidc.
+	gateway := jira.DefaultAPIURL
+	if tracking.Jira.IsOIDC() {
+		gateway = strings.TrimRight(tracking.Jira.APIURL, "/")
+		if err := jira.CheckOIDCGatewayURL(gateway, tracking.Jira.BaseURL); err != nil {
+			return "", fmt.Errorf("%s: %w", what, err)
+		}
+	} else if strings.TrimRight(tracking.Jira.EffectiveAPIURL(), "/") != jira.DefaultAPIURL {
 		return "", fmt.Errorf("%s: tracker.jira.api_url must be unset or %s, the gateway the fullsend-jira profile allows", what, jira.DefaultAPIURL)
 	}
 	if apiURL == "" {
@@ -357,7 +403,7 @@ func resolveJiraMintCloudID(ctx context.Context, apiURL string, tracking *config
 		dctx, cancel := context.WithTimeout(ctx, jiraGatewayDiscoveryTimeout)
 		defer cancel()
 		var err error
-		apiURL, err = discover(dctx, jira.ScopedConfig{BaseURL: conn.BaseURL, APIURL: jira.DefaultAPIURL})
+		apiURL, err = discover(dctx, jira.ScopedConfig{BaseURL: conn.BaseURL, APIURL: gateway})
 		if err == nil && apiURL == "" {
 			err = errors.New("empty gateway URL")
 		}
@@ -365,9 +411,9 @@ func resolveJiraMintCloudID(ctx context.Context, apiURL string, tracking *config
 			return "", fmt.Errorf("%s: could not resolve the Jira cloud ID for %s: %w", what, host, err)
 		}
 	}
-	cloudID, ok := strings.CutPrefix(apiURL, jira.DefaultAPIURL+"/ex/jira/")
+	cloudID, ok := strings.CutPrefix(apiURL, gateway+"/ex/jira/")
 	if !ok {
-		return "", fmt.Errorf("%s: the resolved Jira gateway URL is not under %s/ex/jira/", what, jira.DefaultAPIURL)
+		return "", fmt.Errorf("%s: the resolved Jira gateway URL is not under the configured gateway's /ex/jira/", what)
 	}
 	if err := validateJiraCloudID(cloudID); err != nil {
 		return "", fmt.Errorf("%s: %w", what, err)
@@ -405,7 +451,20 @@ type jiraProviderHandle struct {
 	sandbox string
 	// creds are the client credentials, held in memory so a refresh never
 	// reads the environment.
-	creds     jira.Credentials
+	creds jira.Credentials
+	// audience, when set, selects tracker.jira.auth: oidc: the provider
+	// carries the job's OIDC token for this audience instead of a minted
+	// access token, and egressHost is the self-hosted gateway's host.
+	audience   string
+	egressHost string
+	// oidcRequestURL and oidcRequestToken are the runner's OIDC token
+	// endpoint, captured when the provider is created, so a refresh never
+	// reads an environment another stage may be changing.
+	oidcRequestURL   string
+	oidcRequestToken string
+	// issuedAt and expiresAt are the held token's iat (the mint time for
+	// an access token) and expiry.
+	issuedAt  time.Time
 	expiresAt time.Time
 	// maskActions registers each minted token with the GitHub Actions log
 	// mask as well as the process redactor.
@@ -447,14 +506,29 @@ func registerJiraToken(value string, maskActions bool) error {
 // run-scoped provider instance carrying it, with the token's expiry, as a
 // provider of type profileID (the per-site profile, ensureJiraSiteProfile).
 func ensureJiraProvider(ctx context.Context, pd harness.ProviderDef, profileID, sandboxName string, creds jira.Credentials, printer *ui.Printer) (jiraProviderHandle, error) {
+	return ensureJiraProviderFrom(ctx, pd, profileID, sandboxName, jiraProviderHandle{creds: creds, egressHost: jiraAPIHost}, printer)
+}
+
+// ensureJiraProviderFrom is ensureJiraProvider for the token source in src:
+// its creds (a minted access token) or its audience (the job's OIDC token
+// for a self-hosted gateway, tracker.jira.auth: oidc), and its egressHost.
+func ensureJiraProviderFrom(ctx context.Context, pd harness.ProviderDef, profileID, sandboxName string, src jiraProviderHandle, printer *ui.Printer) (jiraProviderHandle, error) {
 	maskActions := os.Getenv("GITHUB_ACTIONS") == "true"
 	// The client secret is redacted too, should any error ever quote it.
-	security.RegisterRuntimeSecret(creds.ClientSecret)
+	if src.audience == "" {
+		security.RegisterRuntimeSecret(src.creds.ClientSecret)
+	}
 	name := runScopedProviderName(pd.Name, sandboxName)
-	printer.StepStart("Minting the Jira access token for provider: " + pd.Name)
-	tok, err := jiraMintFn(ctx, creds)
+	kind := "OAuth 2.0 client credentials"
+	if src.audience != "" {
+		kind = fmt.Sprintf("GitHub Actions OIDC token, audience %q", src.audience)
+		printer.StepStart("Fetching the OIDC token for the Jira gateway for provider: " + pd.Name)
+	} else {
+		printer.StepStart("Minting the Jira access token for provider: " + pd.Name)
+	}
+	tok, err := src.mintToken(ctx)
 	if err != nil {
-		if jira.IsPermanentOAuthError(err) {
+		if src.audience == "" && jira.IsPermanentOAuthError(err) {
 			cause := jiraRejectedCause(err)
 			printer.StepFail(fmt.Sprintf("Jira %s for provider %s; check %s and %s", cause, pd.Name, jira.ClientIDEnvVar, jira.ClientSecretEnvVar))
 			return jiraProviderHandle{}, fmt.Errorf("provider %q: %s: %w", pd.Name, cause, err)
@@ -466,7 +540,7 @@ func ensureJiraProvider(ctx context.Context, pd harness.ProviderDef, profileID, 
 		printer.StepFail("Jira access token unusable for provider " + pd.Name)
 		return jiraProviderHandle{}, fmt.Errorf("provider %q: %w", pd.Name, err)
 	}
-	printer.StepDone(fmt.Sprintf("Jira access token ready (OAuth 2.0 client credentials, lifetime %s)", time.Until(tok.ExpiresAt).Round(time.Minute)))
+	printer.StepDone(fmt.Sprintf("Jira access token ready (%s, lifetime %s)", kind, time.Until(tok.ExpiresAt).Round(time.Second)))
 	var ignored []string
 	for k := range pd.Credentials {
 		if k != jiraCredentialKey {
@@ -498,14 +572,19 @@ func ensureJiraProvider(ctx context.Context, pd harness.ProviderDef, profileID, 
 	}
 	printer.StepDone(fmt.Sprintf("Provider ready: %s (minted, expires in %s, %.1fs)", name, time.Until(tok.ExpiresAt).Round(time.Minute), time.Since(start).Seconds()))
 	return jiraProviderHandle{
-		name:        name,
-		sandbox:     sandboxName,
-		creds:       creds,
-		expiresAt:   tok.ExpiresAt,
-		maskActions: maskActions,
-		sandboxUp:   &atomic.Bool{},
-		state:       &jiraSeedState{},
-		unrecorded:  &seedGenerations{},
+		name:             name,
+		sandbox:          sandboxName,
+		creds:            src.creds,
+		audience:         src.audience,
+		egressHost:       src.egressHost,
+		oidcRequestURL:   src.oidcRequestURL,
+		oidcRequestToken: src.oidcRequestToken,
+		issuedAt:         tok.IssuedAt,
+		expiresAt:        tok.ExpiresAt,
+		maskActions:      maskActions,
+		sandboxUp:        &atomic.Bool{},
+		state:            &jiraSeedState{},
+		unrecorded:       &seedGenerations{},
 	}, nil
 }
 
@@ -597,15 +676,23 @@ func seedJiraAndMarkReady(ctx context.Context, h jiraProviderHandle, printer *ui
 // bounded by budget; the hand-off waits for the sandbox to observe the new
 // generation and is bounded by handOffTimeout instead.
 func refreshJiraProvider(ctx context.Context, h jiraProviderHandle, budget time.Duration, printer *ui.Printer) (time.Time, error) {
+	tok, err := refreshJiraProviderToken(ctx, h, budget, printer)
+	return tok.ExpiresAt, err
+}
+
+// refreshJiraProviderToken is refreshJiraProvider returning the new token's
+// iat and expiry (never its value).
+func refreshJiraProviderToken(ctx context.Context, h jiraProviderHandle, budget time.Duration, printer *ui.Printer) (jiraProviderToken, error) {
 	updateCtx, cancelUpdate := context.WithTimeout(ctx, budget)
 	defer cancelUpdate()
-	tok, err := jiraMintFn(updateCtx, h.creds)
+	tok, err := h.mintToken(updateCtx)
 	if err != nil {
-		return time.Time{}, err
+		return jiraProviderToken{}, err
 	}
 	if err := registerJiraToken(tok.Value, h.maskActions); err != nil {
-		return time.Time{}, err
+		return jiraProviderToken{}, err
 	}
+	stamp := jiraProviderToken{IssuedAt: tok.IssuedAt, ExpiresAt: tok.ExpiresAt}
 	// The lock keeps the first seed out from between the readiness check
 	// and the update.
 	h.state.rotateMu.Lock()
@@ -621,19 +708,19 @@ func refreshJiraProvider(ctx context.Context, h jiraProviderHandle, budget time.
 		// hands out before this update.
 		p, err := jiraBaselineFn(updateCtx, h.sandbox, jiraCredentialKey)
 		if err != nil {
-			return time.Time{}, fmt.Errorf("reading the Jira placeholder the sandbox holds before rotating: %w", err)
+			return jiraProviderToken{}, fmt.Errorf("reading the Jira placeholder the sandbox holds before rotating: %w", err)
 		}
 		baseline = p
 	}
 	// One update carries the value and its expiry, so the new token never
 	// sits behind the old expiry between two calls.
 	if err := updateJiraProviderFn(updateCtx, h.name, map[string]string{jiraCredentialKey: tok.Value}, tok.ExpiresAt); err != nil {
-		return time.Time{}, err
+		return jiraProviderToken{}, err
 	}
 	if !reseed {
 		// The agent has not started: the token file is seeded at sandbox
 		// start from whatever placeholder the sandbox carries then.
-		return tok.ExpiresAt, nil
+		return stamp, nil
 	}
 	settleCtx, cancelSettle := context.WithTimeout(ctx, handOffTimeout())
 	defer cancelSettle()
@@ -648,10 +735,10 @@ func refreshJiraProvider(ctx context.Context, h jiraProviderHandle, budget time.
 		err = errors.New("the sandbox handed out the generation the token file already names")
 	}
 	if err != nil {
-		return time.Time{}, fmt.Errorf("the provider holds the new token but the sandbox's Jira token file was not re-seeded: %w", err)
+		return jiraProviderToken{}, fmt.Errorf("the provider holds the new token but the sandbox's Jira token file was not re-seeded: %w", err)
 	}
 	h.state.set(seeded)
-	return tok.ExpiresAt, nil
+	return stamp, nil
 }
 
 // failJiraClosed stops the Jira refresher. The provider's expiry moves
@@ -677,26 +764,29 @@ func failJiraClosed(h jiraProviderHandle, heldExpiresAt time.Time, cause error, 
 // failJiraClosed. Otherwise it runs until ctx is cancelled.
 func runJiraRefresh(ctx context.Context, h jiraProviderHandle, printer *ui.Printer) {
 	expiresAt := h.expiresAt.Round(0)
+	issuedAt := h.issuedAt.Round(0)
+	retries, backoff := openAIRefreshRetries, openAIRefreshBackoff
+	if h.audience != "" {
+		// A forge OIDC token is short-lived: the inference gateway
+		// route's retry budget, sized for its lifetime.
+		retries, backoff = gatewayRefreshRetries+1, gatewayRefreshBackoff
+	}
 	for {
-		jitter := time.Duration(0)
-		if openAIRefreshJitter > 0 {
-			jitter = time.Duration(randutil.Int64N(int64(openAIRefreshJitter)))
-		}
 		now := wallNowFn()
-		delay := openAIRefreshDelay(expiresAt, now, jitter)
+		delay := jiraRefreshDelay(h, issuedAt, expiresAt, now, printer)
 		if !waitWallClock(ctx, delay, now.Add(delay)) {
 			return
 		}
-		var next time.Time
+		var next jiraProviderToken
 		failedRounds := 0
 		for {
 			var err error
-			for attempt := 0; attempt < openAIRefreshRetries; attempt++ {
+			for attempt := 0; attempt < retries; attempt++ {
 				if attempt > 0 {
 					select {
 					case <-ctx.Done():
 						return
-					case <-time.After(openAIRefreshBackoff):
+					case <-time.After(backoff):
 					}
 				}
 				// See runOpenAIRefresh: the unrecorded set cannot be
@@ -709,7 +799,7 @@ func runJiraRefresh(ctx context.Context, h jiraProviderHandle, printer *ui.Print
 				if budget < time.Minute {
 					budget = time.Minute
 				}
-				next, err = refreshJiraProvider(ctx, h, budget, printer)
+				next, err = refreshJiraProviderToken(ctx, h, budget, printer)
 				if err == nil {
 					break
 				}
@@ -717,7 +807,7 @@ func runJiraRefresh(ctx context.Context, h jiraProviderHandle, printer *ui.Print
 					return
 				}
 				var notObserved *generationNotObservedError
-				if errors.As(err, &notObserved) || errors.Is(err, errJiraUnredactable) || errors.Is(err, errJiraUnsafeToken) {
+				if errors.As(err, &notObserved) || errors.Is(err, errJiraUnredactable) || errors.Is(err, errJiraUnsafeToken) || errors.Is(err, jira.ErrOIDCEndpointMissing) || errors.Is(err, errJiraOIDCNotJWT) {
 					failJiraClosed(h, expiresAt, err, printer)
 					return
 				}
@@ -726,7 +816,7 @@ func runJiraRefresh(ctx context.Context, h jiraProviderHandle, printer *ui.Print
 					failJiraClosed(h, expiresAt, fmt.Errorf("%s: %w", jiraRejectedCause(err), err), printer)
 					return
 				}
-				printer.StepWarn(fmt.Sprintf("Jira access token refresh attempt %d/%d failed: %v", attempt+1, openAIRefreshRetries, err))
+				printer.StepWarn(fmt.Sprintf("Jira access token refresh attempt %d/%d failed: %v", attempt+1, retries, err))
 			}
 			if err == nil {
 				break
@@ -734,13 +824,13 @@ func runJiraRefresh(ctx context.Context, h jiraProviderHandle, printer *ui.Print
 			failedRounds++
 			now := wallNowFn()
 			wait := openAIRefreshRoundWait(failedRounds, expiresAt, now)
-			printer.StepWarn(fmt.Sprintf("Jira access token refresh for %s failed %d attempts; retrying in %s (the token the agent holds expires %s)", h.name, openAIRefreshRetries, wait, expiresAt.UTC().Format(time.RFC3339)))
+			printer.StepWarn(fmt.Sprintf("Jira access token refresh for %s failed %d attempts; retrying in %s (the token the agent holds expires %s)", h.name, retries, wait, expiresAt.UTC().Format(time.RFC3339)))
 			if !waitWallClock(ctx, wait, now.Add(wait)) {
 				return
 			}
 		}
-		expiresAt = next.Round(0)
-		printer.StepDone(fmt.Sprintf("Jira access token refreshed for %s (next expiry in %s)", h.name, expiresAt.Sub(wallNowFn()).Round(time.Minute)))
+		expiresAt, issuedAt = next.ExpiresAt.Round(0), next.IssuedAt.Round(0)
+		printer.StepDone(fmt.Sprintf("Jira access token refreshed for %s (next expiry in %s)", h.name, expiresAt.Sub(wallNowFn()).Round(time.Second)))
 	}
 }
 
@@ -764,9 +854,10 @@ func startJiraRefreshers(handles []jiraProviderHandle, printer *ui.Printer) []fu
 	return stops
 }
 
-// checkJiraEgressInspected fails when the sandbox policy admits the
-// Atlassian API gateway over a route the proxy cannot inspect: OpenShell
-// would not inject the minted token there.
-func checkJiraEgressInspected(ctx context.Context, sandboxName string) error {
-	return checkEgressInspected(ctx, sandboxName, jiraAPIHost, "Jira", "Make that endpoint `protocol: rest`, as the fullsend-jira profile does")
+// checkJiraEgressInspected fails when the sandbox policy admits host, the
+// Atlassian API gateway or the self-hosted gateway of tracker.jira.auth:
+// oidc, over a route the proxy cannot inspect: OpenShell would not inject
+// the provider's token there.
+func checkJiraEgressInspected(ctx context.Context, sandboxName, host string) error {
+	return checkEgressInspected(ctx, sandboxName, host, "Jira", "Make that endpoint `protocol: rest`, as the fullsend-jira profile does")
 }
