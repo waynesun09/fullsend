@@ -1286,6 +1286,19 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		printer.StepFail("Runner secret validation failed")
 		return err
 	}
+	// The Jira stage comment (FULLSEND_JIRA_STAGE_RESULT) captures its
+	// client, work item and the forge URL of the repository, and creates
+	// its empty result file, now, before any script runs; the post-script
+	// launch reads none of them from config again.
+	jiraStageState, removeJiraStageResult, stageErr := armJiraStage(h, sOpts, issueTracking, forgePlatform, func() bool {
+		keep, keepErr := resolveKeepHistory(nil, absFullsendDir, nil)
+		return keepErr != nil || keep
+	}, os.Getenv, jiraStageResultRoots(h, outputBase))
+	if stageErr != nil {
+		printer.StepFail("Jira stage comment cannot start")
+		return stageErr
+	}
+	defer removeJiraStageResult()
 	// Sandbox-bound sites expand sandboxDeniedKeys empty instead of failing,
 	// so validation must resolve them there whether or not the host variable
 	// is set (the action unsets FULLSEND_JIRA_TOKEN on non-Jira runs).
@@ -2517,6 +2530,10 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 			if gate.agentExitCode != 0 {
 				postCmd.Env = append(postCmd.Env, fmt.Sprintf("FULLSEND_AGENT_EXIT_CODE=%d", gate.agentExitCode))
 			}
+			// The Jira stage comment: the post-script gets the result file
+			// created at start; core reads and posts it once the script
+			// exits, also after a failed post-script.
+			postJiraStage := jiraStageState.attach(postCmd, printer)
 			postCmd.Stdout = os.Stdout
 			postCmd.Stderr = os.Stderr
 			if err := postCmd.Run(); err != nil {
@@ -2526,6 +2543,14 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 				}
 			} else {
 				printer.StepDone(fmt.Sprintf("Post-script completed (%.1fs)", time.Since(postStart).Seconds()))
+			}
+			if jiraStageState != nil {
+				if err := postJiraStage(context.Background()); err != nil {
+					printer.StepFail("Jira stage comment failed: " + err.Error())
+					if runErr == nil {
+						runErr = fmt.Errorf("Jira stage comment: %w", err)
+					}
+				}
 			}
 		}()
 	}
@@ -3730,6 +3755,7 @@ var inheritedScriptDenyKeys = map[string]bool{
 	jira.EmailEnvVar:        true,
 	jira.ClientIDEnvVar:     true,
 	jira.ClientSecretEnvVar: true,
+	jiraStageResultEnv:      true,
 }
 
 // optionalHarnessEnvKeys are host variables a harness ${VAR} reference may
@@ -3746,6 +3772,7 @@ var optionalHarnessEnvKeys = map[string]bool{
 	jira.EmailEnvVar:        true,
 	jira.ClientIDEnvVar:     true,
 	jira.ClientSecretEnvVar: true,
+	jiraStageResultEnv:      true,
 }
 
 // isOptionalHarnessEnvKey reports whether a harness ${VAR} reference to key
@@ -3834,6 +3861,7 @@ var sandboxDeniedKeys = map[string]bool{
 	jira.EmailEnvVar:        true,
 	jira.ClientIDEnvVar:     true,
 	jira.ClientSecretEnvVar: true,
+	jiraStageResultEnv:      true,
 }
 
 // providerCredentialJiraKeys are the sandboxDeniedKeys that provider

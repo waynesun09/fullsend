@@ -493,6 +493,31 @@ Reference these variables only in a harness overlay that applies to Jira runs (`
 
 For sandboxed use, the network profile must allow the gateway host. The built-in agents' `jira-ro` provider profile allows `api.atlassian.com`. The legacy `atlassian-cloud` profile below allows only `*.atlassian.net`, so it serves bot-user calls to the site URL only.
 
+### Code stage comment posted by fullsend
+
+A post-script can let `fullsend run` post the code stage comment on the
+Jira work item. The harness opts in with
+`FULLSEND_JIRA_STAGE_RESULT: "${FULLSEND_JIRA_STAGE_RESULT}"` in `env.runner`.
+On a Jira-sourced run, the post-script then finds an empty file at that path
+and writes one line to it:
+
+```json
+{"verb":"opened","url":"https://github.com/acme/widgets/pull/7"}
+```
+
+`verb` is `opened` or `pushed` (new commits pushed to an existing pull or
+merge request). After the post-script exits, even when it failed,
+`fullsend run` checks that the URL is a pull request (GitHub) or merge
+request (GitLab) of this run's own repository: under `CI_PROJECT_URL` on
+GitLab, or under `GITHUB_SERVER_URL` and `GITHUB_REPOSITORY` on GitHub,
+including host and port. It then posts the stage comment with marker
+`<!-- fullsend:code-agent -->`, using the Jira client it built before any
+script ran. An empty file posts nothing. Any other content, or a failed
+post, fails the step. When the harness opts in on a Jira-sourced run and
+the Jira client or the repository URL is not available, `fullsend run`
+fails at start. Only the exact key `FULLSEND_JIRA_STAGE_RESULT` opts in.
+Without the opt-in, nothing changes.
+
 ### Where built-in agent results appear
 
 Starting with the agents release that follows v0.52.0
