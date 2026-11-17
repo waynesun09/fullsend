@@ -1819,6 +1819,14 @@ jobs:
         with:
           source_repo: ${{ github.repository }}
 
+      # TEST ONLY (nonflux/tmp-fork-pr-poll, never upstream): hold the review
+      # job so the next poll cycle sees it running.
+      - name: TEST ONLY hold review job
+        if: vars.FULLSEND_TEST_REVIEW_HOLD_SECONDS != ''
+        env:
+          HOLD: ${{ vars.FULLSEND_TEST_REVIEW_HOLD_SECONDS }}
+        run: sleep "${HOLD}"
+
       - name: Mint review token
         id: app-token
         uses: ./.defaults/.github/actions/mint-token
