@@ -48,13 +48,14 @@ jobs:
   behaviour-emulator:
     name: behaviour-emulator (${{ matrix.shard }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
         # A dispatch with explicit features runs them as one "custom" shard.
         # Probe: a dispatch with features runs them at 6 and at 2 workers side by side.
-        shard: ${{ fromJSON(inputs.features && '["w6","w2"]' || '["a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p"]') }}
+        # features=all runs every shard's features in ONE job, at 6 and at 3 workers.
+        shard: ${{ fromJSON(inputs.features == 'all' && '["one6","one3"]' || inputs.features && '["w6","w2"]' || '["a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p"]') }}
     steps:
       - name: Checkout fullsend
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -99,21 +100,28 @@ jobs:
           SHARD: ${{ matrix.shard }}
           INPUT_WORKERS: ${{ inputs.workers }}
           INPUT_RUNNERS: ${{ inputs.runners }}
-          SUITE_TIMEOUT: 30m
+          SUITE_TIMEOUT: 130m
+          # Probe: log every emulator writer-lock hold of 50 ms or more.
+          GITHUB_EMULATOR_SQLITE_SLOW_WRITE_LOG_MS: "50"
           BEHAVIOUR_CAPABILITIES: ${{ env.DEFAULT_CAPABILITIES }}
           # The run falls back to fullsend-ai/agents@main on the configured forge.
           AGENTS_SEED: "1"
         run: |
           # A shard line is: <shard> <workers> <runners> <feature[:line]>...
           WORKERS=$DEFAULT_WORKERS EMULATOR_RUNNERS=$DEFAULT_RUNNERS
-          if [ -z "$FEATURES" ]; then
+          if [ "$FEATURES" = all ]; then
+            FEATURES=$(awk '!/^#/ && NF > 3 { for (i = 4; i <= NF; i++) printf "%s ", $i }' e2e/behaviour/emulator/shards.txt)
+          elif [ -z "$FEATURES" ]; then
             read -r _ WORKERS EMULATOR_RUNNERS FEATURES < <(awk -v s="$SHARD" '$1 == s' e2e/behaviour/emulator/shards.txt) || true
           fi
           WORKERS=${INPUT_WORKERS:-$WORKERS} EMULATOR_RUNNERS=${INPUT_RUNNERS:-$EMULATOR_RUNNERS}
           case "$SHARD" in
             w6) WORKERS=6 EMULATOR_RUNNERS=12 ;;
             w2) WORKERS=2 EMULATOR_RUNNERS=4 ;;
+            one6) WORKERS=6 EMULATOR_RUNNERS=12 EMULATOR_PROFILE=1 ;;
+            one3) WORKERS=3 EMULATOR_RUNNERS=6 ;;
           esac
+          export EMULATOR_PROFILE
           export EMULATOR_RUNNERS
           [ -n "$FEATURES" ] || { echo "::error::no features for shard $SHARD"; exit 1; }
           read -ra feats <<<"$FEATURES"

@@ -94,6 +94,10 @@ stop_all() {
     sudo accton off >/dev/null 2>&1 || true
     # shellcheck disable=SC2024 # the log is the runner user's, not root's
     sudo sa -a -c /var/log/account/pacct >"$STATE/sa-commands.log" 2>&1 || true
+    # One line per process with its pid and parent pid, to tell which
+    # commands start the git processes.
+    # shellcheck disable=SC2024 # the log is the runner user's, not root's
+    sudo dump-acct /var/log/account/pacct >"$STATE/acct-dump.log" 2>&1 || true
   fi
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     { echo "| phase | seconds |"; echo "|---|---|"; awk -F'\t' '{print "| " $1 " | " $2 " |"}' "$PHASES"; } >>"$GITHUB_STEP_SUMMARY"
