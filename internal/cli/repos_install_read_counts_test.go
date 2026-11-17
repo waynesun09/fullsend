@@ -103,7 +103,9 @@ github:
 // FULLSEND_MINT_URL 3 → 2, FULLSEND_APP_SET 4 → 3. The remaining reads of
 // each key are convergence's own, made after the manifest write. Since
 // #9109 convergence also reads the managed Jira poll caller once, to keep
-// it absent while Jira polling is disabled (27 and 26).
+// it absent while Jira polling is disabled (27 and 26), and since #9623 the
+// managed fork PR review poll caller once, to keep it absent while the poll
+// is disabled (28 and 27).
 func TestRunReposInstall_PreflightReadsOnceConvergenceRechecks(t *testing.T) {
 	overlayKey := "file:acme/api/" + preset.OverlayPath
 	baseKey := "file:acme/api/" + preset.BasePath
@@ -120,10 +122,10 @@ func TestRunReposInstall_PreflightReadsOnceConvergenceRechecks(t *testing.T) {
 		writeback bool
 		total     int
 	}{
-		{name: "pristine no-preset install", manifest: githubUnmanagedManifestYAML, writeback: true, total: 27},
-		{name: "pristine no-preset dry run", manifest: githubUnmanagedManifestYAML, dryRun: true, writeback: true, total: 26},
-		{name: "behaviour-test manifest", manifest: behaviourTestManifestYAML, total: 27},
-		{name: "behaviour-test manifest dry run", manifest: behaviourTestManifestYAML, dryRun: true, total: 26},
+		{name: "pristine no-preset install", manifest: githubUnmanagedManifestYAML, writeback: true, total: 28},
+		{name: "pristine no-preset dry run", manifest: githubUnmanagedManifestYAML, dryRun: true, writeback: true, total: 27},
+		{name: "behaviour-test manifest", manifest: behaviourTestManifestYAML, total: 28},
+		{name: "behaviour-test manifest dry run", manifest: behaviourTestManifestYAML, dryRun: true, total: 27},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -1033,6 +1033,11 @@ type perRepoConfig struct {
 	// Go forbids a field and method sharing a name on the same type.
 	TraceContextBlock *TraceContextConfig `yaml:"trace_context,omitempty"`
 
+	// ForkPRReviewPollBlock is the fork_pr_review_poll block (ADR 0171).
+	// It backs the ForkPRReviewPoll() accessor, which merges it key by
+	// key over the parent chain.
+	ForkPRReviewPollBlock *ForkPRReviewPollConfig `yaml:"fork_pr_review_poll,omitempty"`
+
 	// parent is the next layer in the fallback chain. Getters consult
 	// parent when the local field is unset. Excluded from YAML
 	// serialization so Marshal emits only locally-set values.
@@ -1168,6 +1173,7 @@ type perRepoConfigMarshal struct {
 	Models                 *ModelsConfig             `yaml:"models,omitempty"`
 	Artifacts              *ArtifactsConfig          `yaml:"artifacts,omitempty"`
 	TraceContext           *TraceContextConfig       `yaml:"trace_context,omitempty"`
+	ForkPRReviewPoll       *ForkPRReviewPollConfig   `yaml:"fork_pr_review_poll,omitempty"`
 }
 
 // MarshalYAML implements yaml.Marshaler to preserve the nil-vs-empty
@@ -1188,6 +1194,7 @@ func (c *perRepoConfig) MarshalYAML() (interface{}, error) {
 		StatusNotifications: c.Notifications,
 		MintURL:             c.MintURL,
 		TraceContext:        c.TraceContextBlock,
+		ForkPRReviewPoll:    c.ForkPRReviewPollBlock,
 	}
 	// Only emit inference block when at least one field is set locally.
 	if c.Inference != nil && *c.Inference != (PerRepoInferenceConfig{}) {
@@ -1339,6 +1346,9 @@ func (c *perRepoConfig) validateLocalFields() error {
 		return err
 	}
 	if err := ValidateTraceContext(c.TraceContextBlock); err != nil {
+		return err
+	}
+	if err := ValidateForkPRReviewPoll(c.ForkPRReviewPollBlock); err != nil {
 		return err
 	}
 	// Validate the merged view, as ValidateAgentEntries does above: a bad
