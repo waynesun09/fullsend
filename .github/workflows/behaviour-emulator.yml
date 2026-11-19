@@ -40,9 +40,9 @@ env:
   # For a dispatch with explicit features; shards set their own in shards.txt.
   DEFAULT_WORKERS: "2"
   DEFAULT_RUNNERS: "4"
-  # waynesun09/github-emulator ci-self-contained (integration head with the mint App seed).
+  # waynesun09/github-emulator emu-combined-validation: upstream main, the 13 open PRs and the CI packaging.
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: d1d00d2db5bd079f2e33be63fc9d4b36ce9f088c
+  EMULATOR_REF: e1c9bea373d3a5aa41d2d15f31f7d4485b8fc993
 
 jobs:
   behaviour-emulator:
