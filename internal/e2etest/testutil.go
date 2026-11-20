@@ -465,7 +465,22 @@ func LoadEnvConfig(t *testing.T) EnvConfig {
 func loadEnvConfig(t *testing.T) envConfig {
 	t.Helper()
 
-	if !runningInGitHubActions() {
+	useMint := runningInGitHubActions()
+	if GitHubEmulatorMode() {
+		// The emulator is the forge: point this process and the CLI at
+		// it, and use the token in GH_TOKEN even on an Actions runner,
+		// where the mint's e2e role would answer for github.com orgs.
+		if _, err := ConfigureGitHubEmulatorForge(); err != nil {
+			t.Fatalf("emulator forge: %v", err)
+		}
+		useMint = false
+		// GH_TOKEN only: the GITHUB_TOKEN and `gh auth token` fallbacks
+		// hold github.com credentials, which must not go to the emulator.
+		if strings.TrimSpace(os.Getenv("GH_TOKEN")) == "" {
+			t.Fatalf("ENVIRONMENT=%s needs the emulator token in GH_TOKEN", GitHubEmulatorEnvironment)
+		}
+	}
+	if !useMint {
 		if _, err := resolveLocalToken(); err != nil {
 			t.Skip("no local GitHub token (gh auth login), skipping e2e test")
 		}
@@ -502,16 +517,29 @@ func loadEnvConfigWithoutToken(t *testing.T) envConfig {
 	}
 }
 
-// newLiveClient creates a GitHub API client from the token.
+// newLiveClient creates a GitHub API client from the token, addressed to
+// githubAPIBaseURL.
 func newLiveClient(token string) *gh.LiveClient {
-	return gh.New(token)
+	return gh.New(token).WithBaseURL(githubAPIBaseURL())
+}
+
+// githubAPIBaseURL is the GitHub REST API root the harness talks to:
+// GITHUB_API_URL when it is set, as it is on every Actions runner and on
+// an enterprise server or emulator, and api.github.com otherwise. The CLI
+// under test resolves its forge the same way, so the harness and the
+// install it drives address one forge.
+func githubAPIBaseURL() string {
+	if base := strings.TrimRight(strings.TrimSpace(os.Getenv("GITHUB_API_URL")), "/"); base != "" {
+		return base
+	}
+	return "https://api.github.com"
 }
 
 // getRepoCreatedAt fetches a repo's created_at timestamp directly from the
 // GitHub REST API. This is intentionally NOT added to forge.Client since it's
 // only needed for e2e lock management.
 func getRepoCreatedAt(ctx context.Context, token, org, repo string) (time.Time, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/%s", org, repo)
+	url := githubAPIBaseURL() + fmt.Sprintf("/repos/%s/%s", org, repo)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("creating request: %w", err)
