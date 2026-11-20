@@ -566,13 +566,16 @@ The script does these steps:
    creates the human-like test actors and their tokens.
 7. It builds a supervisor image that trusts the run's CA
    (`supervisor-ca-image.sh`) and samples VM load (`sample-vm.sh`).
-8. It runs the given features, or the playback suite when
-   `BT_SUITE=playback`.
+8. It runs the given features, the playback suite when `BT_SUITE=playback`,
+   or the agents repository's suite when `BT_SUITE=agents`. For the agents
+   suite, `AGENTS_DIR` is an agents checkout: its HEAD is pushed as
+   `fullsend-ai/agents`, and its `make behaviour-test` runs against this
+   checkout.
 
 The script header lists every setting. The main ones are `EMULATOR_DIR` and
 `EMULATOR_PY` (required), `STATE_DIR` (logs; default
 `$RUNNER_TEMP/bt-github-emulator`, or `/tmp/bt-github-emulator`), `BT_SUITE`,
-`AGENTS_SEED`, `AGENTS_REF`, `AGENTS_PRS` and `BEHAVIOUR_CAPABILITIES`. When
+`AGENTS_DIR`, `AGENTS_SEED`, `AGENTS_REF`, `AGENTS_PRS` and `BEHAVIOUR_CAPABILITIES`. When
 the run passes, the suite's summary line shows the passed scenarios. The
 state directory holds the logs, `phases.tsv` (time per phase) and the
 suite's artifacts.
