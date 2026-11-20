@@ -40,9 +40,9 @@ env:
   # For a dispatch with explicit features; shards set their own in shards.txt.
   DEFAULT_WORKERS: "2"
   DEFAULT_RUNNERS: "4"
-  # waynesun09/github-emulator emu-release-candidate: upstream main plus the CI packaging pull request with its review fixes.
-  EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: 6d41134e57cf9c8162c0d8ee826891ad41da181c
+  # fullsend-ai/github-emulator main 98fe4f2: release candidate (#33, #79, #83 merged).
+  EMULATOR_REPO: fullsend-ai/github-emulator
+  EMULATOR_REF: 98fe4f2ed2fa88163e07c439eb4ed0f507bff623
 
 jobs:
   behaviour-emulator:
