@@ -46,8 +46,8 @@ env:
   # A github-emulator release: its scripts/ci-stack.sh and
   # scripts/ci-seed-mint-apps.py run the stack, so a bump changes what
   # every scenario runs against. Bump on purpose, like an action pin.
-  EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: b516e60e01721ebf49584cff1d512eae674abec6 # emu-pull-request-event prototype (fork-only validation)
+  EMULATOR_REPO: fullsend-ai/github-emulator
+  EMULATOR_REF: 182e5b33408da3bc43c302eb6e09e0f38b0cf604 # PR #92 head (fork-only validation)
 
 jobs:
   behaviour-github-emulator:
