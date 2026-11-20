@@ -202,11 +202,13 @@ Prefer short-lived narrowly-scoped credentials whenever possible. When long-live
 
 ### Gate job mitigation
 
-The `check-e2e-authorization` gate job (`gate` in `e2e.yml`) mitigates the risk by requiring authorization before the behaviour, playback, and forgejo-behaviour jobs check out PR-head code. `e2e.yml` and `e2e-ok-to-test.yml` no longer use `pull_request_target` ([#9245](https://github.com/fullsend-ai/fullsend/issues/9245)): same-repository PRs run on `pull_request`, and fork PRs run only after a `/ok-to-test <sha>` comment (`issue_comment`):
+Pull requests run the behaviour and playback scenarios on a GitHub emulator (`behaviour-github-emulator.yml`): no secrets, no environment and no cloud OIDC, so fork pull requests run them on `pull_request` with no authorization step. With secrets, `e2e.yml` runs the `behaviour` and `playback` suites only in the merge queue and on push to `main`; on a pull request those jobs skip.
+
+The `check-e2e-authorization` gate job (`gate` in `e2e.yml`) mitigates the risk by requiring authorization before the forgejo-behaviour job checks out PR-head code. `e2e.yml` and `e2e-ok-to-test.yml` no longer use `pull_request_target` ([#9245](https://github.com/fullsend-ai/fullsend/issues/9245)): same-repository PRs run on `pull_request`, and fork PRs run only after a `/ok-to-test <sha>` comment (`issue_comment`):
 
 - **Same-repository PRs** — the gate authorizes authors with write access (collaborator permission API) and trusted bots. Fork `pull_request` runs get no secrets, so the suites skip them.
 - **Fork PRs** — require a user with write access (Write role or above) to review the PR diff and comment `/ok-to-test <sha>`, naming the reviewed commit, including when the fork author has write access. The gate reads the comment from the API, checks the commenter's permission, and authorizes the PR head only when it is the named sha. Another head is refused (`stale_ok_to_test`), and a comment with no sha is refused (`missing_sha`). The gate uses no timing. The `ok-to-test` label no longer starts e2e.
-- **Separation of concerns** — the gate (authorize/report) job runs on the base-branch checkout and is the only job with `pull-requests: write` and `checks: write`; it reports the `behaviour`, `playback`, and `forgejo-behaviour` check runs on the authorized sha. The behaviour/playback jobs run on the PR-head checkout with `contents: read` and `id-token: write` only. The `forgejo-behaviour` job runs on the PR-head checkout with `contents: read` only.
+- **Separation of concerns** — the gate (authorize/report) job runs on the base-branch checkout and is the only job with `pull-requests: write` and `checks: write`; it reports the `forgejo-behaviour` check run on the authorized sha. The `forgejo-behaviour` job runs on the PR-head checkout with `contents: read` only.
 
 **Limitations of the gate:**
 
