@@ -40,9 +40,9 @@ env:
   # For a dispatch with explicit features; shards set their own in shards.txt.
   DEFAULT_WORKERS: "2"
   DEFAULT_RUNNERS: "4"
-  # waynesun09/github-emulator emu-combined-validation: upstream main, the 13 open PRs and the CI packaging.
+  # waynesun09/github-emulator emu-release-candidate: upstream main plus the CI packaging pull request with its review fixes.
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: e1c9bea373d3a5aa41d2d15f31f7d4485b8fc993
+  EMULATOR_REF: 6d41134e57cf9c8162c0d8ee826891ad41da181c
 
 jobs:
   behaviour-emulator:
