@@ -52,7 +52,7 @@ env:
 jobs:
   behaviour-github-emulator:
     name: behaviour-github-emulator (${{ matrix.shard }})
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 40
     strategy:
       fail-fast: false
@@ -140,7 +140,7 @@ jobs:
   behaviour-github-emulator-playback:
     name: behaviour-github-emulator (playback)
     if: ${{ !inputs.features }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
       - name: Checkout fullsend
@@ -212,7 +212,7 @@ jobs:
   behaviour-github-emulator-agents:
     name: behaviour-github-emulator (agents)
     if: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && !inputs.features) }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
       - name: Checkout fullsend
@@ -294,7 +294,7 @@ jobs:
     name: behaviour-github-emulator
     if: ${{ always() }}
     needs: [behaviour-github-emulator, behaviour-github-emulator-playback]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: All shards passed
