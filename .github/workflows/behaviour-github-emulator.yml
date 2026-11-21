@@ -41,6 +41,7 @@ env:
   # fetch-allowlist-gate: the job runs this checkout's fullsend, which has the gate.
   DEFAULT_CAPABILITIES: runner-secret-overlay-guard,applier-branch-namespace,fetch-allowlist-gate
   # For a dispatch with explicit features; shards set their own in shards.txt.
+  START_TIMING_DEFER: "1"
   DEFAULT_WORKERS: "2"
   DEFAULT_RUNNERS: "4"
   # A github-emulator release: its scripts/ci-stack.sh and
