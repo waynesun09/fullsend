@@ -213,6 +213,7 @@ sudo sysctl -qw net.ipv4.ip_unprivileged_port_start=80
 (
   cd "$EMULATOR_DIR"
   CI_STACK_DIR="$STATE/stack" CI_STACK_PYTHON="$EMULATOR_PY" \
+  CI_STACK_RUNNER_LABELS=self-hosted,linux,ubuntu-latest,ubuntu-24.04,ubuntu-26.04 \
   CI_STACK_RUNNER_KIND=upstream CI_STACK_RUNNERS="${EMULATOR_RUNNERS:-2}" \
   CI_STACK_TLS=1 CI_STACK_HOST="$EMU_HOST" CI_STACK_PORT=443 CI_STACK_SYSTEM_TRUST=1 \
   CI_STACK_LOCALHOST_DNS=1 CI_STACK_BIND=0.0.0.0 \
