@@ -117,6 +117,7 @@ build_mint() {
     -o "$STATE/mint" .)
 }
 (
+  [ "${START_TIMING_DEFER:-0}" = 1 ] && while [ ! -e "$STATE/stack-up" ]; do sleep 1; done
   build_mint
   cd "$ROOT" && go test -c -tags "$BUILD_TAG" -o "$STATE/suite-warm.test" ./e2e/behaviour/ && rm -f "$STATE/suite-warm.test"
 ) >"$STATE/go-warm.log" 2>&1 &
@@ -183,7 +184,7 @@ if [ "$AGENTS_SEED" = 1 ]; then
   # pays the pull. The suite waits for it below.
   mapfile -t sandbox_images < <(git -C "$agents" grep -hoE 'image: *[^ ]+@sha256:[0-9a-f]+' HEAD -- harness | sed 's/image: *//' | sort -u)
   if [ "${#sandbox_images[@]}" -gt 0 ]; then
-    ( for img in "${sandbox_images[@]}"; do podman pull -q "$img" >/dev/null; done ) >"$STATE/prepull.log" 2>&1 &
+    ( if [ "${START_TIMING_DEFER:-0}" = 1 ]; then while [ ! -e "$STATE/stack-up" ]; do sleep 1; done; fi; for img in "${sandbox_images[@]}"; do podman pull -q "$img" >/dev/null; done ) >"$STATE/prepull.log" 2>&1 &
     prepull_pid=$!
   fi
   # The emulator's runners share this VM's $HOME, and the agents' post
@@ -209,6 +210,8 @@ if [ -n "${runner_prefetch_pid:-}" ]; then
 fi
 
 # 1. Emulator + one real actions/runner over TLS on ghemu.localhost:443.
+vmstat -t 1 >"$STATE/vmstat-stack.log" 2>&1 &
+vmstat_pid=$!
 sudo sysctl -qw net.ipv4.ip_unprivileged_port_start=80
 (
   cd "$EMULATOR_DIR"
@@ -225,6 +228,8 @@ sudo sysctl -qw net.ipv4.ip_unprivileged_port_start=80
 )
 export SSL_CERT_FILE="$STATE/stack/tls/bundle.pem" GIT_SSL_CAINFO="$STATE/stack/tls/bundle.pem"
 export CURL_CA_BUNDLE="$STATE/stack/tls/ca.pem" NODE_EXTRA_CA_CERTS="$STATE/stack/tls/ca.pem"
+kill "$vmstat_pid" 2>/dev/null || true
+touch "$STATE/stack-up"
 phase stack
 
 # OpenShell's egress proxy (in the sandbox supervisor) checks upstream TLS
