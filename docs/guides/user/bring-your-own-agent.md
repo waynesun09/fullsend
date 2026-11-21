@@ -60,6 +60,11 @@ Next:
    ```
 
    This runs the real sandbox and prints the comment instead of posting it.
+   The generated post-script also treats `FULLSEND_DRY_RUN=1` as a dry run
+   when `POST_LINT_DOCS_DRY_RUN` is unset or empty. `fullsend run` sets
+   `FULLSEND_DRY_RUN=1` when the input source is `external`, from `input_source: external` in the
+   harness or `FULLSEND_INPUT_SOURCE=external` in the environment (see
+   [Harness Field Reference § `input_source`](../../reference/harness-reference.md#field-details)).
    A run that finds nothing to report ends like this:
 
    ```text
@@ -233,6 +238,7 @@ you would add or change it by hand.
 | `config.yaml` `agents:` entry | `name:`, `source:` | always, unless `--no-register` | `<name>` / `harness/<name>.yaml` | — |
 | `config.yaml` `agents:` entry | `runtime:` | only when a runtime is given | `--runtime` / spec `runtime` | — |
 | `config.yaml` `agents:` entry | `model:`, `effort:`, `subagents:` | never — `agent set` writes these, not `agent new` | `fullsend agent set` | per-agent tuning after generation |
+| `config.yaml` `agents:` entry | `harness:` | never | edit `config.yaml` | changes harness fields without a `base:` harness ([ADR 0162](../../ADRs/0162-agent-entries-may-carry-harness-overrides.md)) |
 
 ## Troubleshooting
 
@@ -257,6 +263,7 @@ in the code block below the table, not in a cell.
 | The same error on your machine, with bare names and no `fullsend-github*` profile left | The OpenShell gateway still holds an older profile with that id; `fullsend run` cannot replace a profile while a provider uses it | Delete and re-create the providers — see the command below |
 | `provider profile 'fullsend-github-ro' requires static credentials: GH_TOKEN` at `fullsend run` | `GH_TOKEN` is unset or empty on the machine running `fullsend run` | Put a real token in your env file, e.g. `echo "GH_TOKEN=$(gh auth token)" >> .env.local` |
 | `Vertex inference requires GOOGLE_APPLICATION_CREDENTIALS to point to an existing file` (or `a regular/non-empty file`) | The variable is unset or points at a missing path, directory, or empty file | Point it at a real file — [Get GCP credentials](running-agents-locally.md#get-google-cloud-platform-credentials) |
+| `Host file credential validation failed`, then `<N> durable credential host file(s) without allow_durable` | A `host_files` source is a long-lived credential, such as a service account key | Prefer short-lived Workload Identity Federation credentials — see [How Fullsend Authenticates](how-fullsend-authenticates.md). To keep the key, add `allow_durable: true` to that entry; see [`host_files[].allow_durable`](../../reference/harness-reference.md) |
 | `reading behaviour script .../behaviour/current-scenario.yaml: ... no such file or directory` | `--runtime dummy` with no scripted result | Write `.fullsend/behaviour/current-scenario.yaml` — see [Testing locally](#testing-locally) |
 | `sub-agent model resolves to Vertex, but GOOGLE_APPLICATION_CREDENTIALS is not set` at `fullsend run`, or `provider "anthropic-vertex" is not available in this run (Vertex sub-agents need GOOGLE_APPLICATION_CREDENTIALS ...` in a sub-agent's result | pi on `openai/` dispatched a Vertex sub-agent with no credentials file in the sandbox: the variable is unset, or the harness has no `host_files` mount for it | Set `GOOGLE_APPLICATION_CREDENTIALS` and use the overlay from [Pick a route](#pick-a-route), or keep sub-agents on `openai/` models; see [pi › Vertex sub-agents under an OpenAI parent](../../runtimes/pi.md#vertex-sub-agents-under-an-openai-parent) |
 | Agent can't find input files | Pre-script output paths don't match `host_files` entries | Align the two |
@@ -509,6 +516,11 @@ overlays:
 
 New agents should map `ISSUE_URL` from `FULLSEND_WORK_ITEM_URL`; the example
 above shows the current built-in GitHub overlay before that migration.
+
+The `${GOOGLE_APPLICATION_CREDENTIALS}` mount expects a short-lived
+`external_account` file, as CI provides. With a service account key, add
+`allow_durable: true` to that entry; see
+[`host_files[].allow_durable`](../../reference/harness-reference.md).
 
 Key patterns to note:
 
@@ -960,10 +972,12 @@ section).
 ### Pass secrets to host-side scripts (GitHub)
 
 A pre-script that calls Jira, CodeRabbit or another service needs a token. This
-channel is an interim one for your own tools on GitHub: external secret manager
-support, read with the job's OIDC token, is the expected successor (long-term
-design in [#6359](https://github.com/fullsend-ai/fullsend/issues/6359)), and
-this secret stays as the fallback when your workflow cannot use GitHub OIDC or a
+channel is the native source for your own tools on GitHub. To keep the bundle in
+Vault instead, select a Vault connection for `FULLSEND_GITHUB_RUNNER_SECRETS`
+through `connections` and `secrets`; Fullsend reads it with the job's OIDC token
+([config reference](../../reference/config-reference.md#connections); broader
+design in [#6359](https://github.com/fullsend-ai/fullsend/issues/6359)). This
+secret stays as the native source when your workflow cannot use GitHub OIDC or a
 WIF provider with your secret manager. Integrations fullsend owns, such as the
 inference gateway, keep their own named secrets. If your repository has the
 Jira secrets `FULLSEND_JIRA_TOKEN` and optional `FULLSEND_JIRA_EMAIL`
@@ -1119,7 +1133,7 @@ Base chains support up to 5 levels (`MaxBaseDepth` in `internal/harness/compose.
 
 > **Overlay precedence with `base:`:** Overlays are concatenated base-first, child-appended — the same ordering as `plugins`, `providers`, and `api_servers`. Because `ResolveOverlays` merges all matching entries in order (later matches take precedence), child overlay entries override base overlay entries with the same condition. This follows the child-overrides-base convention used by scalar and map merges.
 
-> **Note:** `allowed_remote_resources`, `allow_runtime_fetch`, and `max_runtime_fetches` are NOT inherited from base harnesses — the child must declare its own. This prevents a base harness from injecting arbitrary URL prefixes or enabling runtime fetching in the child.
+> **Note:** `allowed_remote_resources`, `allow_runtime_fetch`, `max_runtime_fetches`, and `allow_ci_variable_credential` are NOT inherited from base harnesses — the child must declare its own. This prevents a base harness from injecting arbitrary URL prefixes, enabling runtime fetching, or silencing the GitLab CI/CD-variable credential warning in the child.
 
 > **Config-level fallback:** Separately from base-harness inheritance, the `allowed_remote_resources` from the repository-local configuration acts as a fallback for all URL resolution. URLs trusted at the config level are accepted even when the child harness omits the field. It is also the ceiling for the harness-level list: whenever the harness's runtime fetch service can start (`allow_runtime_fetch: true`, URL-sourced skill or plugin directories, or a bare, deprecated `allowed_remote_resources` declaration), every harness-level prefix must be covered by the config-level allowlist (the config-level list plus the built-in default prefixes; an explicit `allowed_remote_resources: []` in the config stays deny-all and excludes the defaults), and `fullsend run`, `fullsend lint` and `fullsend lock` fail naming an uncovered prefix and fail closed without a repository config (`config.yaml` or `config.base.yaml`). This is a distinct trust layer from base composition — the config-level list is set by repository administrators, not by base harness authors.
 
@@ -1136,6 +1150,8 @@ fullsend run my-agent \
 ```
 
 The `--env-file` supplies variables your harness references: `GH_TOKEN` and the GitHub variables on every route, plus `ANTHROPIC_VERTEX_PROJECT_ID`, `CLOUD_ML_REGION` and `GOOGLE_APPLICATION_CREDENTIALS` on the Vertex route or `OPENAI_API_KEY` on the OpenAI route (see [Pick a route](#pick-a-route)). See [Running agents locally](running-agents-locally.md) for prerequisites and troubleshooting.
+
+If `GOOGLE_APPLICATION_CREDENTIALS` points at a service account key, add `allow_durable: true` to the generated `${GOOGLE_APPLICATION_CREDENTIALS}` entry under `host_files:`; otherwise the run stops with `Host file credential validation failed`. See [`host_files[].allow_durable`](../../reference/harness-reference.md).
 
 Most agents need additional flags for credentials and target repo — see [Running agents locally](running-agents-locally.md) for the full list.
 

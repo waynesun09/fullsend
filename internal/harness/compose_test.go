@@ -2262,8 +2262,8 @@ func TestMergeHostFiles(t *testing.T) {
 		{Src: "base2", Dest: "/tmp/dest2"},
 	}
 	child := []HostFile{
-		{Src: "child2", Dest: "/tmp/dest2"}, // override
-		{Src: "child3", Dest: "/tmp/dest3"}, // new
+		{Src: "child2", Dest: "/tmp/dest2", AllowDurable: true}, // override
+		{Src: "child3", Dest: "/tmp/dest3"},                     // new
 	}
 
 	result := mergeHostFiles(base, child)
@@ -2273,6 +2273,7 @@ func TestMergeHostFiles(t *testing.T) {
 	assert.Equal(t, "/tmp/dest1", result[0].Dest)
 	assert.Equal(t, "child2", result[1].Src) // overridden
 	assert.Equal(t, "/tmp/dest2", result[1].Dest)
+	assert.True(t, result[1].AllowDurable, "a child re-declaring a dest can opt in")
 	assert.Equal(t, "child3", result[2].Src)
 	assert.Equal(t, "/tmp/dest3", result[2].Dest)
 }
@@ -6203,6 +6204,30 @@ base: base.yaml
 	assert.False(t, h.AllowRuntimeFetch)
 	assert.Nil(t, h.MaxRuntimeFetches)
 	assert.Empty(t, h.AllowedRemoteResources)
+}
+
+func TestLoadWithBase_AllowCIVariableCredential(t *testing.T) {
+	dir := t.TempDir()
+
+	writeTestHarness(t, dir, "base.yaml", `
+agent: agents/test.md
+role: test
+allow_ci_variable_credential: true
+`)
+	inherit := writeTestHarness(t, dir, "child.yaml", `
+base: base.yaml
+`)
+	h, _, err := LoadWithBase(context.Background(), inherit, ComposeOpts{})
+	require.NoError(t, err)
+	assert.False(t, h.AllowCIVariableCredential, "a base cannot silence the warning for its children")
+
+	own := writeTestHarness(t, dir, "child-own.yaml", `
+base: base.yaml
+allow_ci_variable_credential: true
+`)
+	h, _, err = LoadWithBase(context.Background(), own, ComposeOpts{})
+	require.NoError(t, err)
+	assert.True(t, h.AllowCIVariableCredential)
 }
 
 func TestMergeBaseIntoChild_PanicsOnUnresolvedForge(t *testing.T) {

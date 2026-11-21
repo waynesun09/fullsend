@@ -18,7 +18,8 @@ Common configuration goals:
 
 | Goal | How |
 |------|-----|
-| Change model, timeout, or image | Override scalar fields via `base:` composition |
+| Change a setting of an agent's harness, such as a timeout or a variable it declares (for example `REVIEW_FINDING_SEVERITY_THRESHOLD`) | Set it in the agent entry's [`harness:` block](../../reference/config-reference.md#agents) in `config.yaml`; no `base:` harness needed, and the agent keeps getting updates |
+| Change model, timeout, or image in a harness file of your own | Override scalar fields via `base:` composition |
 | Add org-specific skills | Add entries to the `skills:` list |
 | Add environment variables | Add entries under `env.runner` or `env.sandbox` |
 | Install GitHub Packages npm dependencies | Add a repo-level GitHub Packages provider (see [Private registries and GitHub Packages](#private-registries-and-github-packages)) |
@@ -135,7 +136,7 @@ Any harness field can be overridden. See the [field merge rules](../../reference
 
 Base chains support up to 5 levels. Circular references are detected and rejected. Resolution order: base chain, child overrides, overlay resolution.
 
-> **Note:** `allowed_remote_resources`, `allow_runtime_fetch`, and `max_runtime_fetches` are NOT inherited from base harnesses — the child must declare its own. This prevents a base harness from injecting arbitrary URL prefixes or enabling runtime fetching in the child.
+> **Note:** `allowed_remote_resources`, `allow_runtime_fetch`, `max_runtime_fetches`, and `allow_ci_variable_credential` are NOT inherited from base harnesses — the child must declare its own. This prevents a base harness from injecting arbitrary URL prefixes, enabling runtime fetching, or silencing the GitLab CI/CD-variable credential warning in the child.
 
 > **Config-level fallback:** Separately from base-harness inheritance, the config-level `allowed_remote_resources` from the repository's `.fullsend/config.yaml` (layered over `config.base.yaml`) acts as a fallback for all URL resolution. URLs trusted at the config level are accepted even when the child harness omits the field. It is also the ceiling for the harness-level list: whenever the harness's runtime fetch service can start (`allow_runtime_fetch: true`, URL-sourced skill or plugin directories, or a bare, deprecated `allowed_remote_resources` declaration), every harness-level prefix must be covered by the config-level allowlist (the config-level list plus the built-in default prefixes; an explicit `allowed_remote_resources: []` in the config stays deny-all and excludes the defaults), and `fullsend run`, `fullsend lint` and `fullsend lock` fail naming an uncovered prefix and fail closed without a repository config (`config.yaml` or `config.base.yaml`). This is a distinct trust layer from base composition — the config-level list is set by the repository's administrators, not by base harness authors.
 
@@ -562,7 +563,8 @@ disables nothing because no agent has that harness name.
 ## Choosing when review runs
 
 By default, the dispatch workflow decides when the review agent runs: when a
-pull request is opened, pushed to or marked ready, when the
+same-repository pull request is opened, pushed to or marked ready (fork and
+Dependabot pull requests need a `/fs-review` comment), when the
 `ready-for-review` label is added, and on a `/fs-review` comment. To decide it
 yourself, give the `review` entry in `.fullsend/config.yaml` a `trigger`: a
 [CEL expression](cel-triggers-reference.md) over the event. The review still
@@ -595,14 +597,14 @@ job, and how to
 
 ## Choosing when retro runs
 
-By default, the dispatch workflow starts the retro agent when a pull request
-is closed, merged or not, and on a `/fs-retro` comment on an issue or a pull
-request. To decide it yourself, give the `retro` entry in
+By default, the dispatch workflow starts the retro agent when a
+same-repository pull request is closed, merged or not, and on a `/fs-retro`
+comment on an issue or a pull request (a fork pull request needs the comment). To decide it yourself, give the `retro` entry in
 `.fullsend/config.yaml` a `trigger`. The retro still runs in the same `Retro`
 job; the trigger only decides whether that job starts.
 
-Closing or merging a pull request starts retro only when the event actor has
-write access. Merge-queue events follow the same rule, and a CEL routing
+Closing or merging a same-repository pull request starts retro only when the
+event actor has write access (a fork pull request needs `/fs-retro`). Merge-queue events follow the same rule, and a CEL routing
 failure skips retro for that close event.
 The `/fs-retro` command also requires write access, regardless of a lower
 `role:` on the retro harness; CEL cannot promote a command the Bash route

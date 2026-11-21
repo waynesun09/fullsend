@@ -1028,6 +1028,27 @@ func TestRunAgent_CustomNamedProviderOverrideWins(t *testing.T) {
 	assert.Contains(t, log, "provider create --name myorg-github-ro --type myorg-github-ro")
 }
 
+// TestRunAgent_PrintsResolvedProviderProfiles: the run names the profile
+// each provider uses, embedded or listed by the harness, and warns before
+// the sandbox is created when a durable credential host file sits next to a
+// write-capable provider (#9510).
+func TestRunAgent_PrintsResolvedProviderProfiles(t *testing.T) {
+	t.Setenv("GH_TOKEN", "dummy")
+	sa := writeHostFileFixture(t, "service_account")
+	_, _, out := runAgentWithProviderFiles(t,
+		"agent: agents/code.md\nrole: test\nproviders:\n  - github\n  - github-ro\n"+
+			"host_files:\n  - src: "+sa+"\n    dest: /tmp/sa.json\n    allow_durable: true\n"+
+			"openshell:\n  profiles:\n    - profiles/fullsend-github-ro.yaml\n",
+		map[string]string{"profiles/fullsend-github-ro.yaml": "id: fullsend-github-ro\nendpoints:\n  - host: api.github.com\n    protocol: rest\n    access: read-only\nbinaries: [\"**/gh\"]\n"})
+
+	assert.Contains(t, out, "provider github: profile fullsend-github (embedded) -> api.github.com rest read-write, github.com rest read-write; binaries gh, git, node, pre-commit")
+	assert.Contains(t, out, "provider github-ro: profile fullsend-github-ro (harness) -> api.github.com rest read-only; binaries gh")
+	warn := "host file dest /tmp/sa.json is a durable credential, and provider github (profile fullsend-github) permits write methods. Prefer a short-lived credential"
+	assert.Contains(t, out, warn)
+	assert.NotContains(t, out, "provider github-ro (profile", "a read-only provider is not named in the warning")
+	assert.Less(t, strings.Index(out, warn), strings.Index(out, "Creating sandbox"), "the warning comes before the sandbox is created")
+}
+
 // TestRunAgent_UnlistedProfileDirectoryFileIsNotImported guards the #7095
 // fix: an unlisted file under the fullsend dir's profiles/ directory must
 // never be scanned or imported, even when it shares an id with a profile
@@ -2538,6 +2559,33 @@ func TestSandboxDeniedKeys_JiraSecrets(t *testing.T) {
 	assert.Equal(t, "kept", expandSandboxEnvValue("${OTHER_VAR}", harnessEnvExpand))
 }
 
+// TestSandboxDeniedKeys_VaultEligibleStandaloneSecrets verifies that the
+// standalone runner secrets a Vault connection can supply (ADR 0155) stay
+// declarable in env.runner but expand empty at every sandbox-bound site
+// (provider definitions are covered by the sandboxDeniedKeys loop in init).
+func TestSandboxDeniedKeys_VaultEligibleStandaloneSecrets(t *testing.T) {
+	for _, key := range []string{"JIRA_TOKEN", "OTEL_EXPORTER_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_TRACES_HEADERS"} {
+		t.Run(key, func(t *testing.T) {
+			const value = "vault-fetched-secret-value"
+			t.Setenv(key, value)
+			assert.True(t, sandboxDeniedKeys[key])
+
+			// env.runner may still declare it.
+			assert.Equal(t, value, harnessEnvExpand(key))
+			got, ok := harnessEnvLookup(key)
+			assert.True(t, ok)
+			assert.Equal(t, value, got)
+			assert.Equal(t, value, expandRunnerEntry("SOME_SCRIPT_VAR", "${"+key+"}", harnessEnvExpand))
+
+			// env.sandbox, sandbox-bound runner_env, expanded host files and
+			// validation fields refuse it.
+			assert.Equal(t, "x--y", expandSandboxEnvValue("x-${"+key+"}-y", harnessEnvExpand))
+			assert.Equal(t, "x--y", expandRunnerEntry("FULLSEND_OUTPUT_FILE", "x-${"+key+"}-y", harnessEnvExpand))
+			assert.NotContains(t, shellSafeExpandEnv("export V=\"${"+key+"}\""), value)
+		})
+	}
+}
+
 // TestExpandRunnerEntry_OutputFileRefusesJiraSecrets verifies that
 // FULLSEND_OUTPUT_FILE, the runner entry exported verbatim into the sandbox,
 // cannot carry the Jira repository secrets from runner_env or env.runner,
@@ -2765,6 +2813,8 @@ func TestOIDCDenyKeys_Completeness(t *testing.T) {
 		"FULLSEND_GITHUB_RUNNER_SECRETS",
 		// Nor may a harness or script learn where the bundle file was staged.
 		"FULLSEND_GITHUB_RUNNER_SECRETS_FILE",
+		// The GitLab job ID token for Vault login stays runner-only (ADR 0155).
+		"FULLSEND_VAULT_ID_TOKEN",
 	}
 	for _, key := range expected {
 		assert.True(t, oidcDenyKeys[key], "oidcDenyKeys must include %s", key)
@@ -3820,7 +3870,7 @@ func TestPostLoopValidationSweep_LatestIterPasses(t *testing.T) {
 	}
 	printer := ui.New(io.Discard)
 
-	result := postLoopValidationSweep(h, runDir, 3, true, printer)
+	result := postLoopValidationSweep(h, runDir, 3, true, "", printer)
 	assert.True(t, result.passed, "sweep should pass when latest iteration passes")
 	assert.Equal(t, 3, result.validatedIter, "validated iteration should be runCount")
 	assert.True(t, result.repoExtractedOK, "repoExtractedOK should stay true when i == runCount")
@@ -3844,7 +3894,7 @@ func TestPostLoopValidationSweep_EarlierIterPasses(t *testing.T) {
 	}
 	printer := ui.New(io.Discard)
 
-	result := postLoopValidationSweep(h, runDir, 3, true, printer)
+	result := postLoopValidationSweep(h, runDir, 3, true, "", printer)
 	assert.True(t, result.passed, "sweep should pass when earlier iteration passes")
 	assert.Equal(t, 1, result.validatedIter, "validated iteration should be 1")
 	assert.False(t, result.repoExtractedOK, "repoExtractedOK must be false when i != runCount")
@@ -3867,7 +3917,7 @@ func TestPostLoopValidationSweep_NonePass(t *testing.T) {
 	}
 	printer := ui.New(io.Discard)
 
-	result := postLoopValidationSweep(h, runDir, 2, false, printer)
+	result := postLoopValidationSweep(h, runDir, 2, false, "", printer)
 	assert.False(t, result.passed, "sweep should not pass when no iteration passes")
 	assert.Equal(t, 0, result.validatedIter, "validatedIter should be 0 when none pass")
 	assert.False(t, result.repoExtractedOK, "repoExtractedOK should propagate input value")
@@ -3897,7 +3947,7 @@ func TestPostLoopValidationSweep_EarlierIterClearsRepoOK(t *testing.T) {
 	printer := ui.New(io.Discard)
 
 	// currentRepoExtractedOK=true simulates a successful last SafeDownload.
-	result := postLoopValidationSweep(h, runDir, 2, true, printer)
+	result := postLoopValidationSweep(h, runDir, 2, true, "", printer)
 	assert.True(t, result.passed)
 	assert.Equal(t, 1, result.validatedIter)
 	assert.False(t, result.repoExtractedOK,
@@ -3926,7 +3976,7 @@ func TestPostLoopValidationSweep_PassesEmptyTargetRepoDir(t *testing.T) {
 	}
 	printer := ui.New(io.Discard)
 
-	result := postLoopValidationSweep(h, runDir, 1, true, printer)
+	result := postLoopValidationSweep(h, runDir, 1, true, "", printer)
 	require.True(t, result.passed)
 
 	got, err := os.ReadFile(checkFile)
@@ -3952,14 +4002,14 @@ func TestSweepResult_RepoExtractedOK_PreservesWhenRunCount(t *testing.T) {
 	printer := ui.New(io.Discard)
 
 	// With currentRepoExtractedOK=false (last SafeDownload failed).
-	result := postLoopValidationSweep(h, runDir, 1, false, printer)
+	result := postLoopValidationSweep(h, runDir, 1, false, "", printer)
 	assert.True(t, result.passed)
 	assert.Equal(t, 1, result.validatedIter)
 	assert.False(t, result.repoExtractedOK,
 		"repoExtractedOK should remain false when input was false, even when i == runCount")
 
 	// With currentRepoExtractedOK=true (last SafeDownload succeeded).
-	result2 := postLoopValidationSweep(h, runDir, 1, true, printer)
+	result2 := postLoopValidationSweep(h, runDir, 1, true, "", printer)
 	assert.True(t, result2.passed)
 	assert.True(t, result2.repoExtractedOK,
 		"repoExtractedOK should remain true when input was true and i == runCount")

@@ -15,6 +15,10 @@ description: One-line summary       # Human-readable description
 doc: docs/agents/my-agent.md        # Source-repo-only; not resolved at runtime
 trigger: "event.entity.kind == 'work_item'"  # Optional CEL expression over NormalizedEvent (see CEL Triggers Reference)
 
+# ── Input source ──────────────────────────────────────────────
+input_source: external              # Who wrote the text the agent reads: external or maintainer; absent = FULLSEND_INPUT_SOURCE, else maintainer
+# allow_forge_write: true           # Let an external-input run attach a forge-write provider (type fullsend-github, fullsend-gitlab-rw or fullsend-gitlab-forge)
+
 # ── Composition ───────────────────────────────────────────────
 base: harness/common-base.yaml      # Inherit from another harness (local or URL)
 
@@ -23,6 +27,7 @@ image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
 model: opus                         # LLM model override
 effort: high                        # Reasoning effort (low, medium, high, xhigh, max); claude runtime only
 # readonly_repo: true               # make the checkout read-only (chmod a-w, .git/ excluded); absent = inherit from base; false overrides a base true
+# allow_ci_variable_credential: true # GitLab: print the CI/CD-variable credential notice as info, not a warning (default false; not inherited)
 providers:                           # Network access via provider profiles
   - vertex-ai                       # Bare builtin name: resolves to fullsend's embedded definition
   - github                          # Same; or a providers/<name>.yaml path for a local/custom definition
@@ -75,6 +80,7 @@ host_files:
   - src: ${SOME_CREDENTIAL}
     dest: /tmp/.cred.json
     optional: true                   # Skip if missing
+    # allow_durable: true            # Only for a key the run cannot revoke
 
 # ── Environment ───────────────────────────────────────────────
 env:
@@ -320,6 +326,87 @@ keys](../cli/run.md#reserved-envsandbox-keys).
 
 **`host_files[].dest`** — An absolute path under `/sandbox/` or `/tmp/`. Paths the runner writes or puts on `PATH` ahead of the image are refused when the harness loads: `/sandbox/workspace/.env`, the runner and runtime binaries in `/sandbox/workspace/bin` (`claude`, `codex`, `pi`, `opencode`, `fullsend`, `fullsend-check-output`), and anything under `/sandbox/claude-config`, `/sandbox/codex-config`, `/sandbox/pi-config`, `/sandbox/workspace/.fullsend`, `/sandbox/workspace/.security`, `/sandbox/.venv` or `/sandbox/go/bin`. A `dest` containing a `..` path component is refused as well. The same rule applies to `host_files` under `overlays:`, `forge:` and inherited from `base:`. On Claude and pi runs `/sandbox/workspace/bin` is last on the agent's `PATH`, so a file there adds a command but does not replace one the image provides. Codex and OpenCode runs restore the `PATH` from before `.env`, so `/sandbox/workspace/bin` and `.env.d` additions are not on the codex or OpenCode agent's `PATH`. See [Adding executables](../guides/user/customizing-agents.md#adding-executables).
 
+**`host_files[].allow_durable`** — Allows the entry to mount a credential that
+this run did not issue and cannot revoke. Once such a credential is in the
+sandbox, only the network policy constrains it (credential delivery tier 4 in
+[ADR 0025](../ADRs/0025-provider-credential-delivery-for-sandboxed-agents.md)).
+
+`fullsend run` classifies each source it will copy, on the host: before the
+pre-script, again before the sandbox is created, and once more just before
+the upload, so a file the pre-script writes is checked too. An `expand: true`
+source is checked as it will be uploaded, after `${VAR}` expansion. The check
+reads only regular files. These sources are durable:
+
+- a Google `service_account` key;
+- an `authorized_user` or `external_account_authorized_user` file;
+- an `impersonated_service_account` file whose source is not an
+  `external_account`;
+- a file with a PEM private key header (`-----BEGIN ... PRIVATE KEY-----`).
+
+Without `allow_durable: true`, a durable source stops the run (the triage
+harness with a service account key; host path shortened):
+
+```text
+  ✗ Host file credential validation failed
+Error: 1 durable credential host file(s) without allow_durable:
+    host_files[1]: host file .../key.json (src ${GOOGLE_APPLICATION_CREDENTIALS}, dest /tmp/.gcp-credentials.json): service_account key, whose lifetime this run does not control; set allow_durable: true on the entry to mount it
+```
+
+With it, the run continues and prints one warning per mount:
+
+```text
+  ! host file .../key.json (dest /tmp/.gcp-credentials.json): service_account key (lifetime not controlled by this run)
+```
+
+An `external_account` file is short-lived, so it is mounted with no output.
+A file that is not a recognized credential is mounted the same way.
+
+To opt in a mount that a `base:` harness declares, copy the whole entry into
+your own harness and add `allow_durable: true`. The copy replaces the base
+entry, so keep every field the base sets, such as `optional: true`:
+
+```yaml
+host_files:
+  - src: ${GOOGLE_APPLICATION_CREDENTIALS}
+    dest: /tmp/.gcp-credentials.json
+    optional: true
+    allow_durable: true
+```
+
+<a id="durable-credentials-next-to-write-capable-providers"></a>
+**Durable credentials next to write-capable providers** — The run prints a
+warning just before the sandbox is created when a durable credential mount
+sits next to a provider whose profile may permit a write method, or whose
+profile could not be checked (the run did not import it, or could not read
+it). A profile may permit a write method when an endpoint has an `access`
+other than `read-only`, an allow rule for a method other than `GET`, `HEAD`
+or `OPTIONS`, or neither an `access` preset nor any allow rule. Inference
+profiles (`category: inference`, such as `vertex-ai` and `openai`) are left
+out, since their writes are model calls. The warning does not fail the run,
+and it does not replace `allow_durable: true`. Shown wrapped here; the run
+prints it on one line:
+
+```text
+  ! host file dest /tmp/.gcp-credentials.json is a durable credential, and
+    provider github (profile fullsend-github) permits write methods. Prefer a
+    short-lived credential that does not need allow_durable or a provider
+    whose profile is access: read-only (for example github-ro instead of
+    github). A profile is a declaration: whether the gateway enforces it
+    depends on the deployment, and this run does not check that.
+```
+
+To clear it:
+
+- Mount a short-lived credential instead, for example a Workload Identity
+  Federation `external_account` file.
+- Or switch to a read-only provider, such as `github-ro`, if the agent does
+  not need to write.
+- For a profile that could not be checked, list it in `openshell.profiles`
+  so the run can read it.
+
+Each provider's resolved profile is printed earlier in the run; see
+[provider profiles in run output](../cli/run.md#provider-profiles-in-run-output).
+
 **`.env.d` host files** — A `host_files` entry with a `dest` in
 `/sandbox/workspace/.env.d/` ending in `.env` is read before the runtime starts.
 Claude, codex, pi and OpenCode launches, and the runner's own in-sandbox probes
@@ -354,6 +441,92 @@ runtimes.
 **`timeout_minutes`** — Wall-clock budget for one agent iteration, default 30. The runner ends the iteration and sweeps the processes the agent left running in the sandbox (best effort) when it is spent, and a killed iteration ends the run with `agent timed out after <elapsed> without completing (timeout: <budget>)` unless its output validates anyway. Before every iteration the runner writes the budget as `FULLSEND_TIMEOUT_MINUTES`, the kill time as `FULLSEND_ITERATION_DEADLINE` (Unix seconds), and the current agent span as `TRACEPARENT` into the agent's environment — see [`fullsend run` § Budget and deadline](../cli/run.md#budget-and-deadline). Those names are reserved: an `env.sandbox` entry with any of them is dropped. The full reserved set, and the inventory of what the runner injects, is the generated [sandbox environment contract](../normative/sandbox-env/v1/README.md).
 
 **`security.fail_mode`** — Determines what happens when a pre-run security scan finds issues or fails to complete. `closed` (default): the run aborts on scan failure or critical findings. `open`: the run continues with a warning. Omitting the `security` block is equivalent to `fail_mode: closed`.
+
+**`input_source`** — Records who wrote the text the agent reads. `external`
+means someone outside the repository's maintainers wrote it, such as the body
+of an issue, a pull request or a comment. `maintainer` means a maintainer
+wrote it. Any other value fails harness validation with
+`input_source "<value>" is not valid (allowed: external, maintainer)`.
+`fullsend run` resolves the value in this order:
+
+1. The harness field, when set.
+2. The `FULLSEND_INPUT_SOURCE` environment variable (`external` or
+   `maintainer`), so a workflow can pass a value it knows. An empty variable
+   counts as unset. Any other value fails the run before the pre-script
+   and before the sandbox is created, even when the harness sets the field.
+3. Otherwise `maintainer`, which keeps the behaviour of a run without the
+   field.
+
+When the value is `external`, `fullsend run` changes two defaults.
+`maintainer` changes nothing.
+
+- **Dry run by default.** When neither the host process environment nor
+  `env.runner` sets `FULLSEND_DRY_RUN` to a non-empty value, `fullsend run`
+  sets `FULLSEND_DRY_RUN=1` for the host-side scripts: the pre-script, the
+  post-script and the validation script. An empty value counts as unset, so
+  a blank workflow input cannot turn the default off. A non-empty value,
+  such as an explicit `FULLSEND_DRY_RUN=0`, is left as is. A post-script
+  generated by `fullsend agent new` treats `FULLSEND_DRY_RUN=1` as a dry run
+  when its own `POST_<AGENT>_DRY_RUN` variable is unset or empty. When the
+  per-agent variable is set and not empty, it wins, even when it is `0`. A hand-written
+  post-script opts in by reading `FULLSEND_DRY_RUN` itself: when it is `1`,
+  print what the script would write and write nothing.
+- **Forge write needs `allow_forge_write: true`.** When the run attaches a
+  provider that can write to the forge, the run fails before the pre-script
+  and before the sandbox is created. These provider types can write:
+
+  | Type | Read-only alternative named in the error |
+  |------|------------------------------------------|
+  | `fullsend-github` | `github-ro` (type `fullsend-github-ro`) |
+  | `fullsend-gitlab-rw` | `gitlab-ro` (type `fullsend-gitlab-ro`) |
+  | `fullsend-gitlab-forge` | none: remove the provider |
+
+  ```
+  Error: input_source is external (harness), but these providers can write to the forge:
+      provider "github" (type fullsend-github): switch to github-ro (type fullsend-github-ro), or set allow_forge_write: true in the harness
+  ```
+
+  A declared provider with no definition (a bare name that resolves to no
+  file under `providers/` and no shipped definition) also fails the run,
+  because its type cannot be checked. Add a definition, or set
+  `allow_forge_write: true`. Other provider types are unaffected.
+
+The `allow_durable` check for `host_files` applies the same way whether
+`input_source` is `external` or `maintainer`.
+
+Every run prints one line before the pre-script that records the result:
+
+```
+input_source: external (harness); dry run default: on; forge write: github-ro; durable host files: none
+```
+
+The parenthesis says where the value came from: `harness`, `env` or
+`default`. `dry run default` is `on` when the run set `FULLSEND_DRY_RUN=1`,
+`off (FULLSEND_DRY_RUN is set)` when an external run found it already set,
+and `off` otherwise. `forge write` lists the names of the attached
+forge providers, read-only ones included, so you can see them all: the
+three write types above plus `fullsend-github-ro`,
+`fullsend-github-public-ro`, `fullsend-github-code`, `fullsend-gitlab-ro`
+and `fullsend-gitlab-code`. Only the write types need
+`allow_forge_write: true`. It shows `none` when no such provider is
+attached. `durable host files` lists the `dest` of each `host_files` entry
+whose source is a durable credential (see `host_files[].allow_durable`), or
+`none`.
+
+**Top level only.** An `input_source` key under `overlays:`/`forge:` is
+silently ignored. A child harness that leaves it out inherits `external`
+from its `base:`. A base that declares `maintainer` is not inherited, so a
+child without the field still reads `FULLSEND_INPUT_SOURCE`.
+
+**`allow_forge_write`** — Lets a run whose input source is `external` attach
+a provider that can write to the forge (see the table above), or a declared
+provider with no definition. Set it only when an agent that reads external
+text must write back to the forge, for example to push a branch or open a
+pull request, or when it needs a provider that has no definition. It has no effect when the
+input source is `maintainer`. **Top level only** (a key under
+`overlays:`/`forge:` is silently ignored), and not inherited from a
+`base:`, so a base cannot grant it to a child: the harness that runs
+declares it.
 
 **`allow_runtime_fetch`** — When `true`, the agent can fetch remote resources (skills, plugins, profiles) at runtime rather than only at harness resolution time. Fetched URLs must still be covered by `allowed_remote_resources`. The subset check runs for URL-referencing harnesses (as before) and whenever the runtime fetch service can start (`allow_runtime_fetch: true`, URL-sourced skill or plugin directories, or a bare, deprecated `allowed_remote_resources` declaration): every `allowed_remote_resources` prefix must be covered by the config-level allowlist — `config.yaml`'s `allowed_remote_resources` plus the built-in default prefixes (the defaults are included when the list is omitted or non-empty; an explicit `allowed_remote_resources: []` stays deny-all and excludes them) — and `fullsend run`, `fullsend lint` and `fullsend lock` fail naming the uncovered entry; without a repository config (`config.yaml` or `config.base.yaml`) they fail closed rather than fall back to the built-in defaults.
 
@@ -414,6 +587,8 @@ A pi-format entry must also satisfy pi's own loader rule:
 
 **`max_runtime_fetches`** — Caps the number of runtime fetches per run. Only meaningful when `allow_runtime_fetch` is `true`.
 
+**`allow_ci_variable_credential`** — Set to `true` (default `false`) to print the GitLab CI/CD-variable credential line as info instead of a warning. Use it when a credential has no keyless replacement yet. Other forges ignore it. **Top level only**: a key under `overlays:`/`forge:` is silently ignored. **Not inherited** from `base:`, so a base harness cannot silence the warning for its children. For a stock agent, set it in a local child harness; see [Configuration with `base:` composition](../guides/user/customizing-agents.md#configuration-with-base-composition). For the message text and what counts, see [GitLab Role Credentials](../contributing/gitlab-role-credentials.md#provider-credentials-from-cicd-variables).
+
 **`api_servers`** — Planned host-side HTTP servers outside the sandbox, exposed to it via port forwarding; server startup is not yet implemented. The intended design would keep API credentials on the trusted runner rather than inside the sandbox.
 
 ## Reserved `env.sandbox` names
@@ -436,7 +611,8 @@ sandbox environment, case-insensitively:
   `FULLSEND_TRACE_SIGNING_KEY`, `FULLSEND_INFERENCE_GATEWAY_API_KEY`,
   `FULLSEND_OPENAI_API_KEY`, `OPENAI_API_KEY`, `GH_WORKFLOW_TOKEN`, the
   runner-secret bundle and its staging path (`FULLSEND_GITHUB_RUNNER_SECRETS`,
-  `FULLSEND_GITHUB_RUNNER_SECRETS_FILE`), and the GitHub Actions OpenID Connect
+  `FULLSEND_GITHUB_RUNNER_SECRETS_FILE`), the GitLab CI ID token a Vault
+  connection authenticates with (`FULLSEND_VAULT_ID_TOKEN`), and the GitHub Actions OpenID Connect
   (OIDC) request pair `ACTIONS_ID_TOKEN_REQUEST_URL` /
   `ACTIONS_ID_TOKEN_REQUEST_TOKEN`. The runner uses this pair to request a
   token proving the job's identity.
@@ -598,6 +774,9 @@ More-specific entries go last so they override broader defaults.
 | `privilege_levels` | Merged; child keys win. Omitted entirely defaults every stage to `write`. Top-level only — this merge applies only to `base:` composition; an `overlays:`/`forge:` entry is silently ignored |
 | `validation_loop` | Field-level merge; child/overlay non-zero values win, omitted fields inherit |
 | `security` | Child replaces entirely |
+| `input_source` | Child wins if set; inherited when absent only if the base sets `external`. Top-level only — an `input_source` key under `overlays:`/`forge:` is silently ignored |
+| `allow_forge_write` | NOT inherited (the child must declare its own). Top-level only — a key under `overlays:`/`forge:` is silently ignored |
+| `allow_ci_variable_credential` | NOT inherited (child must declare its own). Top-level only — a key under `overlays:`/`forge:` is silently ignored |
 | `allowed_remote_resources`, `allow_runtime_fetch`, `max_runtime_fetches` | NOT inherited (child must declare its own); however, the config-level `allowed_remote_resources` from repository-local configuration acts as a fallback for URL resolution and as the ceiling every harness-level `allowed_remote_resources` is validated against (see `allow_runtime_fetch` above) |
 
 ## Referencing resources: local vs. remote

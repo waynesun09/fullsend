@@ -51,6 +51,12 @@ type PoolConfig struct {
 	GCPProjectID string
 	// Logf is the suite logger.
 	Logf func(string, ...any)
+	// PrivateOrgs reports that no other suite runner leases the pool's
+	// orgs (a GitHub emulator started for this suite). The shared
+	// e2e-lock bridge to legacy runners (orglock.go) is then left out:
+	// with no legacy runner to keep out, its admission window only drains
+	// every worker once the lock is 15 minutes old.
+	PrivateOrgs bool
 }
 
 func (p PoolConfig) validate() error {
@@ -210,7 +216,7 @@ const (
 	// the STAGE org) whose members may call the mint's /v1/status with
 	// a GitHub user token. The CF mint drivers deploy their mint with
 	// --status-auth=oidc,github --status-github-group=ORG/<slug>; the
-	// team itself is created by hack/setup-new-e2e-org.sh.
+	// team itself is created by e2e/org-pool/setup-org.sh.
 	MintStatusTeamSlug = "mint-status"
 )
 
